@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 
 interface Column<T> {
-  key: string
+  key: keyof T
   label: string
   render?: (row: T) => ReactNode
 }
@@ -9,7 +9,7 @@ interface Column<T> {
 interface DataTableProps<T> {
   columns: Column<T>[]
   data: T[]
-  keyField?: keyof T & string
+  keyField?: keyof T
 }
 
 export default function DataTable<T extends object>({
