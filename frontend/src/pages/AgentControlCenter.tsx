@@ -96,7 +96,7 @@ export default function AgentControlCenter() {
             )},
             { key: 'status', label: 'Status', render: (row) => <StatusBadge status={String(row.status)} /> },
             {
-              key: 'actions',
+              key: 'id',
               label: 'Actions',
               render: (row: Task) => (
                 <div className="flex gap-2">
