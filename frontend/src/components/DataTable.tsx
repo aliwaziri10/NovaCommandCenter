@@ -15,7 +15,7 @@ interface DataTableProps<T> {
 export default function DataTable<T extends object>({
   columns,
   data,
-  keyField = 'id',
+  keyField = 'id' as keyof T,
 }: DataTableProps<T>) {
   return (
     <div className="overflow-x-auto rounded-xl border border-slate-800">
@@ -23,7 +23,7 @@ export default function DataTable<T extends object>({
         <thead>
           <tr className="border-b border-slate-800 bg-slate-900/50">
             {columns.map(col => (
-              <th key={col.key} className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-400">
+              <th key={String(col.key)} className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-400">
                 {col.label}
               </th>
             ))}
@@ -40,7 +40,7 @@ export default function DataTable<T extends object>({
             data.map(row => (
               <tr key={String(row[keyField])} className="bg-slate-900/30 hover:bg-slate-800/50 transition-colors">
                 {columns.map(col => (
-                  <td key={col.key} className="px-4 py-3 text-slate-300">
+                  <td key={String(col.key)} className="px-4 py-3 text-slate-300">
                     {col.render ? col.render(row) : String(row[col.key] ?? '')}
                   </td>
                 ))}
