@@ -38,8 +38,12 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
     if isinstance(topics, str):
         topics = json.loads(topics)
 
+    # If the AI returned ONE topic as a single object (has a "title" key), wrap it in a list
+    if isinstance(topics, dict) and "title" in topics:
+        topics = [topics]
+
     # If the AI wrapped the list inside a dictionary/object, pull the list out
-    if isinstance(topics, dict):
+    elif isinstance(topics, dict):
         found_list = None
         for value in topics.values():
             if isinstance(value, list):
