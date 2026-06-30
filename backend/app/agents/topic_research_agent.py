@@ -36,7 +36,14 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
         end = raw.rfind("]") + 1
         topics = json.loads(raw[start:end])
 
-    created = []
+    # Handle cases where the AI wraps the list in an extra layer
+    if isinstance(topics, str):
+        topics = json.loads(topics)
+    if isinstance(topics, dict):
+        for value in topics.values():
+            if isinstance(value, list):
+                topics = value
+                break
     for t in topics:
         topic = Topic(
             title=t["title"],
