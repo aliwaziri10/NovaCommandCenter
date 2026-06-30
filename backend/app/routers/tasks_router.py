@@ -7,9 +7,10 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Task
 from app.schemas import AgentSummary, AgentTasksResponse, TaskResponse
+from app.agents.topic_research_agent import run_topic_research
+from app.agents.script_writing_agent import run_script_writing
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
-
 
 @router.get("/agents", response_model=AgentTasksResponse)
 def get_agent_tasks(db: Session = Depends(get_db)):
@@ -28,13 +29,38 @@ def get_agent_tasks(db: Session = Depends(get_db)):
         tasks=[TaskResponse.model_validate(t) for t in tasks],
     )
 
-
 @router.post("/{task_id}/run", response_model=TaskResponse)
 def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
     task.status = "running"
     db.commit()
-    db.refresh(task)
+
+    try:
+        if task.agent_name == "topic_research":
+            category = (task.payload or {}).get("category", "History")
+            result = run_topic_research(db, category=category)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+
+        elif task.agent_name == "script_writing":
+            topic_id = (task.payload or {})["topic_id"]
+            result = run_script_writing(db, topic_id=topic_id)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+
+        else:
+            task.status = "completed"
+
+        db.commit()
+        db.refresh(task)
+
+    except Exception as e:
+        task.status = "failed"
+        task.payload = {**(task.payload or {}), "error": str(e)}
+        db.commit()
+        db.refresh(task)
+
     return task
