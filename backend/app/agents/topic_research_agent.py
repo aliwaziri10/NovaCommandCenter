@@ -34,28 +34,35 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
         end = raw.rfind("]") + 1
         topics = json.loads(raw[start:end])
 
-    # Handle cases where the AI wraps the list in an extra layer of text
+    # If the AI wrapped the list inside quotes (a string), unwrap it
     if isinstance(topics, str):
         topics = json.loads(topics)
 
-    # Handle cases where the AI wraps the list inside a dictionary/object
+    # If the AI wrapped the list inside a dictionary/object, pull the list out
     if isinstance(topics, dict):
+        found_list = None
         for value in topics.values():
             if isinstance(value, list):
-                topics = value
+                found_list = value
                 break
+        topics = found_list if found_list is not None else []
 
-    # Handle cases where each item is just a plain string, not an object
-    if topics and isinstance(topics[0], str):
+    # If items are plain strings instead of objects, convert them
+    if isinstance(topics, list) and topics and isinstance(topics[0], str):
         topics = [
             {"title": t, "category": category, "trend_score": 50, "notes": ""}
             for t in topics
         ]
 
+    if not isinstance(topics, list):
+        topics = []
+
     created = []
     for t in topics:
+        if not isinstance(t, dict):
+            continue
         topic = Topic(
-            title=t["title"],
+            title=t.get("title", "Untitled"),
             category=t.get("category", category),
             trend_score=t.get("trend_score", 50),
             status="research",
