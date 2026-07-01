@@ -1,275 +1,67 @@
 import uuid
-from datetime import date, datetime
-from typing import Any, Optional
-
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
-
-
-class BaseSchema(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-
-# User
-class UserBase(BaseSchema):
-    email: EmailStr
-    name: str
-    role: str = "viewer"
-    is_active: bool = True
-
-
-class UserCreate(UserBase):
-    pass
-
-
-class UserUpdate(BaseSchema):
-    email: Optional[EmailStr] = None
-    name: Optional[str] = None
-    role: Optional[str] = None
-    is_active: Optional[bool] = None
-
-
-class UserResponse(UserBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Topic
-class TopicBase(BaseSchema):
-    title: str
-    category: str
-    trend_score: float = 0.0
-    status: str = "research"
-    notes: Optional[str] = None
-
-
-class TopicCreate(TopicBase):
-    pass
-
-
-class TopicUpdate(BaseSchema):
-    title: Optional[str] = None
-    category: Optional[str] = None
-    trend_score: Optional[float] = None
-    status: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class TopicResponse(TopicBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Script
-class ScriptBase(BaseSchema):
-    title: str
-    content: str = ""
-    status: str = "draft"
-    topic_id: Optional[uuid.UUID] = None
-
-
-class ScriptCreate(ScriptBase):
-    pass
-
-
-class ScriptUpdate(BaseSchema):
-    title: Optional[str] = None
-    content: Optional[str] = None
-    status: Optional[str] = None
-    topic_id: Optional[uuid.UUID] = None
-
-
-class ScriptResponse(ScriptBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Video
-class VideoBase(BaseSchema):
-    title: str
-    status: str = "planned"
-    views: int = 0
-    production_plan: Optional[str] = None
-    topic_id: Optional[uuid.UUID] = None
-    script_id: Optional[uuid.UUID] = None
-
-
-class VideoCreate(VideoBase):
-    pass
-
-
-class VideoUpdate(BaseSchema):
-    title: Optional[str] = None
-    status: Optional[str] = None
-    views: Optional[int] = None
-    production_plan: Optional[str] = None
-    topic_id: Optional[uuid.UUID] = None
-    script_id: Optional[uuid.UUID] = None
-
-
-class VideoResponse(VideoBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Short
-class ShortBase(BaseSchema):
-    title: str
-    platform: str = "youtube"
-    status: str = "draft"
-    views: int = 0
-    video_id: Optional[uuid.UUID] = None
-
-
-class ShortCreate(ShortBase):
-    pass
-
-
-class ShortUpdate(BaseSchema):
-    title: Optional[str] = None
-    platform: Optional[str] = None
-    status: Optional[str] = None
-    views: Optional[int] = None
-    video_id: Optional[uuid.UUID] = None
-
-
-class ShortResponse(ShortBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Sponsor
-class SponsorBase(BaseSchema):
-    name: str
-    contact_email: EmailStr
-    tier: str = "bronze"
-    status: str = "active"
-
-
-class SponsorCreate(SponsorBase):
-    pass
-
-
-class SponsorUpdate(BaseSchema):
-    name: Optional[str] = None
-    contact_email: Optional[EmailStr] = None
-    tier: Optional[str] = None
-    status: Optional[str] = None
-
-
-class SponsorResponse(SponsorBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Revenue
-class RevenueBase(BaseSchema):
-    amount: float
-    type: str = "sponsor"
-    date: date
-    sponsor_id: Optional[uuid.UUID] = None
-
-
-class RevenueCreate(RevenueBase):
-    pass
-
-
-class RevenueUpdate(BaseSchema):
-    amount: Optional[float] = None
-    type: Optional[str] = None
-    date: Optional[date] = None
-    sponsor_id: Optional[uuid.UUID] = None
-
-
-class RevenueResponse(RevenueBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Task
-class TaskBase(BaseSchema):
-    title: str
-    agent_name: str
-    status: str = "pending"
-    priority: int = 1
-    payload: Optional[dict[str, Any]] = None
-
-
-class TaskCreate(TaskBase):
-    pass
-
-
-class TaskUpdate(BaseSchema):
-    title: Optional[str] = None
-    agent_name: Optional[str] = None
-    status: Optional[str] = None
-    priority: Optional[int] = None
-    payload: Optional[dict[str, Any]] = None
-
-
-class TaskResponse(TaskBase):
-    id: uuid.UUID
-    created_at: datetime
-    updated_at: datetime
-
-
-# Dashboard
-class PipelineCounts(BaseSchema):
-    scripts: int
-    videos: int
-    shorts: int
-    published_videos: int
-    published_shorts: int
-
-
-class AgentSummary(BaseSchema):
-    agent_name: str
-    pending: int
-    running: int
-    completed: int
-    failed: int
-
-
-class CEODashboardResponse(BaseSchema):
-    total_revenue: float
-    active_topics: int
-    pipeline: PipelineCounts
-    agents: list[AgentSummary]
-    top_topics: list[TopicResponse]
-    revenue_trend: list[dict[str, Any]]
-
-
-class KPIDashboardResponse(BaseSchema):
-    total_views: int
-    total_revenue: float
-    total_subscribers: int
-    conversion_rate: float
-    weekly_stats: list[dict[str, Any]]
-    platform_breakdown: list[dict[str, Any]]
-
-
-class PipelineItem(BaseSchema):
-    script: Optional[ScriptResponse] = None
-    video: Optional[VideoResponse] = None
-    shorts: list[ShortResponse] = Field(default_factory=list)
-
-
-class ContentPipelineResponse(BaseSchema):
-    items: list[PipelineItem]
-
-
-class RevenueSummaryResponse(BaseSchema):
-    monthly_totals: list[dict[str, Any]]
-    by_sponsor: list[dict[str, Any]]
-    by_type: list[dict[str, Any]]
-
-
-class AgentTasksResponse(BaseSchema):
-    agents: list[AgentSummary]
-    tasks: list[TaskResponse]
+import requests
+from urllib.parse import quote
+from sqlalchemy.orm import Session
+from app.models.script import Script
+from app.models.video import Video
+
+
+def run_video_planning(db: Session, script_id: str):
+    """Free version — generates a scene/shot breakdown from a script using Pollinations.ai."""
+    script_uuid = uuid.UUID(str(script_id))
+    script = db.query(Script).filter(Script.id == script_uuid).first()
+    if not script:
+        raise ValueError(f"Script {script_id} not found")
+
+    system_prompt = (
+        "You are a professional video producer for a cinematic alternate-history "
+        "YouTube channel. Break the given script into a clear shot-by-shot production "
+        "plan: camera angles, visual style notes, and estimated duration per scene. "
+        "Output ONLY the plan text directly. Do not show your reasoning, do not "
+        "explain your process, do not use JSON — just write the plan."
+    )
+    prompt = (
+        f'Create a shot-by-shot video production plan for this script:\n\n'
+        f'{script.content[:3000]}\n\n'
+        f'List each scene with camera direction, visual style, and estimated duration. '
+        f'Start directly with Scene 1.'
+    )
+    url = f"https://text.pollinations.ai/{quote(prompt)}"
+
+    plan = None
+    last_error = None
+
+    for _ in range(3):
+        params = {"model": "openai", "system": system_prompt, "temperature": 0.8}
+        try:
+            response = requests.get(url, params=params, timeout=60)
+            raw = response.text.strip()
+
+            if raw.startswith('{"role"') or '"reasoning"' in raw[:200] or raw.startswith('{"error"'):
+                last_error = "AI reply was not usable (reasoning or error wrapper)"
+                continue
+
+            if len(raw) > 100:
+                plan = raw
+                break
+            else:
+                last_error = "AI reply too short"
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    if not plan:
+        plan = f"Video planning failed. Last issue: {last_error}"
+
+    video = Video(
+        title=script.title,
+        status="planned",
+        views=0,
+        topic_id=script.topic_id,
+        script_id=script.id,
+        production_plan=plan,
+    )
+    db.add(video)
+    db.commit()
+    db.refresh(video)
+    return {"video_id": str(video.id), "title": video.title, "status": video.status, "plan_preview": plan[:300]}
