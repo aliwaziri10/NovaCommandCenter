@@ -35,29 +35,55 @@ def run_script_writing(db: Session, topic_id: str):
         "json": "true",
         "temperature": 0.85,
     }
-    response = requests.get(url, params=params, timeout=60)
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        data = json.loads(raw[start:end])
+    content = None
+    title = topic.title
+    last_error = None
 
-    if isinstance(data, str):
-        data = json.loads(data)
+    # Try up to 3 times, since the free service sometimes replies inconsistently
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=60)
+            raw = response.text.strip().replace("```json", "").replace("```", "").strip()
 
-    if isinstance(data, list) and data:
-        data = data[0]
+            data = None
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                start = raw.find("{")
+                end = raw.rfind("}") + 1
+                if start != -1 and end > start:
+                    data = json.loads(raw[start:end])
 
-    if not isinstance(data, dict):
-        data = {}
+            if isinstance(data, str):
+                data = json.loads(data)
+            if isinstance(data, list) and data:
+                data = data[0]
+            if not isinstance(data, dict):
+                data = {}
 
-    content = data.get("content") or data.get("script") or "Script generation returned no content."
+            found_content = data.get("content") or data.get("script") or data.get("body")
+
+            # If no content field found, but the raw reply itself looks like a real script
+            # (long enough, not just JSON scaffolding), use the raw text directly.
+            if not found_content and len(raw) > 200:
+                found_content = raw
+
+            if found_content and len(found_content.strip()) > 50:
+                content = found_content
+                title = data.get("title", topic.title)
+                break
+            else:
+                last_error = "AI reply had no usable script content"
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    if not content:
+        content = f"Script generation failed after 3 attempts. Last issue: {last_error}"
 
     script = Script(
-        title=data.get("title", topic.title),
+        title=title,
         content=content,
         status="draft",
         topic_id=topic.id,
