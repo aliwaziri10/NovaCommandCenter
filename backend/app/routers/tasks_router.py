@@ -7,14 +7,10 @@ from app.models import Task
 from app.schemas import AgentSummary, AgentTasksResponse, TaskResponse
 from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
-
+from app.agents.video_planning_agent import run_video_planning
 router = APIRouter(prefix="/tasks", tags=["tasks"])
-
-
 def _normalize(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
-
-
 @router.get("/agents", response_model=AgentTasksResponse)
 def get_agent_tasks(db: Session = Depends(get_db)):
     tasks = db.query(Task).order_by(Task.priority.desc(), Task.created_at.desc()).all()
@@ -29,8 +25,6 @@ def get_agent_tasks(db: Session = Depends(get_db)):
         agents=agents,
         tasks=[TaskResponse.model_validate(t) for t in tasks],
     )
-
-
 @router.post("/{task_id}/run", response_model=TaskResponse)
 def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
@@ -48,6 +42,11 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
         elif agent == "script_writing":
             topic_id = (task.payload or {})["topic_id"]
             result = run_script_writing(db, topic_id=topic_id)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        elif agent == "video_planning":
+            script_id = (task.payload or {})["script_id"]
+            result = run_video_planning(db, script_id=script_id)
             task.status = "completed"
             task.payload = {**(task.payload or {}), "result": result}
         else:
