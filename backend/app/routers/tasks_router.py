@@ -15,6 +15,13 @@ def _normalize(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
 
 
+@router.post("/admin/cleanup-fake-data")
+def admin_cleanup(db: Session = Depends(get_db)):
+    from app.cleanup_once import cleanup
+    result = cleanup()
+    return {"status": "cleaned", "deleted": result}
+
+
 @router.get("/agents", response_model=AgentTasksResponse)
 def get_agent_tasks(db: Session = Depends(get_db)):
     tasks = db.query(Task).order_by(Task.priority.desc(), Task.created_at.desc()).all()
