@@ -1,3 +1,4 @@
+import uuid
 import requests
 import json
 from urllib.parse import quote
@@ -8,7 +9,8 @@ from app.models.script import Script
 
 def run_script_writing(db: Session, topic_id: str):
     """Free version — generates a full video script from a topic using Pollinations.ai."""
-    topic = db.query(Topic).filter(Topic.id == topic_id).first()
+    topic_uuid = uuid.UUID(str(topic_id))
+    topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
     if not topic:
         raise ValueError(f"Topic {topic_id} not found")
 
@@ -43,11 +45,9 @@ def run_script_writing(db: Session, topic_id: str):
         end = raw.rfind("}") + 1
         data = json.loads(raw[start:end])
 
-    # If the AI wrapped the object inside quotes (a string), unwrap it
     if isinstance(data, str):
         data = json.loads(data)
 
-    # If the AI returned a list instead of one object, take the first item
     if isinstance(data, list) and data:
         data = data[0]
 
