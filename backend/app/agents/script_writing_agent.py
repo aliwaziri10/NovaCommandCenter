@@ -1,92 +1,58 @@
-import uuid
-import re
 import requests
+import json
 from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models.topic import Topic
 from app.models.script import Script
 
-
-def _extract_script(raw: str) -> str | None:
-    """Pull usable script text out of a raw AI reply, even if it's wrapped in JSON/reasoning."""
-    text = raw.strip()
-
-    # If it's a JSON-wrapper with a "content" field, pull that out
-    match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-    if match:
-        extracted = match.group(1)
-        extracted = extracted.replace('\\n', '\n').replace('\\"', '"')
-        if len(extracted) > 150:
-            return extracted
-
-    # If it's a reasoning-wrapper (has "reasoning" key), reject entirely — not usable
-    if '"reasoning"' in text[:300] or text.startswith('{"role"'):
-        return None
-
-    # If it looks like an error message from the service, reject
-    if text.startswith('{"error"'):
-        return None
-
-    # Otherwise, if it's long enough plain text, treat it as the script itself
-    if len(text) > 150:
-        return text
-
-    return None
-
+def _call_pollinations(prompt: str, system_prompt: str) -> str:
+    url = f"https://text.pollinations.ai/{quote(prompt)}"
+    params = {"model": "openai", "system": system_prompt, "temperature": 0.85}
+    response = requests.get(url, params=params, timeout=60)
+    return response.text.strip()
 
 def run_script_writing(db: Session, topic_id: str):
-    """Free version — generates a full video script from a topic using Pollinations.ai."""
-    topic_uuid = uuid.UUID(str(topic_id))
-    topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
+    """Generates a full video script in two parts to avoid truncation, using Pollinations.ai."""
+
+    topic = db.query(Topic).filter(Topic.id == topic_id).first()
     if not topic:
         raise ValueError(f"Topic {topic_id} not found")
 
     system_prompt = (
         "You are a professional scriptwriter for a cinematic alternate-history "
-        "YouTube channel. Write engaging, narrative-driven scripts with a clear "
-        "hook, escalating stakes, and a strong closing line. Use [SCENE] markers "
-        "for major beats. Output ONLY the finished script text. Do not show your "
-        "reasoning, do not think step by step out loud, do not explain your "
-        "process, do not use JSON — just write the script directly."
+        "YouTube channel. Write engaging, narrative-driven scripts with [SCENE] "
+        "markers for major beats. Write plain script text only — no JSON, no "
+        "commentary, no markdown."
     )
-    prompt = (
-        f'Write a full YouTube video script for this topic:\n'
-        f'Title: "{topic.title}"\n'
-        f'Category: {topic.category}\n'
-        f'Notes: {topic.notes}\n\n'
-        f'Start directly with [SCENE 1] and write the complete script now.'
+
+    part1_prompt = (
+        f'Write the FIRST HALF of a YouTube video script (roughly scenes 1-3) '
+        f'based on this topic:\nTitle: "{topic.title}"\nCategory: {topic.category}\n'
+        f'Notes: {topic.notes}\n\nStart with a strong hook. End this half at a '
+        f'natural cliffhanger point — do not conclude the video yet.'
     )
-    url = f"https://text.pollinations.ai/{quote(prompt)}"
+    part1 = _call_pollinations(part1_prompt, system_prompt)
 
-    content = None
-    last_error = None
-    models_to_try = ["openai", "openai", "openai"]  # retry same model, sometimes it behaves differently
+    part2_prompt = (
+        f'Continue this same script (write the SECOND HALF — roughly scenes 4-6) '
+        f'for the topic "{topic.title}". Here is the first half for context:\n\n'
+        f'{part1}\n\n'
+        f'Continue directly from where it left off, develop the consequences, '
+        f'bring it to the present day, and end with a strong closing line. '
+        f'Do not repeat the first half — only write the new continuation.'
+    )
+    part2 = _call_pollinations(part2_prompt, system_prompt)
 
-    for model in models_to_try:
-        params = {"model": model, "system": system_prompt, "temperature": 0.9}
-        try:
-            response = requests.get(url, params=params, timeout=60)
-            raw = response.text.strip()
-            extracted = _extract_script(raw)
-            if extracted:
-                content = extracted
-                break
-            else:
-                last_error = f"{model} reply was not usable (reasoning, JSON, or error wrapper)"
-        except Exception as e:
-            last_error = f"{model} error: {e}"
-            continue
-
-    if not content:
-        content = f"Script generation failed. Last issue: {last_error}"
+    full_content = part1.strip() + "\n\n" + part2.strip()
 
     script = Script(
         title=topic.title,
-        content=content,
+        content=full_content,
         status="draft",
         topic_id=topic.id,
     )
     db.add(script)
     db.commit()
     db.refresh(script)
+
     return {"script_id": str(script.id), "title": script.title, "status": script.status}
