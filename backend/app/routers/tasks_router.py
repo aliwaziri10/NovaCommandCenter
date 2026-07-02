@@ -37,6 +37,7 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
     db.commit()
     try:
         agent = _normalize(task.agent_name)
+        print(f"DEBUG: agent_name raw={task.agent_name!r} normalized={agent!r}")
         if agent == "topic_research":
             category = (task.payload or {}).get("category", "History")
             result = run_topic_research(db, category=category)
@@ -71,6 +72,7 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
             task.status = "completed"
             task.payload = {**(task.payload or {}), "result": result}
         else:
+            print(f"DEBUG: no matching branch for agent={agent!r}, falling through to else")
             task.status = "completed"
         db.commit()
         db.refresh(task)
