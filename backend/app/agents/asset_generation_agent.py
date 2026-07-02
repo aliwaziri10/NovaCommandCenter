@@ -1,4 +1,5 @@
 import re
+import time
 import uuid
 import requests
 from urllib.parse import quote
@@ -44,18 +45,22 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
 
     existing_urls = list(video.asset_urls) if video.asset_urls else []
     new_urls = []
+    failure_reasons = []
 
     for description in batch:
         prompt = f"{description}, cinematic, hyper-realistic, high detail"
         url = f"https://image.pollinations.ai/prompt/{quote(prompt)}"
         try:
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, timeout=60)
             if response.status_code == 200:
                 new_urls.append(url)
             else:
                 new_urls.append(None)
-        except requests.RequestException:
+                failure_reasons.append(f"{description[:40]}... -> HTTP {response.status_code}")
+        except requests.RequestException as e:
             new_urls.append(None)
+            failure_reasons.append(f"{description[:40]}... -> {type(e).__name__}: {str(e)[:100]}")
+        time.sleep(3)
 
     video.asset_urls = existing_urls + [u for u in new_urls if u]
     db.commit()
@@ -68,5 +73,6 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
         "batch_count": len(batch),
         "generated": len([u for u in new_urls if u]),
         "failed": len([u for u in new_urls if not u]),
+        "failure_reasons": failure_reasons,
         "asset_urls": video.asset_urls,
     }
