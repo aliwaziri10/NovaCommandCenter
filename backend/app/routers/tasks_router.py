@@ -9,9 +9,15 @@ from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import run_asset_generation
+from app.agents.narration_agent import run_narration
+
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
 def _normalize(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
+
+
 @router.get("/agents", response_model=AgentTasksResponse)
 def get_agent_tasks(db: Session = Depends(get_db)):
     tasks = db.query(Task).order_by(Task.priority.desc(), Task.created_at.desc()).all()
@@ -26,6 +32,8 @@ def get_agent_tasks(db: Session = Depends(get_db)):
         agents=agents,
         tasks=[TaskResponse.model_validate(t) for t in tasks],
     )
+
+
 @router.post("/{task_id}/run", response_model=TaskResponse)
 def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
@@ -56,6 +64,11 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
             start_shot = payload.get("start_shot", 0)
             count = payload.get("count", 5)
             result = run_asset_generation(db, video_id=video_id, start_shot=start_shot, count=count)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        elif agent == "narration":
+            video_id = (task.payload or {})["video_id"]
+            result = run_narration(db, video_id=video_id)
             task.status = "completed"
             task.payload = {**(task.payload or {}), "result": result}
         else:
