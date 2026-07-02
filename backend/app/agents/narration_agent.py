@@ -1,19 +1,26 @@
 import os
 import re
 import uuid
-import requests
-from urllib.parse import quote
+import asyncio
 from sqlalchemy.orm import Session
 from app.models.video import Video
 from app.models.script import Script
 
+import edge_tts
+
 MEDIA_ROOT = "/app/data/media"
+VOICE = "en-US-GuyNeural"
 
 
 def _clean_narration_text(script_content: str) -> str:
     text = re.sub(r'\[SCENE[^\]]*\]', '', script_content, flags=re.IGNORECASE)
     text = re.sub(r'\n{2,}', '\n', text).strip()
     return text
+
+
+async def _generate_audio(text: str, output_path: str) -> None:
+    communicate = edge_tts.Communicate(text, VOICE)
+    await communicate.save(output_path)
 
 
 def run_narration(db: Session, video_id: str):
@@ -33,37 +40,17 @@ def run_narration(db: Session, video_id: str):
     if not narration_text:
         raise ValueError("Narration text was empty after cleaning script content")
 
-    max_chunk_chars = 500
-    chunks = [narration_text[i:i + max_chunk_chars] for i in range(0, len(narration_text), max_chunk_chars)]
-
     video_dir = os.path.join(MEDIA_ROOT, str(video.id), "audio")
     os.makedirs(video_dir, exist_ok=True)
-
-    chunk_paths = []
-    failures = []
-    for idx, chunk in enumerate(chunks):
-        url = f"https://text.pollinations.ai/{quote(chunk)}"
-        params = {"model": "openai-audio", "voice": "onyx"}
-        try:
-            response = requests.get(url, params=params, timeout=90)
-            if response.status_code == 200 and response.content:
-                chunk_path = os.path.join(video_dir, f"part_{idx:03d}.mp3")
-                with open(chunk_path, "wb") as f:
-                    f.write(response.content)
-                chunk_paths.append(chunk_path)
-            else:
-                failures.append(f"chunk {idx}: HTTP {response.status_code}")
-        except requests.RequestException as e:
-            failures.append(f"chunk {idx}: {type(e).__name__}: {str(e)[:100]}")
-
-    if not chunk_paths:
-        raise ValueError(f"Narration generation failed for all chunks: {failures}")
-
     final_path = os.path.join(video_dir, "narration.mp3")
-    with open(final_path, "wb") as outfile:
-        for part in chunk_paths:
-            with open(part, "rb") as infile:
-                outfile.write(infile.read())
+
+    try:
+        asyncio.run(_generate_audio(narration_text, final_path))
+    except Exception as e:
+        raise ValueError(f"Narration generation failed: {type(e).__name__}: {str(e)[:200]}")
+
+    if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+        raise ValueError("Narration file was not created or is empty")
 
     video.audio_path = final_path
     db.commit()
@@ -71,8 +58,7 @@ def run_narration(db: Session, video_id: str):
 
     return {
         "video_id": str(video.id),
-        "chunks_generated": len(chunk_paths),
-        "chunks_failed": len(failures),
-        "failure_reasons": failures,
         "audio_path": final_path,
+        "file_size_bytes": os.path.getsize(final_path),
+        "voice": VOICE,
     }
