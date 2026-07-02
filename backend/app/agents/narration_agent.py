@@ -1,26 +1,19 @@
 import os
 import re
 import uuid
-import asyncio
 from sqlalchemy.orm import Session
 from app.models.video import Video
 from app.models.script import Script
 
-import edge_tts
+from gtts import gTTS
 
 MEDIA_ROOT = "/app/data/media"
-VOICE = "en-US-GuyNeural"
 
 
 def _clean_narration_text(script_content: str) -> str:
     text = re.sub(r'\[SCENE[^\]]*\]', '', script_content, flags=re.IGNORECASE)
     text = re.sub(r'\n{2,}', '\n', text).strip()
     return text
-
-
-async def _generate_audio(text: str, output_path: str) -> None:
-    communicate = edge_tts.Communicate(text, VOICE)
-    await communicate.save(output_path)
 
 
 def run_narration(db: Session, video_id: str):
@@ -45,7 +38,8 @@ def run_narration(db: Session, video_id: str):
     final_path = os.path.join(video_dir, "narration.mp3")
 
     try:
-        asyncio.run(_generate_audio(narration_text, final_path))
+        tts = gTTS(text=narration_text, lang="en", slow=False)
+        tts.save(final_path)
     except Exception as e:
         raise ValueError(f"Narration generation failed: {type(e).__name__}: {str(e)[:200]}")
 
@@ -60,5 +54,5 @@ def run_narration(db: Session, video_id: str):
         "video_id": str(video.id),
         "audio_path": final_path,
         "file_size_bytes": os.path.getsize(final_path),
-        "voice": VOICE,
+        "engine": "gTTS",
     }
