@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -13,6 +13,7 @@ class Video(Base):
     status: Mapped[str] = mapped_column(String(50), default="planned")
     views: Mapped[int] = mapped_column(Integer, default=0)
     production_plan: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    asset_urls: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     topic_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("topics.id", ondelete="SET NULL"), nullable=True
     )
