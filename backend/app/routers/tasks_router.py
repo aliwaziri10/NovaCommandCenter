@@ -48,4 +48,35 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
             task.status = "completed"
             task.payload = {**(task.payload or {}), "result": result}
         elif agent == "video_planning":
-            script_id
+            script_id = (task.payload or {})["script_id"]
+            result = run_video_planning(db, script_id=script_id)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        elif agent == "asset_generation":
+            payload = task.payload or {}
+            video_id = payload["video_id"]
+            start_shot = payload.get("start_shot", 0)
+            count = payload.get("count", 5)
+            result = run_asset_generation(db, video_id=video_id, start_shot=start_shot, count=count)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        elif agent == "narration":
+            video_id = (task.payload or {})["video_id"]
+            result = run_narration(db, video_id=video_id)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        elif agent == "assembly":
+            video_id = (task.payload or {})["video_id"]
+            result = run_assembly(db, video_id=video_id)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        else:
+            task.status = "completed"
+        db.commit()
+        db.refresh(task)
+    except Exception as e:
+        task.status = "failed"
+        task.payload = {**(task.payload or {}), "error": str(e)}
+        db.commit()
+        db.refresh(task)
+    return task
