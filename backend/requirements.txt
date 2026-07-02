@@ -7,9 +7,8 @@ pydantic-settings==2.6.1
 python-dotenv==1.0.1
 email-validator==2.2.0
 requests==2.32.3
+gTTS==2.5.1
 setuptools==75.6.0
 moviepy==1.0.3
 Pillow==10.4.0
 imageio-ffmpeg==0.4.9
-kokoro==0.7.16
-soundfile==0.12.1
