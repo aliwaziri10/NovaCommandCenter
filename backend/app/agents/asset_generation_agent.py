@@ -1,4 +1,5 @@
 import re
+import uuid
 import requests
 from urllib.parse import quote
 from sqlalchemy.orm import Session
@@ -29,6 +30,9 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
     """Free version — uses Pollinations.ai image generation, no API key required.
     Processes a small batch of shots at a time (start_shot -> start_shot+count)
     to avoid free-tier timeouts on long videos."""
+    if isinstance(video_id, str):
+        video_id = uuid.UUID(video_id)
+
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise ValueError(f"Video {video_id} not found")
