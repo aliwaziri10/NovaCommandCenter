@@ -8,6 +8,7 @@ from app.schemas import AgentSummary, AgentTasksResponse, TaskResponse
 from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
+from app.agents.asset_generation_agent import run_asset_generation
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 def _normalize(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
@@ -47,6 +48,14 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
         elif agent == "video_planning":
             script_id = (task.payload or {})["script_id"]
             result = run_video_planning(db, script_id=script_id)
+            task.status = "completed"
+            task.payload = {**(task.payload or {}), "result": result}
+        elif agent == "asset_generation":
+            payload = task.payload or {}
+            video_id = payload["video_id"]
+            start_shot = payload.get("start_shot", 0)
+            count = payload.get("count", 5)
+            result = run_asset_generation(db, video_id=video_id, start_shot=start_shot, count=count)
             task.status = "completed"
             task.payload = {**(task.payload or {}), "result": result}
         else:
