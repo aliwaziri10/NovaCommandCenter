@@ -8,3 +8,6 @@ python-dotenv==1.0.1
 email-validator==2.2.0
 requests==2.32.3
 gTTS==2.5.1
+moviepy==1.0.3
+Pillow==9.5.0
+imageio-ffmpeg==0.4.9
