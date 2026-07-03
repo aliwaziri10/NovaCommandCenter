@@ -43,4 +43,6 @@ def run_narration(db: Session, video_id: str):
     return {
         "video_id": str(video.id),
         "audio_path": final_path,
-        "file_size_bytes":
+        "file_size_bytes": os.path.getsize(final_path),
+        "engine": "gTTS",
+    }
