@@ -10,6 +10,8 @@ import os
 from app.database import get_db
 from app.models import Topic, Script, Video, Short, Revenue, Task
 from app.schemas import CEODashboardResponse, KPIDashboardResponse, PipelineCounts, AgentSummary, TopicResponse
+from app.agents.narration_agent import run_narration
+from app.agents.assembly_agent import run_assembly
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -128,3 +130,17 @@ def download_video(video_id: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Video file not found")
     return FileResponse(file_path, media_type="video/mp4", filename="final.mp4")
+
+
+@router.get("/admin/regenerate-video/{video_id}")
+def regenerate_video(video_id: str, db: Session = Depends(get_db)):
+    try:
+        narration_result = run_narration(db, video_id)
+        assembly_result = run_assembly(db, video_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Regeneration failed: {type(e).__name__}: {str(e)[:300]}")
+    return {
+        "status": "regenerated",
+        "narration": narration_result,
+        "assembly": assembly_result,
+    }
