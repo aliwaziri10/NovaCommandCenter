@@ -46,9 +46,21 @@ def _download_image(url, dest_path):
 
 
 def _ken_burns_clip(image_path, duration):
-    clip = ImageClip(image_path).set_duration(duration)
-    clip = clip.resize(RESOLUTION)
-    zoomed = clip.fx(vfx.resize, lambda t: 1 + 0.04 * (t / duration))
+    clip = ImageClip(image_path)
+    img_w, img_h = clip.size
+    target_w, target_h = RESOLUTION
+
+    # Scale proportionally so the image fully covers the frame (no stretching)
+    scale = max(target_w / img_w, target_h / img_h)
+    new_w, new_h = int(img_w * scale) + 2, int(img_h * scale) + 2
+    clip = clip.resize((new_w, new_h))
+
+    # Crop the overflow evenly from the centre
+    clip = clip.fx(vfx.crop, x_center=new_w / 2, y_center=new_h / 2, width=target_w, height=target_h)
+    clip = clip.set_duration(duration)
+
+    # Slow zoom-in (Ken Burns), a bit more visible than before
+    zoomed = clip.fx(vfx.resize, lambda t: 1 + 0.08 * (t / duration))
     zoomed = zoomed.set_position(("center", "center"))
     return zoomed.set_duration(duration)
 
