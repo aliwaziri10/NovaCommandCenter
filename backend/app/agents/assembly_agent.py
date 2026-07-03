@@ -104,3 +104,41 @@ def run_assembly(db: Session, video_id):
                 skipped.append(i)
                 errors.append(f"shot {i}: download failed")
                 continue
+        try:
+            clip = _ken_burns_clip(img_path, dur)
+            clips.append(clip)
+        except Exception as e:
+            skipped.append(i)
+            errors.append(f"shot {i}: {type(e).__name__}: {str(e)[:150]}")
+            continue
+
+    if not clips:
+        raise ValueError(f"All shots failed. Errors: {errors}")
+
+    final_video = concatenate_videoclips(clips, method="compose", padding=-CROSSFADE)
+    audio_clip = AudioFileClip(video.audio_path)
+    final_video = final_video.set_audio(audio_clip)
+
+    final_video.write_videofile(
+        final_path,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        threads=2,
+        preset="medium",
+        verbose=False,
+        logger=None,
+    )
+
+    video.status = "assembled"
+    db.commit()
+    db.refresh(video)
+
+    return {
+        "video_id": str(video.id),
+        "output_path": final_path,
+        "shots_used": len(clips),
+        "shots_skipped": skipped,
+        "skip_errors": errors,
+        "file_size_bytes": os.path.getsize(final_path) if os.path.exists(final_path) else 0,
+    }
