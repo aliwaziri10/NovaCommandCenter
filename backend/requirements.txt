@@ -12,3 +12,4 @@ setuptools==75.6.0
 moviepy==1.0.3
 Pillow==10.4.0
 imageio-ffmpeg==0.4.9
+python-multipart==0.0.9
