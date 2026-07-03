@@ -1,13 +1,23 @@
 import os
 import re
 import uuid
+import numpy as np
+import soundfile as sf
 from sqlalchemy.orm import Session
 from app.models.video import Video
 from app.models.script import Script
-
-from gtts import gTTS
+from kokoro import KPipeline
 
 MEDIA_ROOT = "/app/data/media"
+
+_pipeline = None
+
+
+def _get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = KPipeline(lang_code="a")
+    return _pipeline
 
 
 def _clean_narration_text(script_content: str) -> str:
@@ -35,11 +45,16 @@ def run_narration(db: Session, video_id: str):
 
     video_dir = os.path.join(MEDIA_ROOT, str(video.id), "audio")
     os.makedirs(video_dir, exist_ok=True)
-    final_path = os.path.join(video_dir, "narration.mp3")
+    final_path = os.path.join(video_dir, "narration.wav")
 
     try:
-        tts = gTTS(text=narration_text, lang="en", slow=False)
-        tts.save(final_path)
+        pipeline = _get_pipeline()
+        generator = pipeline(narration_text, voice="am_adam", speed=1.0)
+        audio_chunks = [audio for _, _, audio in generator]
+        if not audio_chunks:
+            raise ValueError("Kokoro produced no audio output")
+        full_audio = np.concatenate(audio_chunks)
+        sf.write(final_path, full_audio, 24000)
     except Exception as e:
         raise ValueError(f"Narration generation failed: {type(e).__name__}: {str(e)[:200]}")
 
@@ -54,5 +69,5 @@ def run_narration(db: Session, video_id: str):
         "video_id": str(video.id),
         "audio_path": final_path,
         "file_size_bytes": os.path.getsize(final_path),
-        "engine": "gTTS",
+        "engine": "Kokoro (am_adam)",
     }
