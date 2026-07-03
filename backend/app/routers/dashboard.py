@@ -1,9 +1,11 @@
 from collections import defaultdict
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+import os
 
 from app.database import get_db
 from app.models import Topic, Script, Video, Short, Revenue, Task
@@ -118,3 +120,11 @@ def get_kpi_dashboard(db: Session = Depends(get_db)):
         weekly_stats=weekly_stats,
         platform_breakdown=platform_breakdown,
     )
+
+
+@router.get("/admin/download-video/{video_id}")
+def download_video(video_id: str):
+    file_path = f"/app/data/media/{video_id}/output/final.mp4"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    return FileResponse(file_path, media_type="video/mp4", filename="final.mp4")
