@@ -6,24 +6,25 @@ from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models import Video
 
-SHOT_PATTERN = re.compile(
-    r"Shot\s+[\d.]+:\s*(.*?)(?:\s*Camera:|\s*Duration:|$)",
-    re.IGNORECASE,
-)
+SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 
 
 def _parse_shots(production_plan: str) -> list[str]:
-    """Extract each shot's visual description from the production plan text."""
+    """Extract each shot's visual description from the production plan text.
+    Handles both 'Shot 1.1: desc Camera: ... Duration: 4s' style and
+    '**Shot 1** – desc ... **Duration:** 4 s' markdown style."""
     shots = []
     for line in production_plan.splitlines():
         line = line.strip()
-        if not line.lower().startswith("shot"):
+        if not SHOT_START.match(line):
             continue
-        match = SHOT_PATTERN.search(line)
-        if match:
-            desc = match.group(1).strip().rstrip(".")
-            if desc:
-                shots.append(desc)
+        remainder = SHOT_START.sub("", line).strip()
+        remainder = re.sub(r"^[\s:\-–\*]+", "", remainder)
+        remainder = re.split(r"\*{0,2}Duration\*{0,2}\s*:", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
+        remainder = re.split(r"\bCamera\s*:", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
+        remainder = remainder.replace("**", "").replace("*", "").strip().rstrip(".").strip()
+        if remainder:
+            shots.append(remainder)
     return shots
 
 
@@ -33,7 +34,6 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
     to avoid free-tier timeouts on long videos."""
     if isinstance(video_id, str):
         video_id = uuid.UUID(video_id)
-
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise ValueError(f"Video {video_id} not found")
@@ -42,7 +42,6 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
 
     all_shots = _parse_shots(video.production_plan)
     batch = all_shots[start_shot:start_shot + count]
-
     existing_urls = list(video.asset_urls) if video.asset_urls else []
     new_urls = []
     failure_reasons = []
