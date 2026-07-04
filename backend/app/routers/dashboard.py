@@ -1,7 +1,7 @@
 from collections import defaultdict
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -144,3 +144,24 @@ def regenerate_video(video_id: str, db: Session = Depends(get_db)):
         "narration": narration_result,
         "assembly": assembly_result,
     }
+
+
+@router.post("/admin/upload-narration/{video_id}")
+async def upload_narration(video_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    audio_dir = f"/app/data/media/{video_id}/audio"
+    os.makedirs(audio_dir, exist_ok=True)
+    final_path = os.path.join(audio_dir, "narration.mp3")
+
+    contents = await file.read()
+    with open(final_path, "wb") as f:
+        f.write(contents)
+
+    video.audio_path = final_path
+    db.commit()
+    db.refresh(video)
+
+    return {"status": "uploaded", "video_id": video_id, "audio_path": final_path, "size_bytes": len(contents)}
