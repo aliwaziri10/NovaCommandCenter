@@ -26,8 +26,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install espeak-ng
-        run: sudo apt-get update && sudo apt-get install -y espeak-ng
+      - name: Install espeak-ng and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y espeak-ng ffmpeg
 
       - name: Install dependencies
         run: |
