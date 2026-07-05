@@ -1,0 +1,41 @@
+name: Generate Narration
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID to narrate"
+        required: true
+        type: string
+      voice:
+        description: "Kokoro voice to use"
+        required: false
+        type: string
+        default: "am_adam"
+
+jobs:
+  narrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install espeak-ng
+        run: sudo apt-get update && sudo apt-get install -y espeak-ng
+
+      - name: Install dependencies
+        run: |
+          pip install kokoro>=0.9.4 soundfile requests numpy
+
+      - name: Run narration
+        env:
+          RAILWAY_URL: https://novacommandcenter-production.up.railway.app
+          VIDEO_ID: ${{ inputs.video_id }}
+          VOICE: ${{ inputs.voice }}
+        run: python .github/scripts/narrate.py
