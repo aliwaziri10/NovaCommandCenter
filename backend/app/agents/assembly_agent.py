@@ -22,16 +22,17 @@ BLOCK_SIZE = 5  # shots rendered together per block, keeps memory low on 512MB R
 
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
-SHOT_LINE_PATTERN = re.compile(r"Shot\s+[\d.]+:.*?Duration:\s*([\d.]+)s", re.IGNORECASE)
+SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
+DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 
 
 def _parse_durations(production_plan):
     durations = []
     for line in production_plan.splitlines():
         line = line.strip()
-        if not line.lower().startswith("shot"):
+        if not SHOT_START.match(line):
             continue
-        match = SHOT_LINE_PATTERN.search(line)
+        match = DURATION_PATTERN.search(line)
         if match:
             durations.append(float(match.group(1)))
         else:
