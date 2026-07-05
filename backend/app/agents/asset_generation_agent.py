@@ -8,6 +8,10 @@ from app.models import Video
 
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 
+IMAGE_MODEL = "flux"
+IMAGE_WIDTH = 1920
+IMAGE_HEIGHT = 1080
+
 
 def _parse_shots(production_plan: str) -> list[str]:
     """Extract each shot's visual description from the production plan text.
@@ -47,8 +51,15 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
     failure_reasons = []
 
     for description in batch:
-        prompt = f"{description}, cinematic, hyper-realistic, high detail"
-        url = f"https://image.pollinations.ai/prompt/{quote(prompt)}"
+        prompt = (
+            f"{description}, cinematic documentary photography, "
+            f"hyper-realistic, ultra detailed, dramatic lighting, 8k, film grain, "
+            f"professional color grading, widescreen composition"
+        )
+        url = (
+            f"https://image.pollinations.ai/prompt/{quote(prompt)}"
+            f"?model={IMAGE_MODEL}&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}"
+        )
         try:
             response = requests.get(url, timeout=60)
             if response.status_code == 200:
