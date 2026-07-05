@@ -1,0 +1,33 @@
+name: Assemble Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID to assemble"
+        required: true
+        type: string
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests==2.32.3 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9
+
+      - name: Run assembly
+        env:
+          RAILWAY_URL: https://novacommandcenter-production.up.railway.app
+          ASSEMBLY_SECRET: ${{ secrets.ASSEMBLY_SECRET }}
+          VIDEO_ID: ${{ inputs.video_id }}
+        run: python .github/scripts/assemble.py
