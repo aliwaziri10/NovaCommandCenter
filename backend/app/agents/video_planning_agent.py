@@ -1,9 +1,28 @@
+import re
 import uuid
 import requests
 from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models.script import Script
 from app.models.video import Video
+
+
+def _strip_ad_footer(text: str) -> str:
+    marker = "**Support Pollinations.AI:**"
+    idx = text.find(marker)
+    if idx != -1:
+        return text[:idx].rstrip()
+    idx2 = text.find("🌸 **Ad** 🌸")
+    if idx2 != -1:
+        return text[:idx2].rstrip()
+    return text
+
+
+def _looks_truncated(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    return stripped[-1] not in ".!?\"'\u201d\u2019"
 
 
 def run_video_planning(db: Session, script_id: str):
@@ -42,7 +61,7 @@ def run_video_planning(db: Session, script_id: str):
                 continue
 
             if len(raw) > 100:
-                plan = raw
+                plan = _strip_ad_footer(raw)
                 break
             else:
                 last_error = "AI reply too short"
@@ -52,6 +71,33 @@ def run_video_planning(db: Session, script_id: str):
 
     if not plan:
         plan = f"Video planning failed. Last issue: {last_error}"
+    else:
+        continuation_attempts = 0
+        while _looks_truncated(plan) and continuation_attempts < 3:
+            continuation_attempts += 1
+            continuation_prompt = (
+                f"Here is a shot-by-shot video production plan that was cut off "
+                f"mid-sentence. Continue it EXACTLY from where it left off, do not "
+                f"repeat any earlier text, do not restart, just continue the plan "
+                f"to completion including all remaining scenes:\n\n{plan[-1500:]}"
+            )
+            cont_url = f"https://text.pollinations.ai/{quote(continuation_prompt)}"
+            try:
+                cont_response = requests.get(
+                    cont_url,
+                    params={"model": "openai", "system": system_prompt, "temperature": 0.8},
+                    timeout=60,
+                )
+                cont_raw = cont_response.text.strip()
+                if cont_raw.startswith('{"role"') or '"reasoning"' in cont_raw[:200] or cont_raw.startswith('{"error"'):
+                    break
+                cont_raw = _strip_ad_footer(cont_raw)
+                if len(cont_raw) > 20:
+                    plan = plan + "\n" + cont_raw
+                else:
+                    break
+            except Exception:
+                break
 
     video = Video(
         title=script.title,
