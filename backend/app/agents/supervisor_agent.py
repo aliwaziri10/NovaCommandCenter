@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.models import Topic, Script, Video, Task
@@ -14,7 +14,26 @@ from app.agents.assembly_agent import run_assembly
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
 ASSET_BATCH_SIZE = 5
+STALE_TASK_MINUTES = 30
 LOG_PATH = "/app/data/supervisor_log.json"
+
+
+def _clear_stale_tasks(db):
+    """Any task stuck in pending/running past the timeout is marked failed
+    so it stops permanently blocking the Supervisor's active-task check."""
+    cutoff = datetime.utcnow() - timedelta(minutes=STALE_TASK_MINUTES)
+    stuck = db.query(Task).filter(
+        Task.status.in_(["pending", "running"]),
+        Task.created_at < cutoff,
+    ).all()
+    for t in stuck:
+        t.status = "failed"
+        merged = dict(t.payload or {})
+        merged["error"] = "Marked failed by supervisor: exceeded " + str(STALE_TASK_MINUTES) + " minute stale timeout."
+        t.payload = merged
+    if stuck:
+        db.commit()
+    return len(stuck)
 
 
 def _failed_attempts(db, agent_name, id_key, id_value):
@@ -155,10 +174,18 @@ def _write_log(entry):
 
 def run_supervisor_cycle(db):
     started_at = datetime.utcnow()
+
+    cleared = _clear_stale_tasks(db)
+
     next_action = _find_next_task(db)
 
     if not next_action:
-        result = {"timestamp": str(started_at), "action": "idle", "message": "Nothing to do this cycle."}
+        result = {
+            "timestamp": str(started_at),
+            "action": "idle",
+            "message": "Nothing to do this cycle.",
+            "stale_tasks_cleared": cleared,
+        }
         _write_log(result)
         return result
 
@@ -186,6 +213,7 @@ def run_supervisor_cycle(db):
             "agent_name": next_action["agent_name"],
             "task_id": str(task.id),
             "title": next_action["title"],
+            "stale_tasks_cleared": cleared,
         }
     except Exception as e:
         task.status = "failed"
@@ -200,6 +228,7 @@ def run_supervisor_cycle(db):
             "task_id": str(task.id),
             "title": next_action["title"],
             "error": str(e),
+            "stale_tasks_cleared": cleared,
         }
 
     _write_log(result)
