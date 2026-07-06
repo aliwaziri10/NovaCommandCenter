@@ -26,22 +26,18 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
     response = requests.get(url, params=params, timeout=30)
     raw = response.text.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-
     try:
         topics = json.loads(raw)
     except json.JSONDecodeError:
         start = raw.find("[")
         end = raw.rfind("]") + 1
         topics = json.loads(raw[start:end])
-
     # If the AI wrapped the list inside quotes (a string), unwrap it
     if isinstance(topics, str):
         topics = json.loads(topics)
-
     # If the AI returned ONE topic as a single object (has a "title" key), wrap it in a list
     if isinstance(topics, dict) and "title" in topics:
         topics = [topics]
-
     # If the AI wrapped the list inside a dictionary/object, pull the list out
     elif isinstance(topics, dict):
         found_list = None
@@ -50,23 +46,26 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
                 found_list = value
                 break
         topics = found_list if found_list is not None else []
-
     # If items are plain strings instead of objects, convert them
     if isinstance(topics, list) and topics and isinstance(topics[0], str):
         topics = [
             {"title": t, "category": category, "trend_score": 50, "notes": ""}
             for t in topics
         ]
-
     if not isinstance(topics, list):
         topics = []
-
     created = []
+    skipped = []
     for t in topics:
         if not isinstance(t, dict):
             continue
+        title = t.get("title", "Untitled")
+        existing = db.query(Topic).filter(Topic.title == title).first()
+        if existing:
+            skipped.append(title)
+            continue
         topic = Topic(
-            title=t.get("title", "Untitled"),
+            title=title,
             category=t.get("category", category),
             trend_score=t.get("trend_score", 50),
             status="research",
@@ -75,4 +74,8 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
         db.add(topic)
         created.append(topic)
     db.commit()
-    return {"created": len(created), "titles": [t.title for t in created]}
+    return {
+        "created": len(created),
+        "titles": [t.title for t in created],
+        "skipped_duplicates": skipped,
+    }
