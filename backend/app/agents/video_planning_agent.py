@@ -25,6 +25,16 @@ def _looks_truncated(text: str) -> bool:
     return stripped[-1] not in ".!?\"'\u201d\u2019"
 
 
+def _is_refusal(text: str) -> bool:
+    refusal_markers = [
+        "i'm sorry", "i am sorry", "i cannot continue", "i can't continue",
+        "please provide", "could you provide", "i need the actual script",
+        "i need the rest of the script",
+    ]
+    lowered = text[:250].lower()
+    return any(m in lowered for m in refusal_markers)
+
+
 def run_video_planning(db: Session, script_id: str):
     """Free version — generates a scene/shot breakdown from a script using Pollinations.ai."""
     script_uuid = uuid.UUID(str(script_id))
@@ -41,7 +51,7 @@ def run_video_planning(db: Session, script_id: str):
     )
     prompt = (
         f'Create a shot-by-shot video production plan for this script:\n\n'
-        f'{script.content[:3000]}\n\n'
+        f'{script.content[:6000]}\n\n'
         f'List each scene with camera direction, visual style, and estimated duration. '
         f'Start directly with Scene 1.'
     )
@@ -89,9 +99,15 @@ def run_video_planning(db: Session, script_id: str):
                     timeout=60,
                 )
                 cont_raw = cont_response.text.strip()
+
                 if cont_raw.startswith('{"role"') or '"reasoning"' in cont_raw[:200] or cont_raw.startswith('{"error"'):
                     break
+
                 cont_raw = _strip_ad_footer(cont_raw)
+
+                if _is_refusal(cont_raw):
+                    break
+
                 if len(cont_raw) > 20:
                     plan = plan + "\n" + cont_raw
                 else:
