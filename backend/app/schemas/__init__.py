@@ -93,6 +93,7 @@ class VideoBase(BaseSchema):
     views: int = 0
     production_plan: Optional[str] = None
     asset_urls: Optional[list[str]] = None
+    clip_urls: Optional[list[str]] = None
     topic_id: Optional[uuid.UUID] = None
     script_id: Optional[uuid.UUID] = None
 
@@ -107,6 +108,7 @@ class VideoUpdate(BaseSchema):
     views: Optional[int] = None
     production_plan: Optional[str] = None
     asset_urls: Optional[list[str]] = None
+    clip_urls: Optional[list[str]] = None
     topic_id: Optional[uuid.UUID] = None
     script_id: Optional[uuid.UUID] = None
 
