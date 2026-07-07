@@ -18,7 +18,7 @@ DEFAULT_SHOT_DURATION = 4.0
 CROSSFADE = 0.5
 POLL_INTERVAL_SECONDS = 8
 POLL_TIMEOUT_SECONDS = 240
-REQUEST_GAP_SECONDS = 4  # stay under Agnes free-tier 20 RPM
+REQUEST_GAP_SECONDS = 4
 
 WORK_DIR = "/tmp/nova_agnes_video"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
@@ -34,8 +34,6 @@ RAILWAY_HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
 
 def _parse_shots(production_plan):
-    """Returns a list of (description, duration_seconds) tuples, splitting
-    each scene's total duration evenly across its listed shots."""
     shots = []
     current_scene_seconds = None
     current_scene_shots = []
@@ -116,8 +114,6 @@ def _run_ffmpeg(args):
 
 
 def _normalize_clip(input_path, output_path):
-    """Force every downloaded clip to exactly 1280x720, cropped (not stretched),
-    in case Agnes standardized a given clip to a different actual size."""
     _run_ffmpeg([
         "-i", input_path,
         "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
@@ -233,3 +229,4 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
