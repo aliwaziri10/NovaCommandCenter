@@ -70,9 +70,9 @@ def _submit_agnes_video(prompt, target_duration):
     num_frames = max(25, min(int(target_duration * FRAME_RATE), 121))
     payload = {
         "model": "agnes-video-v2.0",
-        "prompt": f"{prompt}, cinematic documentary footage, realistic motion, dramatic lighting",
-        "height": 768,
-        "width": 1152,
+        "prompt": f"{prompt}, cinematic documentary footage, realistic motion, dramatic lighting, widescreen",
+        "height": 720,
+        "width": 1280,
         "num_frames": num_frames,
         "frame_rate": FRAME_RATE,
     }
@@ -115,10 +115,25 @@ def _run_ffmpeg(args):
         raise RuntimeError("ffmpeg failed: " + error_text)
 
 
+def _normalize_clip(input_path, output_path):
+    """Force every downloaded clip to exactly 1280x720, cropped (not stretched),
+    in case Agnes standardized a given clip to a different actual size."""
+    _run_ffmpeg([
+        "-i", input_path,
+        "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-an",
+        output_path,
+    ])
+
+
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     clips_dir = os.path.join(WORK_DIR, "clips")
+    norm_dir = os.path.join(WORK_DIR, "clips_normalized")
     os.makedirs(clips_dir, exist_ok=True)
+    os.makedirs(norm_dir, exist_ok=True)
 
     print("Fetching video data from Railway...")
     resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}", timeout=30)
@@ -161,12 +176,14 @@ def main():
             if not video_url:
                 failures.append(f"shot {i}: generation failed or timed out")
                 continue
-            clip_path = os.path.join(clips_dir, "shot_%03d.mp4" % i)
-            ok = _download_file(video_url, clip_path)
+            raw_clip_path = os.path.join(clips_dir, "raw_shot_%03d.mp4" % i)
+            ok = _download_file(video_url, raw_clip_path)
             if not ok:
                 failures.append(f"shot {i}: download failed")
                 continue
-            clip_paths.append(clip_path)
+            norm_clip_path = os.path.join(norm_dir, "shot_%03d.mp4" % i)
+            _normalize_clip(raw_clip_path, norm_clip_path)
+            clip_paths.append(norm_clip_path)
             print(f"Shot {i}: done")
         except Exception as e:
             failures.append(f"shot {i}: {type(e).__name__}: {str(e)[:150]}")
@@ -216,4 +233,3 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
