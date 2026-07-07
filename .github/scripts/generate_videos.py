@@ -2,7 +2,6 @@ import os
 import re
 import sys
 import time
-import concurrent.futures
 
 import requests
 
@@ -17,7 +16,7 @@ CLIP_NUM_FRAMES = 121  # ~5 seconds at 24fps, must be 8*n+1
 CLIP_FRAME_RATE = 24
 MAX_WAIT_SECONDS = 240
 POLL_INTERVAL_SECONDS = 10
-BATCH_SIZE = 5
+MIN_SECONDS_BETWEEN_SUBMITS = 65  # Agnes allows 1 request per 60s — 65s gives safety margin
 
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
@@ -80,14 +79,6 @@ def _poll_clip(task_id):
     return None, "timed out waiting for clip"
 
 
-def _generate_one(index, description):
-    task_id, error = _submit_clip(description)
-    if not task_id:
-        return index, None, error
-    url, error = _poll_clip(task_id)
-    return index, url, error
-
-
 def _save_progress(clip_urls):
     good_so_far = [u for u in clip_urls if u]
     try:
@@ -118,29 +109,38 @@ def main():
         print("ERROR: no shots parsed from production_plan")
         sys.exit(1)
 
-    print(f"Parsed {len(all_shots)} shots. Generating video clips in batches of {BATCH_SIZE}...")
+    print(f"Parsed {len(all_shots)} shots. Generating video clips ONE AT A TIME "
+          f"({MIN_SECONDS_BETWEEN_SUBMITS}s between submissions, per Agnes's 1/min limit)...")
 
     clip_urls = [None] * len(all_shots)
     failure_reasons = []
+    last_submit_time = 0.0
 
-    for batch_start in range(0, len(all_shots), BATCH_SIZE):
-        batch_indices = list(range(batch_start, min(batch_start + BATCH_SIZE, len(all_shots))))
-        print(f"Starting batch: shots {batch_indices}")
+    for index, description in enumerate(all_shots):
+        elapsed = time.monotonic() - last_submit_time
+        if elapsed < MIN_SECONDS_BETWEEN_SUBMITS:
+            wait_for = MIN_SECONDS_BETWEEN_SUBMITS - elapsed
+            print(f"Waiting {wait_for:.0f}s before next submission (rate limit)...")
+            time.sleep(wait_for)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
-            futures = [executor.submit(_generate_one, i, all_shots[i]) for i in batch_indices]
-            for future in concurrent.futures.as_completed(futures):
-                index, url, error = future.result()
-                if url:
-                    clip_urls[index] = url
-                    print(f"Shot {index+1}/{len(all_shots)}: OK -> {url}")
-                else:
-                    failure_reasons.append(f"shot {index}: {error}")
-                    print(f"Shot {index+1}/{len(all_shots)}: FAILED ({error})")
+        last_submit_time = time.monotonic()
+        task_id, error = _submit_clip(description)
 
-        good_so_far = [u for u in clip_urls if u]
-        print(f"Progress checkpoint after batch: {len(good_so_far)}/{len(all_shots)} clips done so far.")
+        if not task_id:
+            failure_reasons.append(f"shot {index}: {error}")
+            print(f"Shot {index+1}/{len(all_shots)}: FAILED ({error})")
+        else:
+            url, error = _poll_clip(task_id)
+            if url:
+                clip_urls[index] = url
+                print(f"Shot {index+1}/{len(all_shots)}: OK -> {url}")
+            else:
+                failure_reasons.append(f"shot {index}: {error}")
+                print(f"Shot {index+1}/{len(all_shots)}: FAILED ({error})")
+
         _save_progress(clip_urls)
+        good_so_far = len([u for u in clip_urls if u])
+        print(f"Progress: {good_so_far}/{len(all_shots)} clips done so far.")
 
     generated = len([u for u in clip_urls if u])
     failed = len([u for u in clip_urls if not u])
