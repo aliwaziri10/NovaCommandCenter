@@ -10,13 +10,13 @@ if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS
 
 import imageio_ffmpeg
-from moviepy.editor import ImageClip, concatenate_videoclips
+from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ["VIDEO_ID"]
 
-DEFAULT_SHOT_DURATION = 4.0
+DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
@@ -24,45 +24,29 @@ BLOCK_SIZE = 10
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
-SCENE_START = re.compile(r"^\*\*Scene\s*[\d.]+.*?[\u2013\-]\s*(\d+)\s*s\*\*", re.IGNORECASE)
-SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**\s*:", re.IGNORECASE)
+SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
+DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
 
 def _parse_durations(production_plan):
-    """New format: duration is given once per SCENE (e.g. '**Scene 1 ... - 45 s**'),
-    not once per shot. This splits that scene duration evenly across the shots
-    listed under that scene."""
     durations = []
-    current_scene_seconds = None
-    current_scene_shot_lines = []
-
-    def _flush():
-        if not current_scene_shot_lines:
-            return
-        total = current_scene_seconds if current_scene_seconds else DEFAULT_SHOT_DURATION * len(current_scene_shot_lines)
-        per_shot = total / len(current_scene_shot_lines)
-        durations.extend([per_shot] * len(current_scene_shot_lines))
-
-    for raw_line in production_plan.splitlines():
-        line = raw_line.strip()
-        scene_match = SCENE_START.match(line)
-        if scene_match:
-            _flush()
-            current_scene_seconds = float(scene_match.group(1))
-            current_scene_shot_lines = []
+    for line in production_plan.splitlines():
+        line = line.strip()
+        if not SHOT_START.match(line):
             continue
-        if SHOT_START.match(line):
-            current_scene_shot_lines.append(line)
-
-    _flush()
+        match = DURATION_PATTERN.search(line)
+        if match:
+            durations.append(float(match.group(1)))
+        else:
+            durations.append(DEFAULT_SHOT_DURATION)
     return durations
 
 
-def _download_image(url, dest_path):
+def _download_file(url, dest_path):
     try:
-        resp = requests.get(url, timeout=60)
+        resp = requests.get(url, timeout=120)
         if resp.status_code == 200 and len(resp.content) > 0:
             with open(dest_path, "wb") as f:
                 f.write(resp.content)
@@ -72,9 +56,7 @@ def _download_image(url, dest_path):
     return False
 
 
-def _static_clip(image_path, duration):
-    """No zoom, no animated motion. Crop to fill the frame exactly, hold still,
-    only the crossfade transition remains."""
+def _still_image_clip(image_path, duration):
     target_w, target_h = RESOLUTION
     base_clip = ImageClip(image_path)
     src_w, src_h = base_clip.size
@@ -91,6 +73,28 @@ def _static_clip(image_path, duration):
     return clip
 
 
+def _video_clip(video_path, duration):
+    target_w, target_h = RESOLUTION
+    base_clip = VideoFileClip(video_path)
+    src_w, src_h = base_clip.size
+
+    scale = max(target_w / src_w, target_h / src_h)
+    resized_w = int(src_w * scale)
+    resized_h = int(src_h * scale)
+
+    clip = base_clip.resize(newsize=(resized_w, resized_h))
+    clip = clip.set_position(("center", "center"))
+    clip = clip.crop(x_center=resized_w / 2, y_center=resized_h / 2, width=target_w, height=target_h)
+
+    if clip.duration >= duration:
+        clip = clip.subclip(0, duration)
+    else:
+        clip = clip.set_duration(clip.duration)
+
+    clip = clip.crossfadein(min(CROSSFADE, clip.duration / 2))
+    return clip
+
+
 def _run_ffmpeg(args):
     full_args = [FFMPEG_BINARY, "-y"] + args
     result = subprocess.run(full_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -99,7 +103,7 @@ def _run_ffmpeg(args):
         raise RuntimeError("ffmpeg failed: " + error_text)
 
 
-def _render_block(shot_indices, urls, durations, images_dir, block_output_path):
+def _render_block(shot_indices, urls, durations, media_dir, block_output_path, use_clips):
     clips = []
     skipped = []
     errors = []
@@ -107,15 +111,19 @@ def _render_block(shot_indices, urls, durations, images_dir, block_output_path):
     for i in shot_indices:
         url = urls[i]
         dur = durations[i]
-        img_path = os.path.join(images_dir, "shot_%03d.jpg" % i)
-        if not os.path.exists(img_path):
-            ok = _download_image(url, img_path)
+        ext = "mp4" if use_clips else "jpg"
+        media_path = os.path.join(media_dir, "shot_%03d.%s" % (i, ext))
+        if not os.path.exists(media_path):
+            ok = _download_file(url, media_path)
             if not ok:
                 skipped.append(i)
                 errors.append("shot " + str(i) + ": download failed")
                 continue
         try:
-            clip = _static_clip(img_path, dur)
+            if use_clips:
+                clip = _video_clip(media_path, dur)
+            else:
+                clip = _still_image_clip(media_path, dur)
             clips.append(clip)
         except Exception as e:
             skipped.append(i)
@@ -149,9 +157,9 @@ def _render_block(shot_indices, urls, durations, images_dir, block_output_path):
 
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
-    images_dir = os.path.join(WORK_DIR, "images")
+    media_dir = os.path.join(WORK_DIR, "media")
     blocks_dir = os.path.join(WORK_DIR, "blocks")
-    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(media_dir, exist_ok=True)
     os.makedirs(blocks_dir, exist_ok=True)
 
     print("Fetching video data from Railway...")
@@ -159,11 +167,22 @@ def main():
     resp.raise_for_status()
     video = resp.json()
 
+    clip_urls = video.get("clip_urls")
     asset_urls = video.get("asset_urls")
     production_plan = video.get("production_plan")
-    if not asset_urls:
-        print("ERROR: video has no asset_urls")
+
+    if clip_urls:
+        print(f"Found {len(clip_urls)} video clips — using real video clips for assembly.")
+        use_clips = True
+        urls = clip_urls
+    elif asset_urls:
+        print(f"No video clips found. Falling back to {len(asset_urls)} still images.")
+        use_clips = False
+        urls = asset_urls
+    else:
+        print("ERROR: video has no clip_urls and no asset_urls")
         sys.exit(1)
+
     if not production_plan:
         print("ERROR: video has no production_plan")
         sys.exit(1)
@@ -180,13 +199,12 @@ def main():
         f.write(audio_resp.content)
 
     durations = _parse_durations(production_plan)
-    n = min(len(asset_urls), len(durations))
+    n = min(len(urls), len(durations))
     if n == 0:
         print("ERROR: no shots to assemble")
         sys.exit(1)
-    urls = asset_urls[:n]
+    urls = urls[:n]
     durations = durations[:n]
-    print(f"Matched {n} shots to durations. Total runtime: {sum(durations):.1f}s")
 
     silent_path = os.path.join(WORK_DIR, "silent_final.mp4")
     final_path = os.path.join(WORK_DIR, "final.mp4")
@@ -203,7 +221,7 @@ def main():
         block_output_path = os.path.join(blocks_dir, "block_%03d.mp4" % block_num)
 
         print(f"Rendering block {block_num} (shots {block_indices})...")
-        skipped, errors, produced = _render_block(block_indices, urls, durations, images_dir, block_output_path)
+        skipped, errors, produced = _render_block(block_indices, urls, durations, media_dir, block_output_path, use_clips)
         all_skipped.extend(skipped)
         all_errors.extend(errors)
         if produced:
@@ -218,35 +236,4 @@ def main():
             safe_p = p.replace("'", "'\\''")
             f.write("file '" + safe_p + "'\n")
 
-    print("Concatenating blocks...")
-    _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", silent_path])
-
-    print("Merging narration audio...")
-    _run_ffmpeg([
-        "-i", silent_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        final_path,
-    ])
-
-    print("Uploading finished video back to Railway...")
-    with open(final_path, "rb") as f:
-        upload_resp = requests.post(
-            f"{RAILWAY_URL}/api/v1/upload/video/{VIDEO_ID}",
-            headers=HEADERS,
-            files={"file": ("final.mp4", f, "video/mp4")},
-            timeout=300,
-        )
-    upload_resp.raise_for_status()
-
-    print("SUCCESS:", upload_resp.json())
-    if all_skipped:
-        print("Note: some shots were skipped:", all_errors)
-
-
-if __name__ == "__main__":
-    main()
+    print("Concatenating
