@@ -15,6 +15,7 @@ class Video(Base):
     views: Mapped[int] = mapped_column(Integer, default=0)
     production_plan: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     asset_urls: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    clip_urls: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     audio_path: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     topic_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("topics.id", ondelete="SET NULL"), nullable=True
