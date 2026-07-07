@@ -88,6 +88,20 @@ def _generate_one(index, description):
     return index, url, error
 
 
+def _save_progress(clip_urls):
+    good_so_far = [u for u in clip_urls if u]
+    try:
+        patch_resp = requests.patch(
+            f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}",
+            json={"clip_urls": good_so_far},
+            timeout=30,
+        )
+        patch_resp.raise_for_status()
+        print(f"Saved progress to Railway: {len(good_so_far)} clips.")
+    except requests.RequestException as e:
+        print(f"WARNING: failed to save progress to Railway: {type(e).__name__}: {str(e)[:150]}")
+
+
 def main():
     print("Fetching video data from Railway...")
     resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}", timeout=30)
@@ -126,11 +140,11 @@ def main():
 
         good_so_far = [u for u in clip_urls if u]
         print(f"Progress checkpoint after batch: {len(good_so_far)}/{len(all_shots)} clips done so far.")
+        _save_progress(clip_urls)
 
     generated = len([u for u in clip_urls if u])
     failed = len([u for u in clip_urls if not u])
     print(f"DONE. Generated: {generated}, Failed: {failed}")
-    print("FINAL_CLIP_URLS_IN_ORDER:", clip_urls)
     if failure_reasons:
         print("Failure reasons:", failure_reasons)
 
