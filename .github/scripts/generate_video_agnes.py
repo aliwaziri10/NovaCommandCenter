@@ -16,9 +16,11 @@ AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 FRAME_RATE = 24
 DEFAULT_SHOT_DURATION = 4.0
 CROSSFADE = 0.5
-POLL_INTERVAL_SECONDS = 8
+POLL_INTERVAL_SECONDS = 10
 POLL_TIMEOUT_SECONDS = 240
-REQUEST_GAP_SECONDS = 4
+REQUEST_GAP_SECONDS = 20
+MAX_RETRIES = 6
+RETRY_BASE_WAIT = 20
 
 WORK_DIR = "/tmp/nova_agnes_video"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
@@ -31,6 +33,20 @@ AGNES_HEADERS = {
     "Content-Type": "application/json",
 }
 RAILWAY_HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
+
+
+def _request_with_retry(method, url, **kwargs):
+    wait = RETRY_BASE_WAIT
+    for attempt in range(MAX_RETRIES):
+        resp = requests.request(method, url, **kwargs)
+        if resp.status_code == 429:
+            print(f"  Rate limited (429). Waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}...")
+            time.sleep(wait)
+            wait = min(wait * 2, 120)
+            continue
+        resp.raise_for_status()
+        return resp
+    raise RuntimeError("Gave up after repeated 429 rate-limit errors")
 
 
 def _parse_shots(production_plan):
@@ -74,8 +90,7 @@ def _submit_agnes_video(prompt, target_duration):
         "num_frames": num_frames,
         "frame_rate": FRAME_RATE,
     }
-    resp = requests.post(f"{AGNES_BASE_URL}/videos", headers=AGNES_HEADERS, json=payload, timeout=30)
-    resp.raise_for_status()
+    resp = _request_with_retry("POST", f"{AGNES_BASE_URL}/videos", headers=AGNES_HEADERS, json=payload, timeout=30)
     data = resp.json()
     return data.get("video_id") or data.get("id")
 
@@ -83,8 +98,7 @@ def _submit_agnes_video(prompt, target_duration):
 def _poll_agnes_video(video_id):
     waited = 0
     while waited < POLL_TIMEOUT_SECONDS:
-        resp = requests.get(f"{AGNES_BASE_URL}/videos/{video_id}", headers=AGNES_HEADERS, timeout=30)
-        resp.raise_for_status()
+        resp = _request_with_retry("GET", f"{AGNES_BASE_URL}/videos/{video_id}", headers=AGNES_HEADERS, timeout=30)
         data = resp.json()
         status = data.get("status")
         if status == "completed":
