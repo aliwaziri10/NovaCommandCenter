@@ -42,11 +42,21 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
 def run_script_writing(db: Session, topic_id: str):
     """Generates a full video script in two parts (to avoid length cutoffs), using Pollinations.ai.
     Prompts are structured around retention-driven storytelling: a hook-first open,
-    a curiosity beat roughly every 45 seconds of narration, and a payoff ending."""
+    a curiosity beat roughly every 45 seconds of narration, and a payoff ending.
+    Skips generation entirely if a script for this topic already exists, to avoid duplicates."""
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
     if not topic:
         raise ValueError(f"Topic {topic_id} not found")
+
+    existing = db.query(Script).filter(Script.topic_id == topic.id).first()
+    if existing:
+        return {
+            "script_id": str(existing.id),
+            "title": existing.title,
+            "status": existing.status,
+            "skipped_duplicate": True,
+        }
 
     system_prompt = (
         "You are a professional scriptwriter for a cinematic alternate-history "
