@@ -1,0 +1,33 @@
+name: Generate Video Clips
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID to generate video clips for"
+        required: true
+        type: string
+
+jobs:
+  generate_videos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests==2.32.3
+
+      - name: Run video clip generation
+        env:
+          RAILWAY_URL: https://novacommandcenter-production.up.railway.app
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          VIDEO_ID: ${{ inputs.video_id }}
+        run: python .github/scripts/generate_videos.py
