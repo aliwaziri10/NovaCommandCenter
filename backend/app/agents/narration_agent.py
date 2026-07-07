@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import uuid
 from sqlalchemy.orm import Session
 from app.models.video import Video
@@ -7,6 +8,7 @@ from app.models.script import Script
 from gtts import gTTS
 
 MEDIA_ROOT = "/app/data/media"
+NARRATION_SPEED = 0.9
 
 
 def _clean_narration_text(script_content: str) -> str:
@@ -23,35 +25,45 @@ def run_narration(db: Session, video_id: str):
         raise ValueError(f"Video {video_id} not found")
     if not video.script_id:
         raise ValueError(f"Video {video_id} has no linked script")
-
     script = db.query(Script).filter(Script.id == video.script_id).first()
     if not script or not script.content:
         raise ValueError("Linked script has no content to narrate")
-
     narration_text = _clean_narration_text(script.content)
     if not narration_text:
         raise ValueError("Narration text was empty after cleaning script content")
-
     video_dir = os.path.join(MEDIA_ROOT, str(video.id), "audio")
     os.makedirs(video_dir, exist_ok=True)
+    raw_path = os.path.join(video_dir, "narration_raw.mp3")
     final_path = os.path.join(video_dir, "narration.mp3")
-
     try:
         tts = gTTS(text=narration_text, lang="en", slow=False)
-        tts.save(final_path)
+        tts.save(raw_path)
     except Exception as e:
         raise ValueError(f"Narration generation failed: {type(e).__name__}: {str(e)[:200]}")
-
-    if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         raise ValueError("Narration file was not created or is empty")
-
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", raw_path,
+                "-filter:a", f"atempo={NARRATION_SPEED}",
+                final_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.remove(raw_path)
+    except Exception as e:
+        os.rename(raw_path, final_path)
+    if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+        raise ValueError("Narration file was not created or is empty after speed adjustment")
     video.audio_path = final_path
     db.commit()
     db.refresh(video)
-
     return {
         "video_id": str(video.id),
         "audio_path": final_path,
         "file_size_bytes": os.path.getsize(final_path),
         "engine": "gTTS",
+        "speed": NARRATION_SPEED,
     }
