@@ -16,31 +16,47 @@ RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ["VIDEO_ID"]
 
-DEFAULT_SHOT_DURATION = 3.0
+DEFAULT_SHOT_DURATION = 4.0
 CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
-BLOCK_SIZE = 10  # higher than Railway's BLOCK_SIZE=2 since this runner has 7GB RAM
+BLOCK_SIZE = 10
 
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
-SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
-DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
+SCENE_START = re.compile(r"^\*\*Scene\s*[\d.]+.*?[\u2013\-]\s*(\d+)\s*s\*\*", re.IGNORECASE)
+SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**\s*:", re.IGNORECASE)
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
 
 def _parse_durations(production_plan):
+    """New format: duration is given once per SCENE (e.g. '**Scene 1 ... - 45 s**'),
+    not once per shot. This splits that scene duration evenly across the shots
+    listed under that scene."""
     durations = []
-    for line in production_plan.splitlines():
-        line = line.strip()
-        if not SHOT_START.match(line):
+    current_scene_seconds = None
+    current_scene_shot_lines = []
+
+    def _flush():
+        if not current_scene_shot_lines:
+            return
+        total = current_scene_seconds if current_scene_seconds else DEFAULT_SHOT_DURATION * len(current_scene_shot_lines)
+        per_shot = total / len(current_scene_shot_lines)
+        durations.extend([per_shot] * len(current_scene_shot_lines))
+
+    for raw_line in production_plan.splitlines():
+        line = raw_line.strip()
+        scene_match = SCENE_START.match(line)
+        if scene_match:
+            _flush()
+            current_scene_seconds = float(scene_match.group(1))
+            current_scene_shot_lines = []
             continue
-        match = DURATION_PATTERN.search(line)
-        if match:
-            durations.append(float(match.group(1)))
-        else:
-            durations.append(DEFAULT_SHOT_DURATION)
+        if SHOT_START.match(line):
+            current_scene_shot_lines.append(line)
+
+    _flush()
     return durations
 
 
@@ -56,22 +72,19 @@ def _download_image(url, dest_path):
     return False
 
 
-def _ken_burns_clip(image_path, duration):
+def _static_clip(image_path, duration):
+    """No zoom, no animated motion. Crop to fill the frame exactly, hold still,
+    only the crossfade transition remains."""
     target_w, target_h = RESOLUTION
     base_clip = ImageClip(image_path)
     src_w, src_h = base_clip.size
 
-    scale = max(target_w / src_w, target_h / src_h) * 1.15
+    scale = max(target_w / src_w, target_h / src_h)
     resized_w = int(src_w * scale)
     resized_h = int(src_h * scale)
 
     clip = base_clip.set_duration(duration)
     clip = clip.resize(newsize=(resized_w, resized_h))
-
-    def zoom(t):
-        return 1 + 0.03 * (t / duration)
-
-    clip = clip.resize(zoom)
     clip = clip.set_position(("center", "center"))
     clip = clip.crop(x_center=resized_w / 2, y_center=resized_h / 2, width=target_w, height=target_h)
     clip = clip.crossfadein(min(CROSSFADE, duration / 2))
@@ -102,7 +115,7 @@ def _render_block(shot_indices, urls, durations, images_dir, block_output_path):
                 errors.append("shot " + str(i) + ": download failed")
                 continue
         try:
-            clip = _ken_burns_clip(img_path, dur)
+            clip = _static_clip(img_path, dur)
             clips.append(clip)
         except Exception as e:
             skipped.append(i)
@@ -173,6 +186,7 @@ def main():
         sys.exit(1)
     urls = asset_urls[:n]
     durations = durations[:n]
+    print(f"Matched {n} shots to durations. Total runtime: {sum(durations):.1f}s")
 
     silent_path = os.path.join(WORK_DIR, "silent_final.mp4")
     final_path = os.path.join(WORK_DIR, "final.mp4")
