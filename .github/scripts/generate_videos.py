@@ -82,14 +82,15 @@ def _poll_clip(task_id):
 
 
 def _save_progress(clip_urls):
+    good_so_far = [u for u in clip_urls if u]
     try:
         patch_resp = requests.patch(
             f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}",
-            json={"clip_urls": clip_urls},
+            json={"clip_urls": good_so_far},
             timeout=30,
         )
         patch_resp.raise_for_status()
-        print(f"Saved progress to Railway: {len([u for u in clip_urls if u])} clips.")
+        print(f"Saved progress to Railway: {len(good_so_far)} clips.")
     except requests.RequestException as e:
         print(f"WARNING: failed to save progress to Railway: {type(e).__name__}: {str(e)[:150]}")
 
