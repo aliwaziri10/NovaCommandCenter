@@ -10,11 +10,13 @@ from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import run_asset_generation, _parse_shots
 from app.agents.narration_agent import run_narration
 from app.agents.assembly_agent import run_assembly
+from app.agents.github_actions_client import trigger_workflow
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
 ASSET_BATCH_SIZE = 5
 STALE_TASK_MINUTES = 30
+CLIP_COOLDOWN_MINUTES = 25  # a 3-shot Agnes batch takes roughly 10-20 min; avoid re-triggering mid-run
 LOG_PATH = "/app/data/supervisor_log.json"
 
 
@@ -58,6 +60,22 @@ def _has_active_task(db, agent_name, id_key, id_value):
     return False
 
 
+def _has_recent_task(db, agent_name, id_key, id_value, minutes):
+    """Unlike _has_active_task, this checks ANY task (regardless of status)
+    created within the cooldown window. Used for fire-and-forget GitHub Actions
+    triggers, where we have no visibility into whether the run is still going."""
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    tasks = db.query(Task).filter(
+        Task.agent_name == agent_name,
+        Task.created_at >= cutoff,
+    ).all()
+    for t in tasks:
+        payload = t.payload or {}
+        if str(payload.get(id_key)) == str(id_value):
+            return True
+    return False
+
+
 def _find_next_task(db):
     videos = db.query(Video).filter(Video.status != "assembled").all()
 
@@ -65,13 +83,37 @@ def _find_next_task(db):
         if not video.asset_urls or not video.production_plan or not video.audio_path:
             continue
         total_shots = len(_parse_shots(video.production_plan))
-        if total_shots and len(video.asset_urls) >= total_shots:
-            vid = str(video.id)
-            if _has_active_task(db, "assembly", "video_id", vid):
-                continue
-            if _failed_attempts(db, "assembly", "video_id", vid) >= MAX_RETRIES:
-                continue
-            return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
+        if not total_shots:
+            continue
+        clip_urls = video.clip_urls or []
+        clips_done = len([u for u in clip_urls if u])
+        if clips_done < total_shots:
+            continue  # clips not finished yet — handled by the video_clips stage below
+        vid = str(video.id)
+        if _has_active_task(db, "assembly", "video_id", vid):
+            continue
+        if _failed_attempts(db, "assembly", "video_id", vid) >= MAX_RETRIES:
+            continue
+        return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
+
+    for video in videos:
+        if not video.asset_urls or not video.production_plan or not video.audio_path:
+            continue
+        total_shots = len(_parse_shots(video.production_plan))
+        if not total_shots:
+            continue
+        clip_urls = video.clip_urls or []
+        clips_done = len([u for u in clip_urls if u])
+        if clips_done >= total_shots:
+            continue
+        vid = str(video.id)
+        if _has_recent_task(db, "video_clips", "video_id", vid, CLIP_COOLDOWN_MINUTES):
+            continue
+        return {
+            "agent_name": "video_clips",
+            "payload": {"video_id": vid},
+            "title": "Generate video clips for " + vid[:8] + " (" + str(clips_done) + "/" + str(total_shots) + ")",
+        }
 
     for video in videos:
         if not video.asset_urls or not video.production_plan or video.audio_path:
@@ -158,6 +200,11 @@ def _execute(db, agent_name, payload):
         )
     if agent_name == "narration":
         return run_narration(db, video_id=payload["video_id"])
+    if agent_name == "video_clips":
+        triggered = trigger_workflow("generate_videos.yml", {"video_id": payload["video_id"]})
+        if not triggered:
+            raise RuntimeError("Failed to trigger generate_videos.yml GitHub Actions workflow.")
+        return {"workflow_triggered": True, "video_id": payload["video_id"]}
     if agent_name == "assembly":
         return run_assembly(db, video_id=payload["video_id"])
     raise ValueError("Unknown agent_name: " + str(agent_name))
