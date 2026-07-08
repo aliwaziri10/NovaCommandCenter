@@ -9,14 +9,17 @@ from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import run_asset_generation, _parse_shots
 from app.agents.narration_agent import run_narration
-from app.agents.assembly_agent import run_assembly
 from app.agents.github_actions_client import trigger_workflow
+# NOTE: run_assembly (Railway-native) is intentionally no longer imported/called —
+# assembly now runs via the assemble.yml GitHub Actions workflow instead, same
+# pattern as video_clips, to avoid crashing Railway's 512MB RAM stitching real clips.
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
 ASSET_BATCH_SIZE = 5
 STALE_TASK_MINUTES = 30
 CLIP_COOLDOWN_MINUTES = 25  # a 3-shot Agnes batch takes roughly 10-20 min; avoid re-triggering mid-run
+ASSEMBLY_COOLDOWN_MINUTES = 35  # assemble.yml has timeout-minutes: 30; give a 5-min safety margin before re-trigger
 LOG_PATH = "/app/data/supervisor_log.json"
 
 
@@ -90,7 +93,9 @@ def _find_next_task(db):
         if clips_done < total_shots:
             continue  # clips not finished yet — handled by the video_clips stage below
         vid = str(video.id)
-        if _has_active_task(db, "assembly", "video_id", vid):
+        # Fire-and-forget like video_clips: use recency cooldown, not active-status check,
+        # since we have no visibility into whether assemble.yml is still running.
+        if _has_recent_task(db, "assembly", "video_id", vid, ASSEMBLY_COOLDOWN_MINUTES):
             continue
         if _failed_attempts(db, "assembly", "video_id", vid) >= MAX_RETRIES:
             continue
@@ -206,7 +211,10 @@ def _execute(db, agent_name, payload):
             raise RuntimeError("Failed to trigger generate_videos.yml GitHub Actions workflow.")
         return {"workflow_triggered": True, "video_id": payload["video_id"]}
     if agent_name == "assembly":
-        return run_assembly(db, video_id=payload["video_id"])
+        triggered = trigger_workflow("assemble.yml", {"video_id": payload["video_id"]})
+        if not triggered:
+            raise RuntimeError("Failed to trigger assemble.yml GitHub Actions workflow.")
+        return {"workflow_triggered": True, "video_id": payload["video_id"]}
     raise ValueError("Unknown agent_name: " + str(agent_name))
 
 
