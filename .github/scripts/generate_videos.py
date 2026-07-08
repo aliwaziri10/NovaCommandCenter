@@ -18,6 +18,8 @@ MAX_WAIT_SECONDS = 240
 POLL_INTERVAL_SECONDS = 10
 MIN_SECONDS_BETWEEN_SUBMITS = 65  # Agnes allows 1 request per 60s — 65s gives safety margin
 
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))
+
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
@@ -80,15 +82,14 @@ def _poll_clip(task_id):
 
 
 def _save_progress(clip_urls):
-    good_so_far = [u for u in clip_urls if u]
     try:
         patch_resp = requests.patch(
             f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}",
-            json={"clip_urls": good_so_far},
+            json={"clip_urls": clip_urls},
             timeout=30,
         )
         patch_resp.raise_for_status()
-        print(f"Saved progress to Railway: {len(good_so_far)} clips.")
+        print(f"Saved progress to Railway: {len([u for u in clip_urls if u])} clips.")
     except requests.RequestException as e:
         print(f"WARNING: failed to save progress to Railway: {type(e).__name__}: {str(e)[:150]}")
 
@@ -109,16 +110,33 @@ def main():
         print("ERROR: no shots parsed from production_plan")
         sys.exit(1)
 
-    print(f"Parsed {len(all_shots)} shots. Generating video clips ONE AT A TIME "
-          f"({MIN_SECONDS_BETWEEN_SUBMITS}s between submissions, per Agnes's 1/min limit)...")
+    total = len(all_shots)
 
-    clip_urls = [None] * len(all_shots)
+    existing = video.get("clip_urls") or []
+    clip_urls = [None] * total
+    for i in range(min(len(existing), total)):
+        clip_urls[i] = existing[i]
+
+    already_done = [i for i, u in enumerate(clip_urls) if u]
+    missing = [i for i, u in enumerate(clip_urls) if not u]
+
+    print(f"Total shots: {total}. Already done: {len(already_done)}. Missing: {len(missing)}.")
+
+    if not missing:
+        print("All shots already have clips. Nothing to do.")
+        return
+
+    batch = missing[:BATCH_SIZE]
+    print(f"This run will process {len(batch)} shot(s): {batch}")
+
     failure_reasons = []
     last_submit_time = 0.0
 
-    for index, description in enumerate(all_shots):
+    for index in batch:
+        description = all_shots[index]
+
         elapsed = time.monotonic() - last_submit_time
-        if elapsed < MIN_SECONDS_BETWEEN_SUBMITS:
+        if elapsed < MIN_SECONDS_BETWEEN_SUBMITS and last_submit_time > 0:
             wait_for = MIN_SECONDS_BETWEEN_SUBMITS - elapsed
             print(f"Waiting {wait_for:.0f}s before next submission (rate limit)...")
             time.sleep(wait_for)
@@ -128,25 +146,28 @@ def main():
 
         if not task_id:
             failure_reasons.append(f"shot {index}: {error}")
-            print(f"Shot {index+1}/{len(all_shots)}: FAILED ({error})")
+            print(f"Shot {index+1}/{total}: FAILED ({error})")
         else:
             url, error = _poll_clip(task_id)
             if url:
                 clip_urls[index] = url
-                print(f"Shot {index+1}/{len(all_shots)}: OK -> {url}")
+                print(f"Shot {index+1}/{total}: OK -> {url}")
             else:
                 failure_reasons.append(f"shot {index}: {error}")
-                print(f"Shot {index+1}/{len(all_shots)}: FAILED ({error})")
+                print(f"Shot {index+1}/{total}: FAILED ({error})")
 
         _save_progress(clip_urls)
         good_so_far = len([u for u in clip_urls if u])
-        print(f"Progress: {good_so_far}/{len(all_shots)} clips done so far.")
+        print(f"Progress: {good_so_far}/{total} clips done overall.")
 
-    generated = len([u for u in clip_urls if u])
-    failed = len([u for u in clip_urls if not u])
-    print(f"DONE. Generated: {generated}, Failed: {failed}")
+    generated_this_run = len([i for i in batch if clip_urls[i]])
+    failed_this_run = len(batch) - generated_this_run
+    print(f"BATCH DONE. This run generated: {generated_this_run}, failed: {failed_this_run}")
     if failure_reasons:
         print("Failure reasons:", failure_reasons)
+
+    remaining = total - len([u for u in clip_urls if u])
+    print(f"Remaining shots still needed: {remaining}")
 
 
 if __name__ == "__main__":
