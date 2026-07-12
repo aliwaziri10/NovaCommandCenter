@@ -7,7 +7,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 import os
 
-from app.database import get_db
+from app.database import get_db, month_key_expr
 from app.models import Topic, Script, Video, Short, Revenue, Task
 from app.schemas import CEODashboardResponse, KPIDashboardResponse, PipelineCounts, AgentSummary, TopicResponse
 from app.agents.narration_agent import run_narration
@@ -48,7 +48,7 @@ def get_ceo_dashboard(db: Session = Depends(get_db)):
     )
 
     six_months_ago = date.today().replace(day=1) - timedelta(days=150)
-    month_key = func.strftime("%Y-%m", Revenue.date)
+    month_key = month_key_expr(Revenue.date)
     revenue_rows = (
         db.query(
             month_key.label("month"),
