@@ -1,4 +1,3 @@
-import glob
 import os
 import sqlite3
 
@@ -8,35 +7,38 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 TABLES = ["users", "topics", "scripts", "videos", "shorts", "revenue", "sponsors", "tasks"]
 
-SEARCH_ROOTS = ["/app", "/data", "/mnt", "/var/lib/containers"]
+EXACT_CANDIDATES = [
+    "/app/data/nova.db",
+    "/data/nova.db",
+    "/app/nova.db",
+    "./data/nova.db",
+]
 
 
 @router.get("/dump-sqlite")
 def dump_sqlite():
-    """Read-only: finds the legacy local SQLite db (if the volume still has
-    it) and returns every row from every known table as JSON. Does not
-    write anything, does not touch Postgres. Searches only known app/volume
-    directories (not the whole filesystem) to avoid hanging."""
-    candidates: list[str] = []
-    for root in SEARCH_ROOTS:
-        if os.path.isdir(root):
-            candidates.extend(glob.glob(f"{root}/**/nova.db", recursive=True))
-            candidates.extend(glob.glob(f"{root}/**/*.db", recursive=True))
+    """Read-only: checks known exact paths for the legacy local SQLite db
+    and returns every row from every known table as JSON. No recursive
+    filesystem scanning (that hung before). Does not write anything."""
+    found = None
+    for p in EXACT_CANDIDATES:
+        if os.path.isfile(p):
+            found = p
+            break
 
-    if not candidates:
+    if not found:
         listing = {}
-        for root in SEARCH_ROOTS:
-            if os.path.isdir(root):
+        for d in ["/app", "/app/data", "/data"]:
+            if os.path.isdir(d):
                 try:
-                    listing[root] = os.listdir(root)
+                    listing[d] = os.listdir(d)
                 except Exception as e:
-                    listing[root] = f"error: {e}"
+                    listing[d] = f"error: {e}"
             else:
-                listing[root] = "does not exist"
-        return {"error": "no .db file found", "searched_roots": SEARCH_ROOTS, "directory_listing": listing}
+                listing[d] = "does not exist"
+        return {"error": "no .db file found at known paths", "checked": EXACT_CANDIDATES, "directory_listing": listing}
 
-    sqlite_path = candidates[0]
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(found)
     conn.row_factory = sqlite3.Row
     data = {}
     for t in TABLES:
@@ -46,4 +48,4 @@ def dump_sqlite():
         except Exception as e:
             data[t] = f"error reading table: {e}"
     conn.close()
-    return {"sqlite_path": sqlite_path, "all_candidates_found": candidates, "tables": data}
+    return {"sqlite_path": found, "tables": data}
