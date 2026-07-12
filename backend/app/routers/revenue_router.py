@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, month_key_expr
 from app.models import Revenue, Sponsor
 from app.schemas import RevenueSummaryResponse
 
@@ -11,7 +11,7 @@ router = APIRouter(prefix="/revenue", tags=["revenue"])
 
 @router.get("/summary", response_model=RevenueSummaryResponse)
 def get_revenue_summary(db: Session = Depends(get_db)):
-    month_key = func.strftime("%Y-%m", Revenue.date)
+    month_key = month_key_expr(Revenue.date)
     monthly_rows = (
         db.query(
             month_key.label("month"),
