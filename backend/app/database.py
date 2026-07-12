@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, func
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
@@ -40,3 +40,11 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def month_key_expr(column):
+    """Return a SQLAlchemy expression that formats a date column as 'YYYY-MM',
+    working on both SQLite (strftime) and Postgres (to_char)."""
+    if engine.dialect.name == "postgresql":
+        return func.to_char(column, "YYYY-MM")
+    return func.strftime("%Y-%m", column)
