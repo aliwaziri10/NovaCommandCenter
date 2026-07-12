@@ -2,6 +2,7 @@ import requests
 import json
 from urllib.parse import quote
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.models.topic import Topic
 
 
@@ -60,6 +61,10 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
         if not isinstance(t, dict):
             continue
         title = t.get("title", "Untitled")
+        # Pre-check first (cheap, avoids most round trips), but the real
+        # guarantee is the DB-level UNIQUE constraint on topics.title —
+        # two concurrent/retrying runs can both pass this check before
+        # either commits, so we still have to handle the race below.
         existing = db.query(Topic).filter(Topic.title == title).first()
         if existing:
             skipped.append(title)
@@ -72,8 +77,14 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
             notes=t.get("notes", ""),
         )
         db.add(topic)
-        created.append(topic)
-    db.commit()
+        try:
+            db.commit()
+            created.append(topic)
+        except IntegrityError:
+            # Another concurrent/retrying run inserted this exact title
+            # first. Not a real error — treat it as a duplicate and move on.
+            db.rollback()
+            skipped.append(title)
     return {
         "created": len(created),
         "titles": [t.title for t in created],
