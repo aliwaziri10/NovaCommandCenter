@@ -38,6 +38,16 @@ CAMERA_MOVES = [
     "tight dynamic close-up with shallow depth of field",
 ]
 
+# Lens/film-stock texture rotated alongside CAMERA_MOVES so consecutive shots
+# don't all read as the same flat digital render — varies focus falloff,
+# framing width, and grain/motion-blur character shot to shot.
+LENS_STYLES = [
+    "shot on 35mm anamorphic lens, shallow depth of field, subtle lens flare",
+    "shot on vintage 50mm prime lens, soft natural bokeh, warm film tone",
+    "wide-angle lens, deep focus, expansive epic framing",
+    "telephoto compression, soft background blur, natural motion blur",
+]
+
 
 def _parse_shots(production_plan):
     shots = []
@@ -85,10 +95,11 @@ def _find_next_video_needing_clips():
 
 def _submit_clip(description, shot_index):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
+    lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
     prompt = (
-        f"{description}, shot by a Hollywood cinematographer, {camera_move}, "
+        f"{description}, shot by a Hollywood cinematographer, {camera_move}, {lens_style}, "
         f"dramatic cinematic lighting, high-energy fast-paced documentary style, "
-        f"realistic motion, high detail, engaging dynamic composition"
+        f"realistic motion, natural motion blur, high detail, engaging dynamic composition"
     )
     body = {
         "model": "agnes-video-v2.0",
