@@ -10,7 +10,7 @@ if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS
 
 import imageio_ffmpeg
-from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips
+from moviepy.editor import ImageClip, VideoFileClip, CompositeVideoClip, concatenate_videoclips
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
@@ -20,6 +20,24 @@ DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
+KEN_BURNS_ZOOM = 0.08  # slow 8% push-in over a still shot's duration
+
+# Cinematic post-grade: unifies AI-generated clips (which vary in color/exposure
+# shot to shot) into one consistent "house look" — contrast/curve grade, a subtle
+# teal-shadow/warm-highlight split tone, gentle vignette to guide the eye, and a
+# very light film grain so it doesn't read as flat/plasticky AI video. Pattern
+# follows common open-source ffmpeg cinematic-grade pipelines (curves + colorbalance
+# + vignette + noise is the standard combo across most of them).
+CINEMATIC_VF = (
+    "eq=contrast=1.08:saturation=0.95,"
+    "curves=preset=medium_contrast,"
+    "colorbalance=rs=-0.05:bs=0.05:rh=0.05:bh=-0.05,"
+    "vignette=PI/5,"
+    "noise=c0s=6:allf=t+u"
+)
+# Broadcast-standard loudness normalization so every episode plays back at a
+# consistent, comfortable volume regardless of narration source levels.
+LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
@@ -91,20 +109,21 @@ def _download_file(url, dest_path):
 
 
 def _still_image_clip(image_path, duration):
+    """Still-image fallback shot with a slow Ken Burns push-in instead of a
+    static frame, so fallback shots don't look dead next to real AI video clips."""
     target_w, target_h = RESOLUTION
-    base_clip = ImageClip(image_path)
+    base_clip = ImageClip(image_path).set_duration(duration)
     src_w, src_h = base_clip.size
+    cover_scale = max(target_w / src_w, target_h / src_h)
 
-    scale = max(target_w / src_w, target_h / src_h)
-    resized_w = int(src_w * scale)
-    resized_h = int(src_h * scale)
+    def _scale(t):
+        frac = (t / duration) if duration > 0 else 0.0
+        return cover_scale * (1.0 + KEN_BURNS_ZOOM * frac)
 
-    clip = base_clip.set_duration(duration)
-    clip = clip.resize(newsize=(resized_w, resized_h))
-    clip = clip.set_position(("center", "center"))
-    clip = clip.crop(x_center=resized_w / 2, y_center=resized_h / 2, width=target_w, height=target_h)
-    clip = clip.crossfadein(min(CROSSFADE, duration / 2))
-    return clip
+    moving = base_clip.resize(_scale).set_position("center")
+    framed = CompositeVideoClip([moving], size=RESOLUTION).set_duration(duration)
+    framed = framed.crossfadein(min(CROSSFADE, duration / 2))
+    return framed
 
 
 def _video_clip(video_path, duration):
@@ -282,13 +301,17 @@ def main():
     print("Concatenating video blocks...")
     _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", silent_path])
 
-    print("Merging narration audio...")
+    print("Applying cinematic grade and merging narration audio...")
     _run_ffmpeg([
         "-i", silent_path,
         "-i", audio_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-c:v", "copy",
+        "-vf", CINEMATIC_VF,
+        "-af", LOUDNORM_AF,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "19",
         "-c:a", "aac",
         "-shortest",
         final_path,
