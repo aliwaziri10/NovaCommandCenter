@@ -23,6 +23,21 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
+# Cinematic Director: rotates through dynamic camera moves and energy cues
+# instead of one static "documentary style" phrase on every shot, so cuts
+# feel alive and paced for a fast-attention Gen Z audience, not a slow
+# 1950s newsreel.
+CAMERA_MOVES = [
+    "sweeping drone-style push-in",
+    "fast tracking shot alongside the subject",
+    "dramatic low-angle tilt up",
+    "quick whip-pan reveal",
+    "slow dramatic zoom with parallax",
+    "handheld tracking shot, urgent energy",
+    "sweeping crane shot rising over the scene",
+    "tight dynamic close-up with shallow depth of field",
+]
+
 
 def _parse_shots(production_plan):
     shots = []
@@ -68,8 +83,13 @@ def _find_next_video_needing_clips():
     return candidates[0]["id"]
 
 
-def _submit_clip(description):
-    prompt = f"{description}, cinematic documentary style, realistic motion, high detail"
+def _submit_clip(description, shot_index):
+    camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
+    prompt = (
+        f"{description}, shot by a Hollywood cinematographer, {camera_move}, "
+        f"dramatic cinematic lighting, high-energy fast-paced documentary style, "
+        f"realistic motion, high detail, engaging dynamic composition"
+    )
     body = {
         "model": "agnes-video-v2.0",
         "prompt": prompt,
@@ -180,7 +200,7 @@ def main():
             time.sleep(wait_for)
 
         last_submit_time = time.monotonic()
-        task_id, error = _submit_clip(description)
+        task_id, error = _submit_clip(description, index)
 
         if not task_id:
             failure_reasons.append(f"shot {index}: {error}")
