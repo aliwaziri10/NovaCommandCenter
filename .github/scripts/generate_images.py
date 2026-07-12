@@ -8,7 +8,7 @@ import requests
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
-VIDEO_ID = os.environ["VIDEO_ID"]
+VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
 IMAGE_MODEL = "flux"
 IMAGE_WIDTH = 1920
@@ -34,9 +34,45 @@ def _parse_shots(production_plan):
     return shots
 
 
+def _find_next_video_needing_images():
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    resp.raise_for_status()
+    videos = resp.json()
+
+    candidates = []
+    for v in videos:
+        if v.get("status") == "assembled":
+            continue
+        if not v.get("audio_path"):
+            continue
+        production_plan = v.get("production_plan")
+        if not production_plan:
+            continue
+        shots = _parse_shots(production_plan)
+        if not shots:
+            continue
+        existing = len(v.get("asset_urls") or [])
+        if existing < len(shots):
+            candidates.append(v)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]["id"]
+
+
 def main():
+    video_id = VIDEO_ID
+    if not video_id:
+        print("No VIDEO_ID provided — auto-selecting next video needing images...")
+        video_id = _find_next_video_needing_images()
+        if not video_id:
+            print("No videos currently need images. Exiting cleanly.")
+            return
+        print(f"Auto-selected video_id: {video_id}")
+
     print("Fetching video data from Railway...")
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}", timeout=30)
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
     resp.raise_for_status()
     video = resp.json()
 
@@ -81,12 +117,11 @@ def main():
 
         time.sleep(2)
 
-        # Save progress every 10 shots, so a crash never loses everything
         if (i + 1) % 10 == 0 or (i + 1) == len(all_shots):
             good_so_far = [u for u in new_urls if u]
             print(f"Saving progress: {len(good_so_far)} images so far...")
             patch_resp = requests.patch(
-                f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}",
+                f"{RAILWAY_URL}/api/v1/videos/{video_id}",
                 json={"asset_urls": good_so_far},
                 timeout=30,
             )
