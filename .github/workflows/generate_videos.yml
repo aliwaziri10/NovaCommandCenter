@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       video_id:
-        description: "Video ID to generate video clips for"
-        required: true
+        description: "Video ID to generate video clips for (leave blank to auto-select)"
+        required: false
         type: string
+  schedule:
+    - cron: "30 * * * *"
 
 jobs:
   generate_videos:
