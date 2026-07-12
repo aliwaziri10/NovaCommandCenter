@@ -14,7 +14,7 @@ from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
-VIDEO_ID = os.environ["VIDEO_ID"]
+VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
 DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
@@ -30,6 +30,15 @@ DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", r
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
 
+def _parse_shots_count(production_plan):
+    count = 0
+    for line in production_plan.splitlines():
+        line = line.strip()
+        if SHOT_START.match(line):
+            count += 1
+    return count
+
+
 def _parse_durations(production_plan):
     durations = []
     for line in production_plan.splitlines():
@@ -42,6 +51,31 @@ def _parse_durations(production_plan):
         else:
             durations.append(DEFAULT_SHOT_DURATION)
     return durations
+
+
+def _find_next_video_to_assemble():
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    resp.raise_for_status()
+    videos = resp.json()
+
+    candidates = []
+    for v in videos:
+        if v.get("status") == "assembled":
+            continue
+        production_plan = v.get("production_plan")
+        if not production_plan:
+            continue
+        total_shots = _parse_shots_count(production_plan)
+        if total_shots == 0:
+            continue
+        clip_urls = v.get("clip_urls") or []
+        if len(clip_urls) >= total_shots:
+            candidates.append(v)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]["id"]
 
 
 def _download_file(url, dest_path):
@@ -162,8 +196,17 @@ def main():
     os.makedirs(media_dir, exist_ok=True)
     os.makedirs(blocks_dir, exist_ok=True)
 
+    video_id = VIDEO_ID
+    if not video_id:
+        print("No VIDEO_ID provided — auto-selecting next video ready to assemble...")
+        video_id = _find_next_video_to_assemble()
+        if not video_id:
+            print("No videos currently ready to assemble. Exiting cleanly.")
+            return
+        print(f"Auto-selected video_id: {video_id}")
+
     print("Fetching video data from Railway...")
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}", timeout=30)
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
     resp.raise_for_status()
     video = resp.json()
 
@@ -190,7 +233,7 @@ def main():
     print("Downloading narration audio from Railway...")
     audio_path = os.path.join(WORK_DIR, "narration.mp3")
     audio_resp = requests.get(
-        f"{RAILWAY_URL}/api/v1/download/narration/{VIDEO_ID}",
+        f"{RAILWAY_URL}/api/v1/download/narration/{video_id}",
         headers=HEADERS,
         timeout=60,
     )
@@ -236,4 +279,35 @@ def main():
             safe_p = p.replace("'", "'\\''")
             f.write("file '" + safe_p + "'\n")
 
-    print("Concatenating
+    print("Concatenating video blocks...")
+    _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", silent_path])
+
+    print("Merging narration audio...")
+    _run_ffmpeg([
+        "-i", silent_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        final_path,
+    ])
+
+    print("Uploading finished video back to Railway...")
+    with open(final_path, "rb") as f:
+        upload_resp = requests.post(
+            f"{RAILWAY_URL}/api/v1/upload/video/{video_id}",
+            headers=HEADERS,
+            files={"file": ("final.mp4", f, "video/mp4")},
+            timeout=300,
+        )
+    upload_resp.raise_for_status()
+
+    print("SUCCESS:", upload_resp.json())
+    if all_errors:
+        print("Note: some shots had issues:", all_errors)
+
+
+if __name__ == "__main__":
+    main()
