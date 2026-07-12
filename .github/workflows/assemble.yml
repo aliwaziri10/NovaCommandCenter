@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       video_id:
-        description: "Video ID to assemble"
-        required: true
+        description: "Video ID to assemble (leave blank to auto-select)"
+        required: false
         type: string
+  schedule:
+    - cron: "45 */6 * * *"
 
 jobs:
   assemble:
