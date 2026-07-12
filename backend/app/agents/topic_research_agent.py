@@ -1,3 +1,4 @@
+import random
 import requests
 import json
 from urllib.parse import quote
@@ -7,22 +8,46 @@ from app.models.topic import Topic
 
 
 def run_topic_research(db: Session, category: str = "History", count: int = 5):
-    """Free version — uses Pollinations.ai instead of a paid API."""
+    """Free version — uses Pollinations.ai instead of a paid API.
+
+    FIX (2026-07-12): previously the exact same prompt was sent every run,
+    which Pollinations appears to cache — every call was returning the
+    identical single topic ("The Silk Road Reimagined...") which already
+    existed, so `created` stayed at 0 run after run. Two changes fix this:
+    1. A random seed is embedded in both the prompt text and the request
+       params, so the request can't be served from cache.
+    2. Existing topic titles are listed explicitly and the model is told
+       not to repeat them, instead of relying only on the after-the-fact
+       DB duplicate check.
+    """
+    existing_titles = [t.title for t in db.query(Topic.title).all()]
+    avoid_block = ""
+    if existing_titles:
+        avoid_block = (
+            " Do NOT reuse or closely rephrase any of these existing titles: "
+            + "; ".join(existing_titles[:50]) + "."
+        )
+
+    seed = random.randint(1, 10_000_000)
+
     system_prompt = (
         "You are a research assistant for an alternate-history YouTube channel. "
         "Respond with ONLY a valid JSON array. No markdown, no commentary, no code fences."
     )
     prompt = (
-        f'Generate {count} new video topic ideas in the category "{category}". '
+        f'Generate exactly {count} new, distinct video topic ideas in the category "{category}".'
+        f'{avoid_block} '
         f'Format exactly: [{{"title": "...", "category": "{category}", '
-        f'"trend_score": 0-100, "notes": "1-2 sentence pitch"}}]'
+        f'"trend_score": 0-100, "notes": "1-2 sentence pitch"}}] '
+        f'(request id {seed})'
     )
     url = f"https://text.pollinations.ai/{quote(prompt)}"
     params = {
         "model": "openai",
         "system": system_prompt,
         "json": "true",
-        "temperature": 0.8,
+        "temperature": 0.9,
+        "seed": seed,
     }
     response = requests.get(url, params=params, timeout=30)
     raw = response.text.strip()
