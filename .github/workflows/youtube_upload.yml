@@ -1,0 +1,26 @@
+name: YouTube Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Optional specific video ID"
+        required: false
+  schedule:
+    - cron: "15 */6 * * *"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - run: python .github/scripts/youtube_upload.py
+        env:
+          RAILWAY_URL: ${{ secrets.RAILWAY_URL }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
