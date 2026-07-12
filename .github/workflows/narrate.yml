@@ -4,14 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       video_id:
-        description: "Video ID to narrate"
-        required: true
+        description: "Video ID to narrate (leave blank to auto-select)"
+        required: false
         type: string
       voice:
         description: "Kokoro voice to use"
         required: false
         type: string
         default: "am_adam"
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
   narrate:
