@@ -5,7 +5,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import settings
 from app.database import engine, Base, SessionLocal
 from app.routers.crud_factory import make_crud_router
-from app.routers import dashboard, content, revenue_router, tasks_router, download_router, upload_router, supervisor_router
+from app.routers import dashboard, content, revenue_router, tasks_router, download_router, upload_router, supervisor_router, admin_migrate
 from app.models import User, Topic, Script, Video, Short, Sponsor, Revenue, Task
 from app.agents.supervisor_agent import run_supervisor_cycle
 from app.schemas import (
@@ -40,6 +40,7 @@ app.include_router(tasks_router.router, prefix="/api/v1")
 app.include_router(download_router.router, prefix="/api/v1")
 app.include_router(upload_router.router, prefix="/api/v1")
 app.include_router(supervisor_router.router, prefix="/api/v1")
+app.include_router(admin_migrate.router, prefix="/api/v1")
 crud_routers = [
     make_crud_router("/users", User, UserResponse, UserCreate, UserUpdate, "users"),
     make_crud_router("/topics", Topic, TopicResponse, TopicCreate, TopicUpdate, "topics"),
