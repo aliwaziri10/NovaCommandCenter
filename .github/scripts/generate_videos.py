@@ -6,7 +6,7 @@ import time
 import requests
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
-VIDEO_ID = os.environ["VIDEO_ID"]
+VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 
 AGNES_BASE = "https://apihub.agnes-ai.com/v1/videos"
@@ -38,6 +38,34 @@ def _parse_shots(production_plan):
         if remainder:
             shots.append(remainder)
     return shots
+
+
+def _find_next_video_needing_clips():
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    resp.raise_for_status()
+    videos = resp.json()
+
+    candidates = []
+    for v in videos:
+        if v.get("status") == "assembled":
+            continue
+        production_plan = v.get("production_plan")
+        if not production_plan:
+            continue
+        shots = _parse_shots(production_plan)
+        if not shots:
+            continue
+        asset_urls = v.get("asset_urls") or []
+        if len(asset_urls) < len(shots):
+            continue  # images not done yet, not our turn
+        clip_urls = v.get("clip_urls") or []
+        if len(clip_urls) < len(shots):
+            candidates.append(v)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]["id"]
 
 
 def _submit_clip(description):
@@ -81,11 +109,11 @@ def _poll_clip(task_id):
     return None, "timed out waiting for clip"
 
 
-def _save_progress(clip_urls):
+def _save_progress(video_id, clip_urls):
     good_so_far = [u for u in clip_urls if u]
     try:
         patch_resp = requests.patch(
-            f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}",
+            f"{RAILWAY_URL}/api/v1/videos/{video_id}",
             json={"clip_urls": good_so_far},
             timeout=30,
         )
@@ -96,8 +124,17 @@ def _save_progress(clip_urls):
 
 
 def main():
+    video_id = VIDEO_ID
+    if not video_id:
+        print("No VIDEO_ID provided — auto-selecting next video needing clips...")
+        video_id = _find_next_video_needing_clips()
+        if not video_id:
+            print("No videos currently need clips. Exiting cleanly.")
+            return
+        print(f"Auto-selected video_id: {video_id}")
+
     print("Fetching video data from Railway...")
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}", timeout=30)
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
     resp.raise_for_status()
     video = resp.json()
 
@@ -157,7 +194,7 @@ def main():
                 failure_reasons.append(f"shot {index}: {error}")
                 print(f"Shot {index+1}/{total}: FAILED ({error})")
 
-        _save_progress(clip_urls)
+        _save_progress(video_id, clip_urls)
         good_so_far = len([u for u in clip_urls if u])
         print(f"Progress: {good_so_far}/{total} clips done overall.")
 
