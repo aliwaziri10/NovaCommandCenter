@@ -7,7 +7,7 @@ import soundfile as sf
 from kokoro import KPipeline
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
-VIDEO_ID = os.environ["VIDEO_ID"]
+VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 VOICE = os.environ.get("VOICE", "am_adam")
 
 WORK_DIR = "/tmp/nova_narration"
@@ -27,11 +27,34 @@ def _clean_narration_text(raw_content):
     return " ".join(clean_lines)
 
 
+def _find_next_video_needing_narration():
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    resp.raise_for_status()
+    videos = resp.json()
+    candidates = [
+        v for v in videos
+        if v.get("production_plan") and not v.get("audio_path")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]["id"]
+
+
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
 
+    video_id = VIDEO_ID
+    if not video_id:
+        print("No VIDEO_ID provided — auto-selecting next video needing narration...")
+        video_id = _find_next_video_needing_narration()
+        if not video_id:
+            print("No videos currently need narration. Exiting cleanly.")
+            return
+        print(f"Auto-selected video_id: {video_id}")
+
     print("Fetching video data from Railway")
-    video_resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{VIDEO_ID}", timeout=30)
+    video_resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
     video_resp.raise_for_status()
     video = video_resp.json()
 
@@ -81,7 +104,7 @@ def main():
     print("Uploading narration to Railway")
     with open(mp3_path, "rb") as f:
         upload_resp = requests.post(
-            f"{RAILWAY_URL}/api/v1/upload/narration/{VIDEO_ID}",
+            f"{RAILWAY_URL}/api/v1/upload/narration/{video_id}",
             files={"file": ("narration.mp3", f, "audio/mpeg")},
             timeout=120,
         )
