@@ -1,8 +1,12 @@
 import gc
+import json
 import os
 import re
 import subprocess
 import sys
+import time
+
+import numpy as np
 import requests
 
 from PIL import Image
@@ -10,11 +14,20 @@ if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS
 
 import imageio_ffmpeg
-from moviepy.editor import ImageClip, VideoFileClip, CompositeVideoClip, concatenate_videoclips
+from moviepy.editor import (
+    ImageClip,
+    VideoFileClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+    AudioFileClip,
+    CompositeAudioClip,
+    concatenate_audioclips,
+)
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
+ACE_MUSIC_API_KEY = os.environ.get("ACE_MUSIC_API_KEY")
 
 DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
@@ -22,12 +35,6 @@ RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
 KEN_BURNS_ZOOM = 0.08  # slow 8% push-in over a still shot's duration
 
-# Cinematic post-grade: unifies AI-generated clips (which vary in color/exposure
-# shot to shot) into one consistent "house look" — contrast/curve grade, a subtle
-# teal-shadow/warm-highlight split tone, gentle vignette to guide the eye, and a
-# very light film grain so it doesn't read as flat/plasticky AI video. Pattern
-# follows common open-source ffmpeg cinematic-grade pipelines (curves + colorbalance
-# + vignette + noise is the standard combo across most of them).
 CINEMATIC_VF = (
     "eq=contrast=1.08:saturation=0.95,"
     "curves=preset=medium_contrast,"
@@ -35,9 +42,21 @@ CINEMATIC_VF = (
     "vignette=PI/5,"
     "noise=c0s=6:allf=t+u"
 )
-# Broadcast-standard loudness normalization so every episode plays back at a
-# consistent, comfortable volume regardless of narration source levels.
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
+
+# --- Background score (ACE Music) ---
+# Nova's videos table has no per-shot sfx_cue/music_mood columns (unlike Marius),
+# so this generates ONE ambient/orchestral background score per video from a
+# mood prompt built off the title, ducked well under the narration. Per-shot SFX
+# is not implemented here - it needs a dedicated sfx_cue field added to the
+# script-generation step first, same as Marius has.
+ACE_MUSIC_BASES = ["https://api.acemusic.ai", "https://ai.acemusic.ai"]
+ACE_MUSIC_HEADERS = {
+    "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
+    "Content-Type": "application/json",
+}
+MUSIC_VOLUME = 0.22  # ducked well under narration
+LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would clip
 
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
@@ -109,8 +128,6 @@ def _download_file(url, dest_path):
 
 
 def _still_image_clip(image_path, duration):
-    """Still-image fallback shot with a slow Ken Burns push-in instead of a
-    static frame, so fallback shots don't look dead next to real AI video clips."""
     target_w, target_h = RESOLUTION
     base_clip = ImageClip(image_path).set_duration(duration)
     src_w, src_h = base_clip.size
@@ -208,6 +225,127 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
     return skipped, errors, True
 
 
+# ---------------------------------------------------------------------------
+# Background score (ACE Music)
+# ---------------------------------------------------------------------------
+
+def _poll_ace_music_task(task_id, out_path, base_url, max_wait=180, interval=8):
+    waited = 0
+    while waited < max_wait:
+        resp = requests.post(
+            f"{base_url}/query_result",
+            headers=ACE_MUSIC_HEADERS,
+            json={"task_id_list": [task_id]},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            print(f"ACE MUSIC POLL ERROR ({base_url}) {resp.status_code}: {resp.text}")
+            return None
+        entries = resp.json().get("data", [])
+        if not entries:
+            time.sleep(interval)
+            waited += interval
+            continue
+        entry = entries[0]
+        status = entry.get("status")
+        if status == 1:
+            result_list = json.loads(entry.get("result", "[]"))
+            if not result_list or not result_list[0].get("file"):
+                print(f"ACE Music task succeeded but no file in result: {result_list}")
+                return None
+            file_path = result_list[0]["file"]
+            audio_resp = requests.get(f"{base_url}{file_path}", timeout=60)
+            audio_resp.raise_for_status()
+            with open(out_path, "wb") as f:
+                f.write(audio_resp.content)
+            return out_path
+        if status == 2:
+            print(f"ACE Music task failed: {entry}")
+            return None
+        time.sleep(interval)
+        waited += interval
+    print(f"ACE Music task {task_id} timed out after {max_wait}s")
+    return None
+
+
+def _generate_background_music(prompt, duration, out_path):
+    if not ACE_MUSIC_API_KEY:
+        print("No ACE_MUSIC_API_KEY set - skipping background music.")
+        return None
+
+    for base in ACE_MUSIC_BASES:
+        try:
+            resp = requests.post(
+                f"{base}/release_task",
+                headers=ACE_MUSIC_HEADERS,
+                json={
+                    "prompt": prompt,
+                    "audio_duration": max(10, min(int(duration) + 5, 600)),
+                    "thinking": True,
+                },
+                timeout=60,
+            )
+            if resp.status_code >= 400:
+                print(f"ACE MUSIC ERROR ({base}) {resp.status_code}: {resp.text}")
+                continue
+            task_id = resp.json().get("data", {}).get("task_id")
+            if not task_id:
+                print(f"ACE Music response had no task_id ({base}): {resp.json()}")
+                continue
+            result = _poll_ace_music_task(task_id, out_path, base_url=base)
+            if result:
+                return result
+        except Exception as e:
+            print(f"ACE Music generation raised an exception on {base}, trying next host: {e}")
+
+    print("Continuing without background music - every ACE Music host failed this run.")
+    return None
+
+
+def _fit_audio_to_duration(audio_clip, target):
+    if audio_clip.duration >= target:
+        return audio_clip.subclip(0, target)
+    reps = int(target // audio_clip.duration) + 1
+    looped = concatenate_audioclips([audio_clip] * reps)
+    return looped.subclip(0, target)
+
+
+def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
+    samples = audio_clip.to_soundarray(fps=44100)
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+
+    if peak <= 0 or peak <= ceiling:
+        return audio_clip
+
+    scale = ceiling / peak
+    print(f"Safety limiter: peak was {peak:.3f}, exceeds ceiling {ceiling} - scaling mix by {scale:.3f}.")
+    return audio_clip.volumex(scale)
+
+
+def _build_mixed_audio(narration_path, music_mood, out_path):
+    narration_clip = AudioFileClip(narration_path)
+    duration = narration_clip.duration
+    layers = [narration_clip]
+
+    music_path = os.path.join(WORK_DIR, "background_music.mp3")
+    if _generate_background_music(music_mood, duration, music_path):
+        music_clip = AudioFileClip(music_path)
+        music_clip = _fit_audio_to_duration(music_clip, duration)
+        music_clip = music_clip.volumex(MUSIC_VOLUME)
+        layers.append(music_clip)
+    else:
+        print("Proceeding with narration-only audio for this video.")
+
+    mixed = CompositeAudioClip(layers).set_duration(duration)
+    mixed = _apply_safety_limiter(mixed)
+    mixed.write_audiofile(out_path, fps=44100, logger=None)
+
+    for layer in layers:
+        layer.close()
+    mixed.close()
+    return duration
+
+
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     media_dir = os.path.join(WORK_DIR, "media")
@@ -217,7 +355,7 @@ def main():
 
     video_id = VIDEO_ID
     if not video_id:
-        print("No VIDEO_ID provided — auto-selecting next video ready to assemble...")
+        print("No VIDEO_ID provided - auto-selecting next video ready to assemble...")
         video_id = _find_next_video_to_assemble()
         if not video_id:
             print("No videos currently ready to assemble. Exiting cleanly.")
@@ -232,9 +370,10 @@ def main():
     clip_urls = video.get("clip_urls")
     asset_urls = video.get("asset_urls")
     production_plan = video.get("production_plan")
+    title = video.get("title") or ""
 
     if clip_urls:
-        print(f"Found {len(clip_urls)} video clips — using real video clips for assembly.")
+        print(f"Found {len(clip_urls)} video clips - using real video clips for assembly.")
         use_clips = True
         urls = clip_urls
     elif asset_urls:
@@ -269,8 +408,13 @@ def main():
     durations = durations[:n]
 
     silent_path = os.path.join(WORK_DIR, "silent_final.mp4")
+    mixed_audio_path = os.path.join(WORK_DIR, "mixed_audio.wav")
     final_path = os.path.join(WORK_DIR, "final.mp4")
     concat_list_path = os.path.join(WORK_DIR, "concat_list.txt")
+
+    print("Building audio mix (narration + background score)...")
+    music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
+    _build_mixed_audio(audio_path, music_mood, mixed_audio_path)
 
     all_skipped = []
     all_errors = []
@@ -301,10 +445,10 @@ def main():
     print("Concatenating video blocks...")
     _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", silent_path])
 
-    print("Applying cinematic grade and merging narration audio...")
+    print("Applying cinematic grade and merging mixed audio...")
     _run_ffmpeg([
         "-i", silent_path,
-        "-i", audio_path,
+        "-i", mixed_audio_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-vf", CINEMATIC_VF,
