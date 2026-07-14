@@ -4,8 +4,8 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Depends, Header
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.video import Video
+from app.supabase_storage import upload_to_storage
 
-MEDIA_ROOT = "/app/data/media"
 ASSEMBLY_SECRET = os.environ.get("ASSEMBLY_SECRET")
 
 router = APIRouter(prefix="/upload", tags=["upload"])
@@ -29,21 +29,22 @@ async def upload_narration(video_id: str, file: UploadFile = File(...), db: Sess
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    audio_dir = os.path.join(MEDIA_ROOT, video_id, "audio")
-    os.makedirs(audio_dir, exist_ok=True)
-    dest_path = os.path.join(audio_dir, "narration.mp3")
-
     contents = await file.read()
-    with open(dest_path, "wb") as f:
-        f.write(contents)
 
-    video.audio_path = dest_path
+    # Uploaded to Supabase Storage (durable) instead of Railway's local disk.
+    # Railway's local filesystem is NOT durable - it is wiped on every
+    # restart/redeploy. Storing narration/final video only there was the
+    # root cause of videos silently never reaching YouTube: the file
+    # would vanish before the next scheduled pipeline step ran.
+    audio_url = upload_to_storage(f"narration/{video_id}.mp3", contents, "audio/mpeg")
+
+    video.audio_path = audio_url
     db.commit()
     db.refresh(video)
 
     return {
         "video_id": video_id,
-        "audio_path": dest_path,
+        "audio_path": audio_url,
         "file_size_bytes": len(contents),
     }
 
@@ -66,21 +67,18 @@ async def upload_video(
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    output_dir = os.path.join(MEDIA_ROOT, video_id, "output")
-    os.makedirs(output_dir, exist_ok=True)
-    dest_path = os.path.join(output_dir, "final.mp4")
-
     contents = await file.read()
-    with open(dest_path, "wb") as f:
-        f.write(contents)
 
+    video_url = upload_to_storage(f"final/{video_id}.mp4", contents, "video/mp4")
+
+    video.video_url = video_url
     video.status = "assembled"
     db.commit()
     db.refresh(video)
 
     return {
         "video_id": video_id,
-        "video_path": dest_path,
+        "video_path": video_url,
         "file_size_bytes": len(contents),
         "status": video.status,
     }
