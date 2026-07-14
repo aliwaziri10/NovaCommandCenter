@@ -23,10 +23,6 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
-# Cinematic Director: rotates through dynamic camera moves and energy cues
-# instead of one static "documentary style" phrase on every shot, so cuts
-# feel alive and paced for a fast-attention Gen Z audience, not a slow
-# 1950s newsreel.
 CAMERA_MOVES = [
     "sweeping drone-style push-in",
     "fast tracking shot alongside the subject",
@@ -38,9 +34,6 @@ CAMERA_MOVES = [
     "tight dynamic close-up with shallow depth of field",
 ]
 
-# Lens/film-stock texture rotated alongside CAMERA_MOVES so consecutive shots
-# don't all read as the same flat digital render — varies focus falloff,
-# framing width, and grain/motion-blur character shot to shot.
 LENS_STYLES = [
     "shot on 35mm anamorphic lens, shallow depth of field, subtle lens flare",
     "shot on vintage 50mm prime lens, soft natural bokeh, warm film tone",
@@ -82,7 +75,7 @@ def _find_next_video_needing_clips():
             continue
         asset_urls = v.get("asset_urls") or []
         if len(asset_urls) < len(shots):
-            continue  # images not done yet, not our turn
+            continue
         clip_urls = v.get("clip_urls") or []
         if len(clip_urls) < len(shots):
             candidates.append(v)
@@ -113,16 +106,33 @@ def _submit_clip(description, shot_index):
         submit = requests.post(AGNES_BASE, headers=HEADERS, json=body, timeout=60)
     except requests.RequestException as e:
         return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}"
+
+    if submit.status_code == 400 and "content_policy_violation" in submit.text:
+        return None, f"CONTENT POLICY REJECTED — reword this shot's description: {description!r}"
+
     if submit.status_code != 200:
         return None, f"submit failed: HTTP {submit.status_code}: {submit.text[:200]}"
+
     task_id = submit.json().get("task_id")
     if not task_id:
         return None, "no task_id returned"
     return task_id, None
 
 
+def _extract_video_url(data):
+    for key in ("video_url", "url", "output_url", "result_url"):
+        val = data.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+    for val in data.values():
+        if isinstance(val, str) and val.startswith("http") and val.endswith(".mp4"):
+            return val
+    return None
+
+
 def _poll_clip(task_id):
     waited = 0
+    last_data = None
     while waited < MAX_WAIT_SECONDS:
         time.sleep(POLL_INTERVAL_SECONDS)
         waited += POLL_INTERVAL_SECONDS
@@ -133,11 +143,15 @@ def _poll_clip(task_id):
         if check.status_code != 200:
             continue
         data = check.json()
+        last_data = data
         if data.get("status") == "completed":
-            return data.get("url"), None
+            url = _extract_video_url(data)
+            if url:
+                return url, None
+            return None, f"completed but no video URL found in response: {data}"
         if data.get("status") == "failed":
             return None, f"generation failed: {data.get('error')}"
-    return None, "timed out waiting for clip"
+    return None, f"timed out waiting for clip. Last poll response: {last_data}"
 
 
 def _save_progress(video_id, clip_urls):
