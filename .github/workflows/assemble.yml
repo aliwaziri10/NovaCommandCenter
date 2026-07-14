@@ -25,11 +25,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests==2.32.3 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9
+          pip install requests==2.32.3 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9 numpy==1.26.4
 
       - name: Run assembly
         env:
           RAILWAY_URL: https://novacommandcenter-production.up.railway.app
           ASSEMBLY_SECRET: ${{ secrets.ASSEMBLY_SECRET }}
+          ACE_MUSIC_API_KEY: ${{ secrets.ACE_MUSIC_API_KEY }}
           VIDEO_ID: ${{ inputs.video_id }}
         run: python .github/scripts/assemble.py
