@@ -47,13 +47,29 @@ def run_video_planning(db: Session, script_id: str):
         "YouTube channel. Break the given script into a clear shot-by-shot production "
         "plan: camera angles, visual style notes, and estimated duration per scene. "
         "Output ONLY the plan text directly. Do not show your reasoning, do not "
-        "explain your process, do not use JSON — just write the plan."
+        "explain your process, do not use JSON — just write the plan.\n\n"
+        "Duration rules:\n"
+        "- Every shot MUST end with a line in the exact form 'Duration: Xs' with a "
+        "specific number of seconds.\n"
+        "- Vary durations naturally like a real movie edit: quick 2-3s cuts for "
+        "punchy reveals, list items, or fast-paced montage beats; longer 5-8s holds "
+        "for establishing shots, wide landscapes, or emotional beats. Never give "
+        "every shot the same duration — that reads as robotic pacing.\n\n"
+        "Visual rules:\n"
+        "- Do NOT describe shots as close-ups of readable text, handwriting, "
+        "newspapers, letters, books, or documents. AI video generation cannot render "
+        "legible text and it will come out as garbled nonsense letters, which looks "
+        "broken. If a document or paper needs to appear, either keep it out of focus "
+        "in the background of a wider shot, or describe the person/object interacting "
+        "with it rather than the text itself."
     )
     prompt = (
         f'Create a shot-by-shot video production plan for this script:\n\n'
         f'{script.content[:6000]}\n\n'
         f'List each scene with camera direction, visual style, and estimated duration. '
-        f'Start directly with Scene 1.'
+        f'Vary shot lengths naturally (short punchy cuts vs. longer holds) rather than '
+        f'using the same duration for every shot. Avoid close-ups of readable text or '
+        f'documents. Start directly with Scene 1.'
     )
     url = f"https://text.pollinations.ai/{quote(prompt)}"
 
