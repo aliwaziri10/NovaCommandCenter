@@ -29,7 +29,7 @@ jobs:
 
       - name: Run image generation
         env:
-          RAILWAY_URL: https://novacommandcenter-production.up.railway.app
+          RAILWAY_URL: https://novacommandcenter.onrender.com
           ASSEMBLY_SECRET: ${{ secrets.ASSEMBLY_SECRET }}
           VIDEO_ID: ${{ inputs.video_id }}
         run: python .github/scripts/generate_images.py
