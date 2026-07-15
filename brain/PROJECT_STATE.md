@@ -4,10 +4,12 @@
 Nova Command Center — Railway to Render/Supabase migration
 
 ## Current Goal
-Move Nova backend off Railway before billing starts (~15 days from 2026-07-15).
+COMPLETE. Backend fully migrated off Railway to Render.
 
 ## Current Step
-Render Web Service live and healthy: https://novacommandcenter.onrender.com/health confirmed "healthy". Env vars set on Render: DATABASE_URL, SUPABASE_URL, SUPABASE_SECRET_KEY, CORS_ORIGINS, GITHUB_PAT, ASSEMBLY_SECRET, PORT=8000. Free instance type. Next: rewrite hardcoded Railway URL in 5 workflow yml files, update youtube_upload.yml RAILWAY_URL secret, verify full pipeline run, then decommission Railway.
+Migration finished. Backend live at https://novacommandcenter.onrender.com (Docker, root dir backend, Free instance). All 5 workflow files (assemble.yml, generate_images.yml, generate_video_agnes.yml, generate_videos.yml, narrate.yml) point to Render. youtube_upload.yml's RAILWAY_URL secret updated to Render URL. Pipeline verified working end-to-end against Render. Railway project deleted (scheduled removal within 48h of 2026-07-15).
+
+Remaining unrelated task: re-enable youtube_upload.yml once YT_REFRESH_TOKEN is regenerated (see TASK_QUEUE.md Known Bugs) — not part of this migration.
 
 ## Rules
 - Read all files in /brain before starting work.
