@@ -37,7 +37,7 @@ jobs:
 
       - name: Run narration
         env:
-          RAILWAY_URL: https://novacommandcenter-production.up.railway.app
+          RAILWAY_URL: https://novacommandcenter.onrender.com
           VIDEO_ID: ${{ inputs.video_id }}
           VOICE: ${{ inputs.voice }}
         run: python .github/scripts/narrate.py
