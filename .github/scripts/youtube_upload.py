@@ -1,7 +1,7 @@
 """
 Nova Command Center - YouTube Upload Agent
 Finds the oldest video with status "assembled" and no youtube_video_id,
-downloads it from Railway's own storage, uploads it to YouTube via the
+downloads it from Render's own storage, uploads it to YouTube via the
 Data API v3 using a stored OAuth refresh token, then marks it uploaded.
 
 Uploads are set to 'public'. Sets containsSyntheticMedia = True on every
@@ -9,11 +9,16 @@ upload, per YouTube's AI-disclosure requirement, since all content here
 is AI-generated.
 
 Unlike Marius (which talks to Supabase REST directly), Nova's video files
-and metadata live behind its own Railway FastAPI backend, so this script
-talks to Railway's REST API instead.
+and metadata live behind its own FastAPI backend (now on Render), so this
+script talks to that backend's REST API instead.
+
+Render's free tier spins the backend down after inactivity. The first
+request after a cold start can take 30-90+ seconds just to wake it up.
+wake_up_backend() below retries with a long timeout before doing real work.
 """
 
 import os
+import time
 import requests
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
@@ -23,6 +28,22 @@ YOUTUBE_REFRESH_TOKEN = os.environ["YOUTUBE_REFRESH_TOKEN"]
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
+
+BACKEND_TIMEOUT = 90  # was 30 — too short for a cold Render free-tier instance
+
+
+def wake_up_backend(max_attempts=4):
+    """Ping the backend until it responds, to survive Render cold starts."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=BACKEND_TIMEOUT)
+            resp.raise_for_status()
+            return resp
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            print(f"Backend not awake yet (attempt {attempt}/{max_attempts}): {e}")
+            if attempt == max_attempts:
+                raise
+            time.sleep(10)
 
 
 def get_access_token():
@@ -43,8 +64,7 @@ def get_access_token():
 
 
 def get_next_ready_video():
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
-    resp.raise_for_status()
+    resp = wake_up_backend()
     videos = resp.json()
     candidates = [
         v for v in videos
@@ -123,7 +143,7 @@ def mark_uploaded(video_id, youtube_id):
     resp = requests.patch(
         f"{RAILWAY_URL}/api/v1/videos/{video_id}",
         json={"status": "uploaded", "youtube_video_id": youtube_id},
-        timeout=30,
+        timeout=BACKEND_TIMEOUT,
     )
     if resp.status_code >= 400:
         print(f"MARK UPLOADED ERROR {resp.status_code}: {resp.text}")
