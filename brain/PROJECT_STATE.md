@@ -7,7 +7,7 @@ Nova Command Center — Railway to Render/Supabase migration
 Move Nova backend off Railway before billing starts (~15 days from 2026-07-15).
 
 ## Current Step
-SUPABASE_URL and SUPABASE_SECRET_KEY added to Railway — confirmed healthy at /health. Render Web Service being created now (root dir: backend, env vars: DATABASE_URL, SUPABASE_URL, SUPABASE_SECRET_KEY, CORS_ORIGINS, GITHUB_PAT, ASSEMBLY_SECRET — all copied from Railway). AGNES_API_KEY and VITE_API_URL confirmed NOT needed on Render (backend code never reads them). Waiting on Render deploy to finish and produce a live URL.
+Render Web Service live and healthy: https://novacommandcenter.onrender.com/health confirmed "healthy". Env vars set on Render: DATABASE_URL, SUPABASE_URL, SUPABASE_SECRET_KEY, CORS_ORIGINS, GITHUB_PAT, ASSEMBLY_SECRET, PORT=8000. Free instance type. Next: rewrite hardcoded Railway URL in 5 workflow yml files, update youtube_upload.yml RAILWAY_URL secret, verify full pipeline run, then decommission Railway.
 
 ## Rules
 - Read all files in /brain before starting work.
