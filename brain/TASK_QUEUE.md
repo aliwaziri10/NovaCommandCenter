@@ -1,13 +1,10 @@
 # Nova Command Center - Task Queue
 
 ## In Progress
-- Rewrite hardcoded Railway URL in 5 workflow files
+- Verify one full pipeline run end-to-end on Render before touching Railway
 
 ## Next
-- Replace https://novacommandcenter-production.up.railway.app with https://novacommandcenter.onrender.com in: assemble.yml, generate_images.yml, generate_video_agnes.yml, generate_videos.yml, narrate.yml (full-file replace, no partial edits)
-- Update youtube_upload.yml's RAILWAY_URL secret (GitHub Secrets, not the yml file) to https://novacommandcenter.onrender.com
 - Re-enable youtube_upload.yml ONLY after YT_REFRESH_TOKEN is regenerated (still unresolved — see Known Bugs)
-- Verify one full pipeline run end-to-end on Render before touching Railway
 - Decommission Railway (delete project) once confirmed stable
 
 ## Known Bugs
@@ -18,3 +15,5 @@
 - Disabled youtube_upload.yml to stop further wrong-channel uploads.
 - Added SUPABASE_URL / SUPABASE_SECRET_KEY to Railway, confirmed /health returns healthy.
 - Created Render Web Service (Docker, root dir backend), all env vars copied, confirmed live and healthy at https://novacommandcenter.onrender.com/health.
+- Rewrote hardcoded Railway URL to Render URL in all 5 workflow files (assemble.yml, generate_images.yml, generate_video_agnes.yml, generate_videos.yml, narrate.yml).
+- Updated youtube_upload.yml's RAILWAY_URL GitHub Secret to Render URL.
