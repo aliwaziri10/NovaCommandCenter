@@ -367,26 +367,34 @@ def main():
     resp.raise_for_status()
     video = resp.json()
 
-    clip_urls = video.get("clip_urls")
-    asset_urls = video.get("asset_urls")
+    clip_urls = video.get("clip_urls") or []
+    asset_urls = video.get("asset_urls") or []
     production_plan = video.get("production_plan")
     title = video.get("title") or ""
-
-    if clip_urls:
-        print(f"Found {len(clip_urls)} video clips - using real video clips for assembly.")
-        use_clips = True
-        urls = clip_urls
-    elif asset_urls:
-        print(f"No video clips found. Falling back to {len(asset_urls)} still images.")
-        use_clips = False
-        urls = asset_urls
-    else:
-        print("ERROR: video has no clip_urls and no asset_urls")
-        sys.exit(1)
 
     if not production_plan:
         print("ERROR: video has no production_plan")
         sys.exit(1)
+
+    total_shots = _parse_shots_count(production_plan)
+    if total_shots == 0:
+        print("ERROR: no shots parsed from production_plan")
+        sys.exit(1)
+
+    if len(clip_urls) < total_shots:
+        print(
+            f"NOT READY: this video needs {total_shots} real video clips but only has "
+            f"{len(clip_urls)} so far ({len(asset_urls)} still images are available as "
+            f"reference only). Assembly will NOT fall back to still images - real Agnes "
+            f"video clips are required for every shot. Let generate_videos.py finish "
+            f"(it runs hourly, 3 clips per run) until clip_urls reaches {total_shots}, "
+            f"then re-run assembly for this video."
+        )
+        return
+
+    print(f"Found {len(clip_urls)} video clips - using real video clips for assembly.")
+    use_clips = True
+    urls = clip_urls
 
     print("Downloading narration audio from Railway...")
     audio_path = os.path.join(WORK_DIR, "narration.mp3")
