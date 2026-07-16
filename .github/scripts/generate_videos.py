@@ -192,7 +192,15 @@ def main():
         print(f"Auto-selected video_id: {video_id}")
 
     print("Fetching video data from Railway...")
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
+            break
+        except requests.exceptions.RequestException:
+            if attempt == 2:
+                raise
+            print(f"Backend not responding (likely waking from sleep), retrying in 20s (attempt {attempt + 1}/3)...")
+            time.sleep(20)
     resp.raise_for_status()
     video = resp.json()
 
@@ -268,4 +276,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
