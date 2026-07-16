@@ -91,7 +91,7 @@ def _parse_durations(production_plan):
 
 
 def _find_next_video_to_assemble():
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=90)
     resp.raise_for_status()
     videos = resp.json()
 
@@ -363,7 +363,7 @@ def main():
         print(f"Auto-selected video_id: {video_id}")
 
     print("Fetching video data from Railway...")
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
     resp.raise_for_status()
     video = resp.json()
 
