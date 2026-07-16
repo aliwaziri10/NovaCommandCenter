@@ -484,5 +484,29 @@ def main():
         print("Note: some shots had issues:", all_errors)
 
 
+def _print_failure_summary(exc):
+    import traceback
+    tb = traceback.extract_tb(exc.__traceback__)
+    location = "unknown"
+    for frame in tb:
+        if frame.filename.endswith("assemble.py"):
+            location = f"{frame.name}() line {frame.lineno}"
+    print("\n" + "=" * 60)
+    print("FAILURE SUMMARY (read this first)")
+    print("=" * 60)
+    print(f"Script:        assemble.py")
+    print(f"Failed in:     {location}")
+    print(f"Error type:    {type(exc).__name__}")
+    print(f"Error message: {str(exc)[:400]}")
+    print(f"RAILWAY_URL:   {RAILWAY_URL}")
+    print(f"VIDEO_ID:      {VIDEO_ID or '(auto-select)'}")
+    print("=" * 60)
+    print("Full traceback follows below for reference.\n")
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        _print_failure_summary(e)
+        raise
