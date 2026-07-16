@@ -59,7 +59,15 @@ def _parse_shots(production_plan):
 
 
 def _find_next_video_needing_clips():
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=90)
+            break
+        except requests.exceptions.RequestException:
+            if attempt == 2:
+                raise
+            print(f"Backend not responding (likely waking from sleep), retrying in 20s (attempt {attempt + 1}/3)...")
+            time.sleep(20)
     resp.raise_for_status()
     videos = resp.json()
 
@@ -260,3 +268,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
