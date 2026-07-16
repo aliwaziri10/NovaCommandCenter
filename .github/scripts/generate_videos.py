@@ -124,6 +124,11 @@ def _extract_video_url(data):
         val = data.get(key)
         if isinstance(val, str) and val.startswith("http"):
             return val
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        val = metadata.get("url")
+        if isinstance(val, str) and val.startswith("http"):
+            return val
     for val in data.values():
         if isinstance(val, str) and val.startswith("http") and val.endswith(".mp4"):
             return val
