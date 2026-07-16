@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: "45 */6 * * *"
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   assemble:
     runs-on: ubuntu-latest
@@ -34,3 +38,17 @@ jobs:
           ACE_MUSIC_API_KEY: ${{ secrets.ACE_MUSIC_API_KEY }}
           VIDEO_ID: ${{ inputs.video_id }}
         run: python .github/scripts/assemble.py
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Assemble workflow failed - run #${{ github.run_number }}" \
+            --body "The assemble workflow failed on $(date -u +%Y-%m-%dT%H:%M:%SZ).
+
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Open the run log above and check the top of the failed step's output for the FAILURE SUMMARY block (script, line, error type/message) before digging into the full traceback."
