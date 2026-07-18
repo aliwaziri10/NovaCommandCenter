@@ -1,10 +1,19 @@
+import os
+import sys
 import time
+
 import requests
 
-# Replace the existing BACKEND_TIMEOUT constant near the top of the file with this:
-BACKEND_TIMEOUT = 120  # was 90 — Render cold starts can run past 90s
+RAILWAY_URL = os.environ["RAILWAY_URL"]  # name is legacy - this actually points to Render now
+YOUTUBE_CLIENT_ID = os.environ["YOUTUBE_CLIENT_ID"]
+YOUTUBE_CLIENT_SECRET = os.environ["YOUTUBE_CLIENT_SECRET"]
+YOUTUBE_REFRESH_TOKEN = os.environ["YOUTUBE_REFRESH_TOKEN"]
+VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
-# Replace the existing wake_up_backend() function (around line 39) with this:
+BACKEND_TIMEOUT = 120  # Render cold starts can run past 90s
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+
+
 def wake_up_backend(max_attempts=4):
     """
     Wakes a sleeping Render free-tier instance before hitting the real endpoint.
@@ -35,3 +44,141 @@ def wake_up_backend(max_attempts=4):
         f"Backend at {RAILWAY_URL} did not respond after {max_attempts} attempts. "
         "Check Render dashboard for deploy/crash status."
     )
+
+
+def _get_youtube_access_token():
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": YOUTUBE_CLIENT_ID,
+            "client_secret": YOUTUBE_CLIENT_SECRET,
+            "refresh_token": YOUTUBE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _find_next_video_to_upload(videos):
+    candidates = [
+        v for v in videos
+        if v.get("status") == "assembled" and not v.get("youtube_video_id")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]
+
+
+def _upload_to_youtube(video_bytes, title, description, access_token):
+    metadata = {
+        "snippet": {
+            "title": title[:100],
+            "description": description[:5000],
+            "categoryId": "27",  # Education
+        },
+        "status": {
+            "privacyStatus": "public",
+        },
+    }
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    init_resp = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos"
+        "?uploadType=resumable&part=snippet,status",
+        headers={**headers, "X-Upload-Content-Type": "video/mp4"},
+        json=metadata,
+        timeout=60,
+    )
+    init_resp.raise_for_status()
+    upload_url = init_resp.headers["Location"]
+
+    upload_resp = requests.put(
+        upload_url,
+        headers={"Content-Type": "video/mp4"},
+        data=video_bytes,
+        timeout=600,
+    )
+    upload_resp.raise_for_status()
+    return upload_resp.json()
+
+
+def main():
+    print("Waking backend and fetching video list...")
+    resp = wake_up_backend()
+    resp.raise_for_status()
+    videos = resp.json()
+
+    video_id = VIDEO_ID
+    if video_id:
+        video = next((v for v in videos if v.get("id") == video_id), None)
+        if not video:
+            print(f"ERROR: video_id {video_id} not found")
+            sys.exit(1)
+    else:
+        print("No VIDEO_ID provided - auto-selecting next assembled video ready for upload...")
+        video = _find_next_video_to_upload(videos)
+        if not video:
+            print("No assembled videos currently waiting for upload. Exiting cleanly.")
+            return
+        video_id = video["id"]
+        print(f"Auto-selected video_id: {video_id}")
+
+    title = video.get("title") or "Untitled"
+    description = video.get("description") or ""
+
+    print(f"Downloading final video file for {video_id}...")
+    file_resp = requests.get(
+        f"{RAILWAY_URL}/api/v1/download/video/{video_id}",
+        timeout=300,
+    )
+    file_resp.raise_for_status()
+    video_bytes = file_resp.content
+    print(f"Downloaded {len(video_bytes)} bytes.")
+
+    print("Getting fresh YouTube access token...")
+    access_token = _get_youtube_access_token()
+
+    print("Uploading to YouTube...")
+    result = _upload_to_youtube(video_bytes, title, description, access_token)
+    youtube_video_id = result.get("id")
+    print(f"SUCCESS: uploaded as https://youtube.com/watch?v={youtube_video_id}")
+
+    print("Marking video as uploaded in backend...")
+    mark_resp = requests.post(
+        f"{RAILWAY_URL}/api/v1/videos/{video_id}/mark-uploaded",
+        json={"youtube_video_id": youtube_video_id},
+        timeout=60,
+    )
+    if mark_resp.status_code >= 400:
+        print(f"WARNING: upload succeeded but failed to mark backend as uploaded: {mark_resp.status_code} {mark_resp.text}")
+
+
+def _print_failure_summary(exc):
+    import traceback
+    tb = traceback.extract_tb(exc.__traceback__)
+    location = "unknown"
+    for frame in tb:
+        if frame.filename.endswith("youtube_upload.py"):
+            location = f"{frame.name}() line {frame.lineno}"
+    print("\n" + "=" * 60)
+    print("FAILURE SUMMARY (read this first)")
+    print("=" * 60)
+    print("Script:        youtube_upload.py")
+    print(f"Failed in:     {location}")
+    print(f"Error type:    {type(exc).__name__}")
+    print(f"Error message: {str(exc)[:400]}")
+    print(f"RAILWAY_URL:   {RAILWAY_URL}")
+    print(f"VIDEO_ID:      {VIDEO_ID or '(auto-select)'}")
+    print("=" * 60)
+    print("Full traceback follows below for reference.\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        _print_failure_summary(e)
+        raise
