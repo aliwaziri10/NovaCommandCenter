@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import subprocess
 import time
@@ -13,6 +14,11 @@ VOICE = os.environ.get("VOICE", "am_adam")
 
 WORK_DIR = "/tmp/nova_narration"
 BACKEND_TIMEOUT = 120  # Render cold starts can run past 30s
+
+# Strips a leading bracketed tag from a line, e.g. "[SCENE 1] A single strip..."
+# -> "A single strip...". Handles tags that sit at the START of a paragraph
+# line (not just lines that are ENTIRELY "[...]").
+LEADING_BRACKET_TAG_RE = re.compile(r"^\[[^\]]*\]\s*")
 
 
 def _get_with_wakeup(url, max_attempts=4, **kwargs):
@@ -48,6 +54,9 @@ def _clean_narration_text(raw_content):
         if stripped.startswith("[") and stripped.endswith("]"):
             continue
         if stripped.upper().startswith("NARRATOR"):
+            continue
+        stripped = LEADING_BRACKET_TAG_RE.sub("", stripped).strip()
+        if not stripped:
             continue
         clean_lines.append(stripped)
     return " ".join(clean_lines)
