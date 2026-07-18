@@ -56,6 +56,7 @@ ACE_MUSIC_HEADERS = {
     "Content-Type": "application/json",
 }
 MUSIC_VOLUME = 0.22  # ducked well under narration
+NARRATION_VOLUME = 0.70  # 30% reduction so music/SFX have more headroom, matches Marius
 LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would clip
 
 WORK_DIR = "/tmp/nova_assembly"
@@ -323,7 +324,7 @@ def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
 
 
 def _build_mixed_audio(narration_path, music_mood, out_path):
-    narration_clip = AudioFileClip(narration_path)
+    narration_clip = AudioFileClip(narration_path).volumex(NARRATION_VOLUME)
     duration = narration_clip.duration
     layers = [narration_clip]
 
