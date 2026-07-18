@@ -1,16 +1,42 @@
 import os
 import sys
 import subprocess
+import time
 import numpy as np
 import requests
 import soundfile as sf
 from kokoro import KPipeline
 
-RAILWAY_URL = os.environ["RAILWAY_URL"]
+RAILWAY_URL = os.environ["RAILWAY_URL"]  # name is legacy - this actually points to Render now
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 VOICE = os.environ.get("VOICE", "am_adam")
 
 WORK_DIR = "/tmp/nova_narration"
+BACKEND_TIMEOUT = 120  # Render cold starts can run past 30s
+
+
+def _get_with_wakeup(url, max_attempts=4, **kwargs):
+    """
+    GETs a URL, retrying with backoff if the Render free-tier backend
+    is asleep and slow to wake up (read timeout / connection error).
+    """
+    backoff_seconds = [10, 20, 40, 60]
+    kwargs.setdefault("timeout", BACKEND_TIMEOUT)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return requests.get(url, **kwargs)
+        except requests.exceptions.ReadTimeout:
+            print(f"Backend not awake yet (attempt {attempt}/{max_attempts}): read timeout")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Backend not reachable yet (attempt {attempt}/{max_attempts}): {e}")
+
+        if attempt < max_attempts:
+            wait = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            print(f"Waiting {wait}s before retry...")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Backend at {url} did not respond after {max_attempts} attempts.")
 
 
 def _clean_narration_text(raw_content):
@@ -28,7 +54,7 @@ def _clean_narration_text(raw_content):
 
 
 def _find_next_video_needing_narration():
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=30)
+    resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/videos")
     resp.raise_for_status()
     videos = resp.json()
     candidates = [
@@ -53,8 +79,8 @@ def main():
             return
         print(f"Auto-selected video_id: {video_id}")
 
-    print("Fetching video data from Railway")
-    video_resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=30)
+    print("Fetching video data from backend")
+    video_resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/videos/{video_id}")
     video_resp.raise_for_status()
     video = video_resp.json()
 
@@ -63,8 +89,8 @@ def main():
         print("ERROR: video has no script_id")
         sys.exit(1)
 
-    print("Fetching script data from Railway")
-    script_resp = requests.get(f"{RAILWAY_URL}/api/v1/scripts/{script_id}", timeout=30)
+    print("Fetching script data from backend")
+    script_resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/scripts/{script_id}")
     script_resp.raise_for_status()
     script = script_resp.json()
 
@@ -101,7 +127,7 @@ def main():
         print("ffmpeg error: " + result.stdout.decode(errors="ignore"))
         sys.exit(1)
 
-    print("Uploading narration to Railway")
+    print("Uploading narration to backend")
     with open(mp3_path, "rb") as f:
         upload_resp = requests.post(
             f"{RAILWAY_URL}/api/v1/upload/narration/{video_id}",
