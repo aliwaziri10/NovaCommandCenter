@@ -1,278 +1,183 @@
-import os
 import re
-import sys
-import time
-
+import uuid
 import requests
-
-RAILWAY_URL = os.environ["RAILWAY_URL"]
-VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
-AGNES_API_KEY = os.environ["AGNES_API_KEY"]
-
-AGNES_BASE = "https://apihub.agnes-ai.com/v1/videos"
-CLIP_HEIGHT = 768
-CLIP_WIDTH = 1152
-CLIP_NUM_FRAMES = 121  # ~5 seconds at 24fps, must be 8*n+1
-CLIP_FRAME_RATE = 24
-MAX_WAIT_SECONDS = 240
-POLL_INTERVAL_SECONDS = 10
-MIN_SECONDS_BETWEEN_SUBMITS = 65  # Agnes allows 1 request per 60s — 65s gives safety margin
-
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))
-
-SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
-HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
-
-CAMERA_MOVES = [
-    "sweeping drone-style push-in",
-    "fast tracking shot alongside the subject",
-    "dramatic low-angle tilt up",
-    "quick whip-pan reveal",
-    "slow dramatic zoom with parallax",
-    "handheld tracking shot, urgent energy",
-    "sweeping crane shot rising over the scene",
-    "tight dynamic close-up with shallow depth of field",
-]
-
-LENS_STYLES = [
-    "shot on 35mm anamorphic lens, shallow depth of field, subtle lens flare",
-    "shot on vintage 50mm prime lens, soft natural bokeh, warm film tone",
-    "wide-angle lens, deep focus, expansive epic framing",
-    "telephoto compression, soft background blur, natural motion blur",
-]
+from urllib.parse import quote
+from sqlalchemy.orm import Session
+from app.models.script import Script
+from app.models.video import Video
 
 
-def _parse_shots(production_plan):
-    shots = []
-    for line in production_plan.splitlines():
-        line = line.strip()
-        if not SHOT_START.match(line):
-            continue
-        remainder = SHOT_START.sub("", line).strip()
-        remainder = re.sub(r"^[\s:\-–\*]+", "", remainder)
-        remainder = re.split(r"\*{0,2}Duration\*{0,2}\s*:", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
-        remainder = re.split(r"\bCamera\s*:", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
-        remainder = remainder.replace("**", "").replace("*", "").strip().rstrip(".").strip()
-        if remainder:
-            shots.append(remainder)
-    return shots
+def _strip_ad_footer(text: str) -> str:
+    marker = "**Support Pollinations.AI:**"
+    idx = text.find(marker)
+    if idx != -1:
+        return text[:idx].rstrip()
+    idx2 = text.find("🌸 **Ad** 🌸")
+    if idx2 != -1:
+        return text[:idx2].rstrip()
+    return text
 
 
-def _find_next_video_needing_clips():
-    for attempt in range(3):
+def _looks_truncated(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    return stripped[-1] not in ".!?\"'\u201d\u2019"
+
+
+def _is_refusal(text: str) -> bool:
+    refusal_markers = [
+        "i'm sorry", "i am sorry", "i cannot continue", "i can't continue",
+        "please provide", "could you provide", "i need the actual script",
+        "i need the rest of the script",
+    ]
+    lowered = text[:250].lower()
+    return any(m in lowered for m in refusal_markers)
+
+
+SYSTEM_PROMPT = (
+    "You are a professional video producer for a cinematic alternate-history "
+    "YouTube channel. Break the given script into a clear shot-by-shot production "
+    "plan: camera angles, visual style notes, and estimated duration per shot. "
+    "Output ONLY the plan text directly. Do not show your reasoning, do not "
+    "explain your process, do not use JSON — just write the plan.\n\n"
+    "Formatting rule (critical, machine-parsed):\n"
+    "- Every shot MUST start its own line with the literal word 'Shot' followed by "
+    "a number, e.g. 'Shot 1:', 'Shot 2:'. Do NOT use the word 'Scene' anywhere as "
+    "a line label — an automated parser looks for the word 'Shot' specifically and "
+    "will silently drop any shot labeled 'Scene'.\n\n"
+    "Duration rules:\n"
+    "- Every shot MUST end with a line in the exact form 'Duration: Xs' with a "
+    "specific number of seconds.\n"
+    "- Vary durations naturally like a real movie edit: quick 2-3s cuts for "
+    "punchy reveals, list items, or fast-paced montage beats; longer 5-8s holds "
+    "for establishing shots, wide landscapes, or emotional beats. Never give "
+    "every shot the same duration — that reads as robotic pacing.\n\n"
+    "Visual rules:\n"
+    "- Do NOT describe shots as close-ups of readable text, handwriting, "
+    "newspapers, letters, books, or documents. AI video generation cannot render "
+    "legible text and it will come out as garbled nonsense letters, which looks "
+    "broken. If a document or paper needs to appear, either keep it out of focus "
+    "in the background of a wider shot, or describe the person/object interacting "
+    "with it rather than the text itself."
+)
+
+
+def _query_pollinations(prompt: str) -> str | None:
+    url = f"https://text.pollinations.ai/{quote(prompt)}"
+    for _ in range(3):
         try:
-            resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=90)
-            break
-        except requests.exceptions.RequestException:
-            if attempt == 2:
-                raise
-            print(f"Backend not responding (likely waking from sleep), retrying in 20s (attempt {attempt + 1}/3)...")
-            time.sleep(20)
-    resp.raise_for_status()
-    videos = resp.json()
-
-    candidates = []
-    for v in videos:
-        if v.get("status") == "assembled":
+            response = requests.get(
+                url,
+                params={"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8},
+                timeout=60,
+            )
+            raw = response.text.strip()
+            if raw.startswith('{"role"') or '"reasoning"' in raw[:200] or raw.startswith('{"error"'):
+                continue
+            if len(raw) > 100:
+                return _strip_ad_footer(raw)
+        except Exception:
             continue
-        production_plan = v.get("production_plan")
-        if not production_plan:
-            continue
-        shots = _parse_shots(production_plan)
-        if not shots:
-            continue
-        asset_urls = v.get("asset_urls") or []
-        if len(asset_urls) < len(shots):
-            continue
-        clip_urls = v.get("clip_urls") or []
-        if len(clip_urls) < len(shots):
-            candidates.append(v)
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda v: v.get("created_at") or "")
-    return candidates[0]["id"]
-
-
-def _submit_clip(description, shot_index):
-    camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
-    lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
-    prompt = (
-        f"{description}, shot by a Hollywood cinematographer, {camera_move}, {lens_style}, "
-        f"dramatic cinematic lighting, high-energy fast-paced documentary style, "
-        f"realistic motion, natural motion blur, high detail, engaging dynamic composition"
-    )
-    body = {
-        "model": "agnes-video-v2.0",
-        "prompt": prompt,
-        "height": CLIP_HEIGHT,
-        "width": CLIP_WIDTH,
-        "num_frames": CLIP_NUM_FRAMES,
-        "frame_rate": CLIP_FRAME_RATE,
-    }
-    try:
-        submit = requests.post(AGNES_BASE, headers=HEADERS, json=body, timeout=60)
-    except requests.RequestException as e:
-        return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}"
-
-    if submit.status_code == 400 and "content_policy_violation" in submit.text:
-        return None, f"CONTENT POLICY REJECTED — reword this shot's description: {description!r}"
-
-    if submit.status_code != 200:
-        return None, f"submit failed: HTTP {submit.status_code}: {submit.text[:200]}"
-
-    task_id = submit.json().get("task_id")
-    if not task_id:
-        return None, "no task_id returned"
-    return task_id, None
-
-
-def _extract_video_url(data):
-    for key in ("video_url", "url", "output_url", "result_url"):
-        val = data.get(key)
-        if isinstance(val, str) and val.startswith("http"):
-            return val
-    metadata = data.get("metadata")
-    if isinstance(metadata, dict):
-        val = metadata.get("url")
-        if isinstance(val, str) and val.startswith("http"):
-            return val
-    for val in data.values():
-        if isinstance(val, str) and val.startswith("http") and val.endswith(".mp4"):
-            return val
     return None
 
 
-def _poll_clip(task_id):
-    waited = 0
-    last_data = None
-    while waited < MAX_WAIT_SECONDS:
-        time.sleep(POLL_INTERVAL_SECONDS)
-        waited += POLL_INTERVAL_SECONDS
-        try:
-            check = requests.get(f"{AGNES_BASE}/{task_id}", headers=HEADERS, timeout=30)
-        except requests.RequestException:
-            continue
-        if check.status_code != 200:
-            continue
-        data = check.json()
-        last_data = data
-        if data.get("status") == "completed":
-            url = _extract_video_url(data)
-            if url:
-                return url, None
-            return None, f"completed but no video URL found in response: {data}"
-        if data.get("status") == "failed":
-            return None, f"generation failed: {data.get('error')}"
-    return None, f"timed out waiting for clip. Last poll response: {last_data}"
-
-
-def _save_progress(video_id, clip_urls):
-    good_so_far = [u for u in clip_urls if u]
-    try:
-        patch_resp = requests.patch(
-            f"{RAILWAY_URL}/api/v1/videos/{video_id}",
-            json={"clip_urls": good_so_far},
-            timeout=30,
+def _continue_if_truncated(plan: str) -> str:
+    continuation_attempts = 0
+    while _looks_truncated(plan) and continuation_attempts < 3:
+        continuation_attempts += 1
+        continuation_prompt = (
+            f"Here is a shot-by-shot video production plan that was cut off "
+            f"mid-sentence. Continue it EXACTLY from where it left off, do not "
+            f"repeat any earlier text, do not restart, just continue the plan "
+            f"to completion including all remaining shots. Remember: every shot "
+            f"line must start with the literal word 'Shot' followed by a number, "
+            f"never 'Scene':\n\n{plan[-1500:]}"
         )
-        patch_resp.raise_for_status()
-        print(f"Saved progress to Railway: {len(good_so_far)} clips.")
-    except requests.RequestException as e:
-        print(f"WARNING: failed to save progress to Railway: {type(e).__name__}: {str(e)[:150]}")
-
-
-def main():
-    video_id = VIDEO_ID
-    if not video_id:
-        print("No VIDEO_ID provided — auto-selecting next video needing clips...")
-        video_id = _find_next_video_needing_clips()
-        if not video_id:
-            print("No videos currently need clips. Exiting cleanly.")
-            return
-        print(f"Auto-selected video_id: {video_id}")
-
-    print("Fetching video data from Railway...")
-    for attempt in range(3):
+        cont_url = f"https://text.pollinations.ai/{quote(continuation_prompt)}"
         try:
-            resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
-            break
-        except requests.exceptions.RequestException:
-            if attempt == 2:
-                raise
-            print(f"Backend not responding (likely waking from sleep), retrying in 20s (attempt {attempt + 1}/3)...")
-            time.sleep(20)
-    resp.raise_for_status()
-    video = resp.json()
-
-    production_plan = video.get("production_plan")
-    if not production_plan:
-        print("ERROR: video has no production_plan")
-        sys.exit(1)
-
-    all_shots = _parse_shots(production_plan)
-    if not all_shots:
-        print("ERROR: no shots parsed from production_plan")
-        sys.exit(1)
-
-    total = len(all_shots)
-
-    existing = video.get("clip_urls") or []
-    clip_urls = [None] * total
-    for i in range(min(len(existing), total)):
-        clip_urls[i] = existing[i]
-
-    already_done = [i for i, u in enumerate(clip_urls) if u]
-    missing = [i for i, u in enumerate(clip_urls) if not u]
-
-    print(f"Total shots: {total}. Already done: {len(already_done)}. Missing: {len(missing)}.")
-
-    if not missing:
-        print("All shots already have clips. Nothing to do.")
-        return
-
-    batch = missing[:BATCH_SIZE]
-    print(f"This run will process {len(batch)} shot(s): {batch}")
-
-    failure_reasons = []
-    last_submit_time = 0.0
-
-    for index in batch:
-        description = all_shots[index]
-
-        elapsed = time.monotonic() - last_submit_time
-        if elapsed < MIN_SECONDS_BETWEEN_SUBMITS and last_submit_time > 0:
-            wait_for = MIN_SECONDS_BETWEEN_SUBMITS - elapsed
-            print(f"Waiting {wait_for:.0f}s before next submission (rate limit)...")
-            time.sleep(wait_for)
-
-        last_submit_time = time.monotonic()
-        task_id, error = _submit_clip(description, index)
-
-        if not task_id:
-            failure_reasons.append(f"shot {index}: {error}")
-            print(f"Shot {index+1}/{total}: FAILED ({error})")
-        else:
-            url, error = _poll_clip(task_id)
-            if url:
-                clip_urls[index] = url
-                print(f"Shot {index+1}/{total}: OK -> {url}")
+            cont_response = requests.get(
+                cont_url,
+                params={"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8},
+                timeout=60,
+            )
+            cont_raw = cont_response.text.strip()
+            if cont_raw.startswith('{"role"') or '"reasoning"' in cont_raw[:200] or cont_raw.startswith('{"error"'):
+                break
+            cont_raw = _strip_ad_footer(cont_raw)
+            if _is_refusal(cont_raw):
+                break
+            if len(cont_raw) > 20:
+                plan = plan + "\n" + cont_raw
             else:
-                failure_reasons.append(f"shot {index}: {error}")
-                print(f"Shot {index+1}/{total}: FAILED ({error})")
-
-        _save_progress(video_id, clip_urls)
-        good_so_far = len([u for u in clip_urls if u])
-        print(f"Progress: {good_so_far}/{total} clips done overall.")
-
-    generated_this_run = len([i for i in batch if clip_urls[i]])
-    failed_this_run = len(batch) - generated_this_run
-    print(f"BATCH DONE. This run generated: {generated_this_run}, failed: {failed_this_run}")
-    if failure_reasons:
-        print("Failure reasons:", failure_reasons)
-
-    remaining = total - len([u for u in clip_urls if u])
-    print(f"Remaining shots still needed: {remaining}")
+                break
+        except Exception:
+            break
+    return plan
 
 
-if __name__ == "__main__":
-    main()
+def run_video_planning(db: Session, script_id: str):
+    """Free version — generates a shot-by-shot breakdown from a script using Pollinations.ai.
+    Splits the script into two halves (matching how script_writing_agent generates it)
+    instead of truncating, so the full script gets shot-planned, not just the first ~6000 chars."""
+    script_uuid = uuid.UUID(str(script_id))
+    script = db.query(Script).filter(Script.id == script_uuid).first()
+    if not script:
+        raise ValueError(f"Script {script_id} not found")
+
+    full_content = script.content
+    midpoint = len(full_content) // 2
+    # avoid splitting mid-sentence: snap to the nearest paragraph break near the midpoint
+    split_at = full_content.rfind("\n\n", 0, midpoint + 200)
+    if split_at == -1 or split_at < midpoint - 1000:
+        split_at = midpoint
+    part1_script = full_content[:split_at]
+    part2_script = full_content[split_at:]
+
+    part1_prompt = (
+        f'Create a shot-by-shot video production plan for the FIRST HALF of this '
+        f'script:\n\n{part1_script}\n\n'
+        f'List each shot with camera direction, visual style, and estimated duration. '
+        f'Vary shot lengths naturally (short punchy cuts vs. longer holds) rather than '
+        f'using the same duration for every shot. Avoid close-ups of readable text or '
+        f'documents. Start directly with Shot 1. This is only the first half of the '
+        f'script — end at a natural shot boundary, do not add a conclusion yet.'
+    )
+    part1 = _query_pollinations(part1_prompt)
+
+    if not part1:
+        plan = "Video planning failed on part 1 — try running this task again."
+    else:
+        part1 = _continue_if_truncated(part1)
+
+        part2_prompt = (
+            f'Continue the shot-by-shot production plan directly from where it left '
+            f'off, for the SECOND HALF of the same script:\n\n{part2_script}\n\n'
+            f'Here is the shot plan so far for context (do not repeat it, only '
+            f'continue numbering from the next shot number):\n\n{part1[-1500:]}\n\n'
+            f'Keep the same format: every shot starts with the literal word "Shot" '
+            f'followed by a number (never "Scene"), and every shot ends with a '
+            f'"Duration: Xs" line. Vary durations naturally. Avoid close-ups of '
+            f'readable text or documents. Cover this second half through to the end '
+            f'of the script.'
+        )
+        part2 = _query_pollinations(part2_prompt)
+
+        if part2:
+            part2 = _continue_if_truncated(part2)
+            plan = part1 + "\n" + part2
+        else:
+            plan = part1 + "\n[Second half of shot plan failed to generate — plan is incomplete]"
+
+    video = Video(
+        title=script.title,
+        status="planned",
+        views=0,
+        topic_id=script.topic_id,
+        script_id=script.id,
+        production_plan=plan,
+    )
+    db.add(video)
+    db.commit()
+    db.refresh(video)
+    return {"video_id": str(video.id), "title": video.title, "status": video.status, "plan_preview": plan[:300]}
