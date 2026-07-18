@@ -1,5 +1,4 @@
 name: Generate Video (Agnes)
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,7 +6,6 @@ on:
         description: "Video ID to generate via Agnes"
         required: true
         type: string
-
 jobs:
   generate:
     runs-on: ubuntu-latest
@@ -15,22 +13,18 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: Install dependencies
         run: pip install requests imageio-ffmpeg
-
       - name: Run Agnes video generation
         env:
           RAILWAY_URL: https://novacommandcenter.onrender.com
           ASSEMBLY_SECRET: ${{ secrets.ASSEMBLY_SECRET }}
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
           VIDEO_ID: ${{ inputs.video_id }}
-        run: python .github/scripts/generate_video_agnes.py
+        run: python .github/scripts/generate_videos.py
