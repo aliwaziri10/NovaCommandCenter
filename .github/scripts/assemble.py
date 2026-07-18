@@ -24,7 +24,7 @@ from moviepy.editor import (
     concatenate_audioclips,
 )
 
-RAILWAY_URL = os.environ["RAILWAY_URL"]
+RAILWAY_URL = os.environ["RAILWAY_URL"]  # name is legacy - this actually points to Render now
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 ACE_MUSIC_API_KEY = os.environ.get("ACE_MUSIC_API_KEY")
