@@ -13,6 +13,14 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 BACKEND_TIMEOUT = 120  # Render cold starts can run past 90s
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 
+# Nova's channel. Both this channel and "Erased" (used by the separate Marius
+# project) are managed by the SAME Google account (ziawaziri@gmail.com), so a
+# wrong-credential-pair upload landing on the wrong channel is a real,
+# recurring risk here - not a hypothetical one. This is checked BEFORE
+# downloading or uploading anything, so a wrong YT_CLIENT_ID/YT_REFRESH_TOKEN
+# pair fails loudly and immediately instead of silently posting to Erased.
+EXPECTED_CHANNEL_TITLE = "Alternate Earth"
+
 
 def wake_up_backend(max_attempts=4):
     """
@@ -61,6 +69,27 @@ def _get_youtube_access_token():
     return resp.json()["access_token"]
 
 
+def _get_authorized_channel(access_token):
+    """Asks YouTube which channel the current access token is actually
+    authorized for. This is how we tell Ali's two client_id/refresh_token
+    pairs apart without having to do a live upload to find out."""
+    resp = requests.get(
+        "https://www.googleapis.com/youtube/v3/channels",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"part": "snippet", "mine": "true"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+    if not items:
+        raise RuntimeError(
+            "YouTube API returned no channel for these credentials - the token "
+            "may be invalid, expired, or missing the youtube.upload/youtube.readonly scope."
+        )
+    channel = items[0]
+    return channel["id"], channel["snippet"]["title"]
+
+
 def _find_next_video_to_upload(videos):
     candidates = [
         v for v in videos
@@ -106,6 +135,22 @@ def _upload_to_youtube(video_bytes, title, description, access_token):
 
 
 def main():
+    print("Getting YouTube access token and verifying which channel it's authorized for...")
+    access_token = _get_youtube_access_token()
+    channel_id, channel_title = _get_authorized_channel(access_token)
+    print(f"These credentials are authorized for channel: {channel_title!r} ({channel_id})")
+
+    if channel_title.strip().lower() != EXPECTED_CHANNEL_TITLE.lower():
+        raise RuntimeError(
+            f"REFUSING TO UPLOAD: these credentials authorize {channel_title!r}, not the "
+            f"expected {EXPECTED_CHANNEL_TITLE!r}. This is the wrong YT_CLIENT_ID/YT_REFRESH_TOKEN "
+            f"pair for Nova. Fix: on youtube.com signed in as ziawaziri@gmail.com, switch the active "
+            f"channel to {EXPECTED_CHANNEL_TITLE}, redo the OAuth consent flow to get a matching "
+            f"client_id/refresh_token pair, then update the YT_CLIENT_ID/YT_CLIENT_SECRET/"
+            f"YT_REFRESH_TOKEN secrets on this repo. No video was downloaded or uploaded."
+        )
+    print(f"Channel verified ({EXPECTED_CHANNEL_TITLE}) - proceeding.")
+
     print("Waking backend and fetching video list...")
     resp = wake_up_backend()
     resp.raise_for_status()
@@ -137,9 +182,6 @@ def main():
     file_resp.raise_for_status()
     video_bytes = file_resp.content
     print(f"Downloaded {len(video_bytes)} bytes.")
-
-    print("Getting fresh YouTube access token...")
-    access_token = _get_youtube_access_token()
 
     print("Uploading to YouTube...")
     result = _upload_to_youtube(video_bytes, title, description, access_token)
