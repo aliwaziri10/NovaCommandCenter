@@ -35,7 +35,16 @@ RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
 KEN_BURNS_ZOOM = 0.08  # slow 8% push-in over a still shot's duration
 
+# Supabase Free plan hard-caps storage uploads at 50MB (not configurable without
+# upgrading to Pro). Target comfortably under that so encoding variance never
+# pushes a final video over the limit and failing the upload.
+TARGET_UPLOAD_MB = 45
+AUDIO_BITRATE_KBPS = 128
+MIN_VIDEO_KBPS = 400
+OUTPUT_RESOLUTION_VF = "scale=1280:720"
+
 CINEMATIC_VF = (
+    f"{OUTPUT_RESOLUTION_VF},"
     "eq=contrast=1.08:saturation=0.95,"
     "curves=preset=medium_contrast,"
     "colorbalance=rs=-0.05:bs=0.05:rh=0.05:bh=-0.05,"
@@ -347,6 +356,15 @@ def _build_mixed_audio(narration_path, music_mood, out_path):
     return duration
 
 
+def _compute_target_video_kbps(duration_seconds):
+    """Computes a video bitrate that keeps the final file under
+    TARGET_UPLOAD_MB for the given duration, leaving room for the audio
+    track. Supabase Storage on the Free plan hard-caps uploads at 50MB."""
+    total_kbps = (TARGET_UPLOAD_MB * 8000) / max(duration_seconds, 1)
+    video_kbps = int(total_kbps - AUDIO_BITRATE_KBPS)
+    return max(MIN_VIDEO_KBPS, video_kbps)
+
+
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     media_dir = os.path.join(WORK_DIR, "media")
@@ -423,7 +441,7 @@ def main():
 
     print("Building audio mix (narration + background score)...")
     music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
-    _build_mixed_audio(audio_path, music_mood, mixed_audio_path)
+    total_duration = _build_mixed_audio(audio_path, music_mood, mixed_audio_path)
 
     all_skipped = []
     all_errors = []
@@ -454,7 +472,12 @@ def main():
     print("Concatenating video blocks...")
     _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", silent_path])
 
-    print("Applying cinematic grade and merging mixed audio...")
+    video_kbps = _compute_target_video_kbps(total_duration)
+    print(
+        f"Applying cinematic grade and merging mixed audio "
+        f"(duration={total_duration:.1f}s, target video bitrate={video_kbps}kbps, "
+        f"budget={TARGET_UPLOAD_MB}MB)..."
+    )
     _run_ffmpeg([
         "-i", silent_path,
         "-i", mixed_audio_path,
@@ -464,11 +487,17 @@ def main():
         "-af", LOUDNORM_AF,
         "-c:v", "libx264",
         "-preset", "medium",
-        "-crf", "19",
+        "-b:v", f"{video_kbps}k",
+        "-maxrate", f"{int(video_kbps * 1.45)}k",
+        "-bufsize", f"{int(video_kbps * 2)}k",
         "-c:a", "aac",
+        "-b:a", f"{AUDIO_BITRATE_KBPS}k",
         "-shortest",
         final_path,
     ])
+
+    final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
+    print(f"Final file size: {final_size_mb:.1f}MB (budget was {TARGET_UPLOAD_MB}MB)")
 
     print("Uploading finished video back to Railway...")
     with open(final_path, "rb") as f:
