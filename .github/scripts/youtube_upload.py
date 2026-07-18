@@ -131,7 +131,7 @@ def main():
 
     print(f"Downloading final video file for {video_id}...")
     file_resp = requests.get(
-        f"{RAILWAY_URL}/api/v1/download/video/{video_id}",
+        f"{RAILWAY_URL}/api/v1/download/videos/{video_id}",
         timeout=300,
     )
     file_resp.raise_for_status()
