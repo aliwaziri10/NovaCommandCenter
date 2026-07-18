@@ -1,3 +1,18 @@
+# Nova Command Center — Session Handoff (2026-07-18)
+
+## GitHub write access
+- Status: 403 "Resource not accessible by integration" — confirmed again this session on `NovaCommandCenter`.
+- No workflow-dispatch/run-workflow tool available via connected GitHub integration. Workflow reruns must be triggered manually by Zia in the Actions tab.
+- All file edits require manual copy/paste by Zia via GitHub web editor.
+
+## Pending action — numpy pin fix (NOT YET APPLIED)
+Path:
+```
+https://github.com/aliwaziri10/NovaCommandCenter/edit/main/.github/workflows/assemble.yml
+```
+
+Full replacement file content:
+```yaml
 name: Assemble Video
 
 on:
@@ -29,7 +44,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests==2.32.3 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9 numpy==1.26.4
+          pip install requests==2.32.3 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9 numpy==1.24.4
 
       - name: Run assembly
         env:
@@ -52,3 +67,23 @@ jobs:
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           Open the run log above and check the top of the failed step's output for the FAILURE SUMMARY block (script, line, error type/message) before digging into the full traceback."
+```
+
+Zia's steps: go to path above → paste full content over existing file → commit directly to `main`.
+
+## Then: rerun workflow manually
+- Actions tab → `Assemble Video` workflow → Run workflow → `video_id` input = `424a809e-31bb-4d94-92d2-09824d2ea33a`.
+- Not triggerable by Claude — no run-workflow tool on connected GitHub integration.
+
+## Critical outstanding item (unchanged from prior session)
+- Nova `YT_REFRESH_TOKEN` must be regenerated via OAuth Playground against the "Alternate Earth" Google account, not "Erased." Blocks all uploads until done.
+
+## Repo/project reference
+- Marius: `aliwaziri10/marius-command-center`, Supabase `swnjzzejsuupecdgbzzf`, channel "Erased"
+- Nova: `aliwaziri10/NovaCommandCenter`, Supabase `vpflhiotidvvvaojwfgf`, channel "Alternate Earth", backend `https://novacommandcenter.onrender.com`
+
+## Standing rules for next session
+- GitHub write is 403 on both repos — always assume manual paste required, verify live before acting.
+- All code changes: full path in copy-button code block + full script in a code block. Never point to specific lines to find.
+- Terse, action-only responses. No rationale/preamble unless safety-critical.
+- Always pull live from GitHub/Supabase tools before answering Nova/Marius questions — don't rely on memory alone.
