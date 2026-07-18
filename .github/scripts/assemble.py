@@ -65,7 +65,7 @@ ACE_MUSIC_HEADERS = {
     "Content-Type": "application/json",
 }
 MUSIC_VOLUME = 0.22  # ducked well under narration
-NARRATION_VOLUME = 0.70  # 30% reduction so music/SFX have more headroom, matches Marius
+NARRATION_VOLUME_WITH_MUSIC = 0.70  # only applied when a music layer is actually mixed in
 LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would clip
 
 WORK_DIR = "/tmp/nova_assembly"
@@ -333,18 +333,24 @@ def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
 
 
 def _build_mixed_audio(narration_path, music_mood, out_path):
-    narration_clip = AudioFileClip(narration_path).volumex(NARRATION_VOLUME)
+    narration_clip = AudioFileClip(narration_path)
     duration = narration_clip.duration
-    layers = [narration_clip]
 
     music_path = os.path.join(WORK_DIR, "background_music.mp3")
-    if _generate_background_music(music_mood, duration, music_path):
-        music_clip = AudioFileClip(music_path)
+    music_file = _generate_background_music(music_mood, duration, music_path)
+
+    if music_file:
+        # Only duck the narration when there's actually a music bed to make
+        # room for. Ducking unconditionally (even with no music) was making
+        # narration too quiet on runs where ACE Music failed.
+        narration_clip = narration_clip.volumex(NARRATION_VOLUME_WITH_MUSIC)
+        music_clip = AudioFileClip(music_file)
         music_clip = _fit_audio_to_duration(music_clip, duration)
         music_clip = music_clip.volumex(MUSIC_VOLUME)
-        layers.append(music_clip)
+        layers = [narration_clip, music_clip]
     else:
-        print("Proceeding with narration-only audio for this video.")
+        print("Proceeding with narration-only audio for this video (full volume, no ducking).")
+        layers = [narration_clip]
 
     mixed = CompositeAudioClip(layers).set_duration(duration)
     mixed = _apply_safety_limiter(mixed)
