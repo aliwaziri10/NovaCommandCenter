@@ -106,7 +106,7 @@ Base path: `/api/v1`
 | `ASSEMBLY_SECRET` | `generate_images.py`, `assemble.py` |
 | `AGNES_API_KEY` | `generate_videos.py` |
 | `ACE_MUSIC_API_KEY` | `assemble.py` (background score) |
-| `YT_CLIENT_ID`, `YT_CLIENT_SECRET`, `YT_REFRESH_TOKEN` | `youtube_upload.py` — must be authorized against the **Alternator** YouTube channel specifically (see note below) |
+| `YT_CLIENT_ID`, `YT_CLIENT_SECRET`, `YT_REFRESH_TOKEN` | `youtube_upload.py` — must be authorized against the **Alternate Earth** YouTube channel specifically (see note below) |
 | `RAILWAY_URL` (legacy name — actually the Render URL) | `youtube_upload.yml` only; other workflows hardcode the Render URL directly |
 
-**Note on `YT_REFRESH_TOKEN`:** which channel an upload lands on is determined by which YouTube channel was active in the browser at the moment the OAuth consent was granted — not by anything in the code. Always confirm **Alternator** is the active channel on youtube.com *before* generating a new refresh token.
+**Note on `YT_REFRESH_TOKEN`:** both `Alternate Earth` and `Erased` are managed by the same Google account (ziawaziri@gmail.com), so this is not a "wrong login" problem — it's about which of the two channels was set **active** in that account's YouTube session at the moment OAuth consent was granted. Before generating a new refresh token: go to youtube.com while signed into ziawaziri@gmail.com, click the profile icon, and switch the active channel to **Alternate Earth** first. Only then go through the consent screen.
