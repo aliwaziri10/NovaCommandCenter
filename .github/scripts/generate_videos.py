@@ -81,9 +81,11 @@ def _find_next_video_needing_clips():
         shots = _parse_shots(production_plan)
         if not shots:
             continue
-        asset_urls = v.get("asset_urls") or []
-        if len(asset_urls) < len(shots):
-            continue
+        # NOTE (2026-07-19): previously also required len(asset_urls) >= len(shots)
+        # here. Removed — asset_urls (Pollinations still images) are never read by
+        # assembly (assemble.py treats them as reference-only) and Pollinations'
+        # free tier was failing often enough to stall videos indefinitely waiting
+        # on images nothing downstream uses. video_clips only needs the shot text.
         clip_urls = v.get("clip_urls") or []
         if len(clip_urls) < len(shots):
             candidates.append(v)
