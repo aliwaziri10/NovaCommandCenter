@@ -7,16 +7,27 @@ from app.models import Topic, Script, Video, Task
 from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
-from app.agents.asset_generation_agent import run_asset_generation, _parse_shots
+from app.agents.asset_generation_agent import _parse_shots
 from app.agents.narration_agent import run_narration
 from app.agents.github_actions_client import trigger_workflow
 # NOTE: run_assembly (Railway-native) is intentionally no longer imported/called —
 # assembly now runs via the assemble.yml GitHub Actions workflow instead, same
 # pattern as video_clips, to avoid crashing Railway's 512MB RAM stitching real clips.
+#
+# NOTE (2026-07-19): asset_generation (Pollinations.ai still images) has been
+# removed from the pipeline entirely. Audit found the images it produced were
+# never used anywhere downstream — video_clips generates real clips straight
+# from each shot's text description via Agnes, and assembly only ever reads
+# clip_urls (assemble.py explicitly treats asset_urls as "reference only" and
+# never uses them). asset_generation was a pure gate: narration, video_clips,
+# and assembly all refused to proceed until it fully finished, and Pollinations'
+# free tier was failing with HTTP 500s often enough that videos stalled forever
+# waiting on images nothing downstream reads. Removing the gate unblocks the
+# real pipeline. run_asset_generation/_parse_shots import kept only for shot
+# counting; the agent function itself is no longer called.
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
-ASSET_BATCH_SIZE = 5
 STALE_TASK_MINUTES = 30
 CLIP_COOLDOWN_MINUTES = 25  # a 3-shot Agnes batch takes roughly 10-20 min; avoid re-triggering mid-run
 ASSEMBLY_COOLDOWN_MINUTES = 35  # assemble.yml has timeout-minutes: 30; give a 5-min safety margin before re-trigger
@@ -82,8 +93,9 @@ def _has_recent_task(db, agent_name, id_key, id_value, minutes):
 def _find_next_task(db):
     videos = db.query(Video).filter(Video.status != "assembled").all()
 
+    # Stage: assembly (needs narration audio + all clips done)
     for video in videos:
-        if not video.asset_urls or not video.production_plan or not video.audio_path:
+        if not video.production_plan or not video.audio_path:
             continue
         total_shots = len(_parse_shots(video.production_plan))
         if not total_shots:
@@ -101,8 +113,9 @@ def _find_next_task(db):
             continue
         return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
 
+    # Stage: video_clips (needs narration audio; clips not yet complete)
     for video in videos:
-        if not video.asset_urls or not video.production_plan or not video.audio_path:
+        if not video.production_plan or not video.audio_path:
             continue
         total_shots = len(_parse_shots(video.production_plan))
         if not total_shots:
@@ -120,37 +133,21 @@ def _find_next_task(db):
             "title": "Generate video clips for " + vid[:8] + " (" + str(clips_done) + "/" + str(total_shots) + ")",
         }
 
+    # Stage: narration (needs production_plan; no longer waits on asset_generation)
     for video in videos:
-        if not video.asset_urls or not video.production_plan or video.audio_path:
-            continue
-        total_shots = len(_parse_shots(video.production_plan))
-        if total_shots and len(video.asset_urls) >= total_shots:
-            vid = str(video.id)
-            if _has_active_task(db, "narration", "video_id", vid):
-                continue
-            if _failed_attempts(db, "narration", "video_id", vid) >= MAX_RETRIES:
-                continue
-            return {"agent_name": "narration", "payload": {"video_id": vid}, "title": "Narrate video " + vid[:8]}
-
-    for video in videos:
-        if not video.production_plan:
+        if not video.production_plan or video.audio_path:
             continue
         total_shots = len(_parse_shots(video.production_plan))
         if not total_shots:
             continue
-        have = len(video.asset_urls) if video.asset_urls else 0
-        if have < total_shots:
-            vid = str(video.id)
-            if _has_active_task(db, "asset_generation", "video_id", vid):
-                continue
-            if _failed_attempts(db, "asset_generation", "video_id", vid) >= MAX_RETRIES:
-                continue
-            return {
-                "agent_name": "asset_generation",
-                "payload": {"video_id": vid, "start_shot": have, "count": ASSET_BATCH_SIZE},
-                "title": "Generate shots for video " + vid[:8],
-            }
+        vid = str(video.id)
+        if _has_active_task(db, "narration", "video_id", vid):
+            continue
+        if _failed_attempts(db, "narration", "video_id", vid) >= MAX_RETRIES:
+            continue
+        return {"agent_name": "narration", "payload": {"video_id": vid}, "title": "Narrate video " + vid[:8]}
 
+    # Stage: video_planning
     scripts = db.query(Script).all()
     for script in scripts:
         has_video = db.query(Video).filter(Video.script_id == script.id).first()
@@ -163,6 +160,7 @@ def _find_next_task(db):
             continue
         return {"agent_name": "video_planning", "payload": {"script_id": sid}, "title": "Plan video for script " + sid[:8]}
 
+    # Stage: script_writing
     topics = db.query(Topic).all()
     for topic in topics:
         has_script = db.query(Script).filter(Script.topic_id == topic.id).first()
@@ -175,6 +173,7 @@ def _find_next_task(db):
             continue
         return {"agent_name": "script_writing", "payload": {"topic_id": tid}, "title": "Write script for topic " + tid[:8]}
 
+    # Stage: topic_research
     topics_without_scripts = []
     for t in topics:
         has_script = db.query(Script).filter(Script.topic_id == t.id).first()
@@ -196,13 +195,6 @@ def _execute(db, agent_name, payload):
         return run_script_writing(db, topic_id=payload["topic_id"])
     if agent_name == "video_planning":
         return run_video_planning(db, script_id=payload["script_id"])
-    if agent_name == "asset_generation":
-        return run_asset_generation(
-            db,
-            video_id=payload["video_id"],
-            start_shot=payload.get("start_shot", 0),
-            count=payload.get("count", 5),
-        )
     if agent_name == "narration":
         return run_narration(db, video_id=payload["video_id"])
     if agent_name == "video_clips":
