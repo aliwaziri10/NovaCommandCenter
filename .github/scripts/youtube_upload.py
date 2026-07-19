@@ -189,13 +189,19 @@ def main():
     print(f"SUCCESS: uploaded as https://youtube.com/watch?v={youtube_video_id}")
 
     print("Marking video as uploaded in backend...")
-    mark_resp = requests.post(
-        f"{RAILWAY_URL}/api/v1/videos/{video_id}/mark-uploaded",
-        json={"youtube_video_id": youtube_video_id},
+    # NOTE: there is no dedicated /mark-uploaded endpoint on this backend -
+    # that route was never built (confirmed by reading main.py's registered
+    # routers). The generic CRUD router DOES support PATCH on /videos/{id},
+    # so we use that instead.
+    mark_resp = requests.patch(
+        f"{RAILWAY_URL}/api/v1/videos/{video_id}",
+        json={"status": "uploaded", "youtube_video_id": youtube_video_id},
         timeout=60,
     )
     if mark_resp.status_code >= 400:
         print(f"WARNING: upload succeeded but failed to mark backend as uploaded: {mark_resp.status_code} {mark_resp.text}")
+    else:
+        print(f"Backend updated: video {video_id} marked status=uploaded, youtube_video_id={youtube_video_id}.")
 
 
 def _print_failure_summary(exc):
