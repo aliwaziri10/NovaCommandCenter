@@ -53,7 +53,7 @@ def run_asset_generation(db: Session, video_id, start_shot: int = 0, count: int 
     for description in batch:
         prompt = (
             f"{description}, cinematic documentary photography, "
-            f"hyper-realistic, ultra detailed, dramatic lighting, 8k, film grain, "
+            f"hyper-realistic, ultra detailed, natural lighting, 8k, film grain, "
             f"professional color grading, widescreen composition"
         )
         url = (
