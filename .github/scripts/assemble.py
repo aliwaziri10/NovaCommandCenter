@@ -59,13 +59,21 @@ LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 # mood prompt built off the title, ducked well under the narration. Per-shot SFX
 # is not implemented here - it needs a dedicated sfx_cue field added to the
 # script-generation step first, same as Marius has.
+#
+# HOWEVER, the source video clips from Agnes already carry their own native
+# audio (ambient sound, sfx, sometimes voices/laughter baked into the clip).
+# That native audio track is captured separately below (see
+# _extract_native_audio) and mixed in as a third layer alongside narration
+# and the generated score - it used to be silently discarded during block
+# rendering (write_videofile was called with audio=False).
 ACE_MUSIC_BASES = ["https://api.acemusic.ai", "https://ai.acemusic.ai"]
 ACE_MUSIC_HEADERS = {
     "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
     "Content-Type": "application/json",
 }
 MUSIC_VOLUME = 0.22  # ducked well under narration
-NARRATION_VOLUME_WITH_MUSIC = 0.70  # only applied when a music layer is actually mixed in
+NATIVE_SFX_VOLUME = 0.55  # clip-native ambient/sfx/laughter, ducked under narration but audible
+NARRATION_VOLUME_WITH_LAYERS = 0.70  # applied when music and/or native sfx is mixed in
 LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would clip
 
 WORK_DIR = "/tmp/nova_assembly"
@@ -175,12 +183,16 @@ def _video_clip(video_path, duration):
     return clip
 
 
-def _run_ffmpeg(args):
+def _run_ffmpeg(args, allow_fail=False):
     full_args = [FFMPEG_BINARY, "-y"] + args
     result = subprocess.run(full_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode != 0:
         error_text = result.stdout.decode(errors="ignore")[-2000:]
+        if allow_fail:
+            print("ffmpeg step failed (continuing without it): " + error_text)
+            return False
         raise RuntimeError("ffmpeg failed: " + error_text)
+    return True
 
 
 def _render_block(shot_indices, urls, durations, media_dir, block_output_path, use_clips):
@@ -214,11 +226,15 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
         return skipped, errors, False
 
     block_video = concatenate_videoclips(clips, method="compose", padding=-CROSSFADE)
+    # Keep each clip's native audio (ambient/sfx/laughter) in the block instead
+    # of discarding it - it gets extracted and mixed back in later, once the
+    # full video is concatenated, alongside narration and the generated score.
     block_video.write_videofile(
         block_output_path,
         fps=24,
         codec="libx264",
-        audio=False,
+        audio=use_clips,
+        audio_codec="aac" if use_clips else None,
         threads=4,
         preset="medium",
         verbose=False,
@@ -233,6 +249,19 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
     gc.collect()
 
     return skipped, errors, True
+
+
+def _extract_native_audio(video_path, out_path):
+    """Pulls the native audio track (ambient/sfx/laughter baked into the
+    Agnes clips) out of the fully concatenated video. Returns out_path if
+    the video actually had an audio stream, otherwise None."""
+    ok = _run_ffmpeg(
+        ["-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out_path],
+        allow_fail=True,
+    )
+    if not ok or not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        return None
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -332,22 +361,38 @@ def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
     return audio_clip.volumex(scale)
 
 
-def _build_mixed_audio(narration_path, music_mood, out_path):
+def _build_mixed_audio(narration_path, music_mood, native_sfx_path, out_path):
     narration_clip = AudioFileClip(narration_path)
     duration = narration_clip.duration
 
     music_path = os.path.join(WORK_DIR, "background_music.mp3")
     music_file = _generate_background_music(music_mood, duration, music_path)
 
+    extra_layers = []
+
     if music_file:
-        # Only duck the narration when there's actually a music bed to make
-        # room for. Ducking unconditionally (even with no music) was making
-        # narration too quiet on runs where ACE Music failed.
-        narration_clip = narration_clip.volumex(NARRATION_VOLUME_WITH_MUSIC)
         music_clip = AudioFileClip(music_file)
         music_clip = _fit_audio_to_duration(music_clip, duration)
         music_clip = music_clip.volumex(MUSIC_VOLUME)
-        layers = [narration_clip, music_clip]
+        extra_layers.append(music_clip)
+    else:
+        print("No background score this run (ACE Music unavailable).")
+
+    if native_sfx_path:
+        print("Mixing in native clip audio (ambient/sfx/laughter from the source clips).")
+        sfx_clip = AudioFileClip(native_sfx_path)
+        sfx_clip = _fit_audio_to_duration(sfx_clip, duration)
+        sfx_clip = sfx_clip.volumex(NATIVE_SFX_VOLUME)
+        extra_layers.append(sfx_clip)
+    else:
+        print("No native clip audio detected to mix in for this video.")
+
+    if extra_layers:
+        # Only duck the narration when there's actually something else to make
+        # room for. Ducking unconditionally (even with nothing else mixed in)
+        # was making narration too quiet on runs where every other layer failed.
+        narration_clip = narration_clip.volumex(NARRATION_VOLUME_WITH_LAYERS)
+        layers = [narration_clip] + extra_layers
     else:
         print("Proceeding with narration-only audio for this video (full volume, no ducking).")
         layers = [narration_clip]
@@ -440,14 +485,11 @@ def main():
     urls = urls[:n]
     durations = durations[:n]
 
-    silent_path = os.path.join(WORK_DIR, "silent_final.mp4")
+    silent_path = os.path.join(WORK_DIR, "silent_final.mp4")  # carries native clip audio internally now; only its video stream is used in the final mux
+    native_sfx_path = os.path.join(WORK_DIR, "native_sfx.wav")
     mixed_audio_path = os.path.join(WORK_DIR, "mixed_audio.wav")
     final_path = os.path.join(WORK_DIR, "final.mp4")
     concat_list_path = os.path.join(WORK_DIR, "concat_list.txt")
-
-    print("Building audio mix (narration + background score)...")
-    music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
-    total_duration = _build_mixed_audio(audio_path, music_mood, mixed_audio_path)
 
     all_skipped = []
     all_errors = []
@@ -477,6 +519,13 @@ def main():
 
     print("Concatenating video blocks...")
     _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", silent_path])
+
+    print("Extracting native clip audio (ambient/sfx/laughter) for the mix...")
+    extracted_sfx = _extract_native_audio(silent_path, native_sfx_path)
+
+    print("Building audio mix (narration + native clip audio + background score)...")
+    music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
+    total_duration = _build_mixed_audio(audio_path, music_mood, extracted_sfx, mixed_audio_path)
 
     video_kbps = _compute_target_video_kbps(total_duration)
     print(
