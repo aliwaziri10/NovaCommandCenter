@@ -94,7 +94,7 @@ def main():
     for i, description in enumerate(all_shots):
         prompt = (
             f"{description}, cinematic documentary photography, "
-            f"hyper-realistic, ultra detailed, dramatic lighting, 8k, film grain, "
+            f"hyper-realistic, ultra detailed, natural lighting, 8k, film grain, "
             f"professional color grading, widescreen composition"
         )
         url = (
