@@ -115,7 +115,13 @@ def _find_next_video_to_assemble():
 
     candidates = []
     for v in videos:
-        if v.get("status") == "assembled":
+        # NOTE: must exclude BOTH "assembled" and "uploaded" - a video that's
+        # already live on YouTube must never be re-picked as "next to assemble".
+        # This used to check only "assembled", which let already-uploaded videos
+        # (still carrying old production_plan/clip_urls) get re-selected as the
+        # oldest candidate on every run, crashing on narration/media that no
+        # longer exists post-migration and starving every real pending video.
+        if v.get("status") in ("assembled", "uploaded"):
             continue
         production_plan = v.get("production_plan")
         if not production_plan:
