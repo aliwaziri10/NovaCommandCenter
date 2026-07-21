@@ -47,7 +47,7 @@ OUTPUT_RESOLUTION_VF = "scale=1280:720"
 # blue-shadow colorbalance) was making every video look dark and gloomy.
 # Vignette and noise are dropped entirely; colorbalance now warms instead of
 # cooling; small brightness lift added.
-CINEMATIC_VF = (
+CINEMATIC_VF_BASE = (
     f"{OUTPUT_RESOLUTION_VF},"
     "eq=contrast=1.05:brightness=0.04:saturation=1.05,"
     "curves=preset=medium_contrast,"
@@ -89,7 +89,16 @@ LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
-SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
+# Matches BOTH production_plan formats seen so far:
+#   "Shot 1: ..." / "**Shot 2:** ..." (the intended format)
+#   "1. ..." / "1) ..."               (a "Scene N - ..." header format that
+#                                       some generations drift into, where the
+#                                       word "Shot" never appears but each
+#                                       shot is still its own numbered line)
+# "Scene N - ..." header lines themselves are correctly NOT matched here (they
+# start with the word "Scene", not a digit or "Shot"), so they're skipped as
+# pure section dividers and only the real numbered shot lines under them count.
+SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
 DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
@@ -281,6 +290,14 @@ def _extract_native_audio(video_path, out_path):
     if not ok or not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
         return None
     return out_path
+
+
+def _get_video_duration(video_path):
+    """Probes a video file's duration in seconds using moviepy."""
+    clip = VideoFileClip(video_path)
+    duration = clip.duration
+    clip.close()
+    return duration
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +564,25 @@ def main():
     music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
     total_duration = _build_mixed_audio(audio_path, music_mood, extracted_sfx, mixed_audio_path)
 
+    # SAFETY NET: the planned shot durations should roughly track the
+    # narration length, but if the shot plan ever under-covers the script
+    # (too few/short shots for a long narration), ffmpeg's "-shortest" below
+    # would silently cut the narration off early once the video track runs
+    # out. Instead of losing narration, freeze the last frame to pad the
+    # video out to the full narration length so the audio always plays in
+    # full and the video always matches its actual narration duration.
+    video_duration = _get_video_duration(silent_path)
+    pad_seconds = total_duration - video_duration
+    if pad_seconds > 0.5:
+        print(
+            f"Video track ({video_duration:.1f}s) is shorter than narration "
+            f"({total_duration:.1f}s) - freezing the last frame for an extra "
+            f"{pad_seconds:.1f}s so no narration gets cut off."
+        )
+        cinematic_vf = f"tpad=stop_mode=clone:stop_duration={pad_seconds:.2f}," + CINEMATIC_VF_BASE
+    else:
+        cinematic_vf = CINEMATIC_VF_BASE
+
     video_kbps = _compute_target_video_kbps(total_duration)
     print(
         f"Applying cinematic grade and merging mixed audio "
@@ -558,7 +594,7 @@ def main():
         "-i", mixed_audio_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-vf", CINEMATIC_VF,
+        "-vf", cinematic_vf,
         "-af", LOUDNORM_AF,
         "-c:v", "libx264",
         "-preset", "medium",
