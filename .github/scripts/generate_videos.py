@@ -82,7 +82,11 @@ def _find_next_video_needing_clips():
         if not shots:
             continue
         clip_urls = v.get("clip_urls") or []
-        if len(clip_urls) < len(shots):
+        # Count FILLED slots, not raw list length. clip_urls is a fixed-length,
+        # position-aligned list (null = not generated yet) - once padded to
+        # full length, len() alone would always look "done" even with gaps.
+        filled = sum(1 for u in clip_urls if u)
+        if filled < len(shots):
             candidates.append(v)
 
     if not candidates:
@@ -168,15 +172,22 @@ def _poll_clip(task_id):
 
 
 def _save_progress(video_id, clip_urls):
-    good_so_far = [u for u in clip_urls if u]
+    # IMPORTANT: save the list AS-IS, preserving null placeholders and shot
+    # position. Filtering out Nones here ("good_so_far = [u for u in clip_urls
+    # if u]") was the actual bug behind narration/visual mismatches: it
+    # compacted the list, so on the next run the shorter list got remapped
+    # back onto shot indices starting at 0 - shifting every clip after a
+    # failed shot into the WRONG shot's slot (wrong clip plays under the
+    # wrong narration line). Never compact this list.
     try:
         patch_resp = requests.patch(
             f"{RAILWAY_URL}/api/v1/videos/{video_id}",
-            json={"clip_urls": good_so_far},
+            json={"clip_urls": clip_urls},
             timeout=30,
         )
         patch_resp.raise_for_status()
-        print(f"Saved progress to Railway: {len(good_so_far)} clips.")
+        filled = len([u for u in clip_urls if u])
+        print(f"Saved progress to Railway: {filled}/{len(clip_urls)} clips (position-preserved).")
     except requests.RequestException as e:
         print(f"WARNING: failed to save progress to Railway: {type(e).__name__}: {str(e)[:150]}")
 
