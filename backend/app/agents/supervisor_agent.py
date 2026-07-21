@@ -43,6 +43,16 @@ from app.agents.github_actions_client import trigger_workflow
 # their narration file had since been cleaned up from Supabase Storage, so
 # every re-trigger of assemble.yml failed with a 400 fetching it. "uploaded"
 # is now excluded too so finished videos stop being reprocessed.
+#
+# NOTE (2026-07-21c): narration and video_clips fired via GitHub Actions
+# workflows with only a cooldown check (_has_recent_task), never a permanent-
+# failure cap. Every other stage (assembly, video_planning, script_writing,
+# topic_research) checks _failed_attempts >= MAX_RETRIES and gives up for
+# good — narration/video_clips didn't, so a video whose narration or clip
+# generation workflow fails every time (bad input, expired API key, etc.)
+# would get re-triggered forever every cooldown window, exactly the same
+# failure mode as the "uploaded" bug above just for a different stage. Both
+# now check _failed_attempts like assembly does.
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
@@ -146,6 +156,8 @@ def _find_next_task(db):
         vid = str(video.id)
         if _has_recent_task(db, "video_clips", "video_id", vid, CLIP_COOLDOWN_MINUTES):
             continue
+        if _failed_attempts(db, "video_clips", "video_id", vid) >= MAX_RETRIES:
+            continue
         return {
             "agent_name": "video_clips",
             "payload": {"video_id": vid},
@@ -164,6 +176,8 @@ def _find_next_task(db):
             continue
         vid = str(video.id)
         if _has_recent_task(db, "narration", "video_id", vid, NARRATION_COOLDOWN_MINUTES):
+            continue
+        if _failed_attempts(db, "narration", "video_id", vid) >= MAX_RETRIES:
             continue
         return {"agent_name": "narration", "payload": {"video_id": vid}, "title": "Narrate video " + vid[:8]}
 
