@@ -36,6 +36,13 @@ from app.agents.github_actions_client import trigger_workflow
 # their outputs, so it survives restarts. run_narration/narration_agent.py is
 # no longer called by the supervisor and is now dead code (kept in the repo
 # in case anything else references it).
+#
+# NOTE (2026-07-21b): the active-videos query below previously only excluded
+# status "assembled", not "uploaded". That let already-uploaded videos (like
+# 424a809e, fully on YouTube) get re-selected by the assembly stage forever —
+# their narration file had since been cleaned up from Supabase Storage, so
+# every re-trigger of assemble.yml failed with a 400 fetching it. "uploaded"
+# is now excluded too so finished videos stop being reprocessed.
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
@@ -103,7 +110,7 @@ def _has_recent_task(db, agent_name, id_key, id_value, minutes):
 
 
 def _find_next_task(db):
-    videos = db.query(Video).filter(Video.status != "assembled").all()
+    videos = db.query(Video).filter(Video.status.notin_(["assembled", "uploaded"])).all()
 
     # Stage: assembly (needs narration audio + all clips done)
     for video in videos:
