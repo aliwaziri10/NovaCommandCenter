@@ -8,7 +8,6 @@ from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import _parse_shots
-from app.agents.narration_agent import run_narration
 from app.agents.github_actions_client import trigger_workflow
 # NOTE: run_assembly (Railway-native) is intentionally no longer imported/called —
 # assembly now runs via the assemble.yml GitHub Actions workflow instead, same
@@ -25,12 +24,25 @@ from app.agents.github_actions_client import trigger_workflow
 # waiting on images nothing downstream reads. Removing the gate unblocks the
 # real pipeline. run_asset_generation/_parse_shots import kept only for shot
 # counting; the agent function itself is no longer called.
+#
+# NOTE (2026-07-21): narration switched from the in-process run_narration()
+# (backend/app/agents/narration_agent.py — gTTS, writes to local Render disk)
+# to the narrate.yml GitHub Actions workflow (.github/scripts/narrate.py —
+# Kokoro TTS, uploads via the backend's upload endpoint to Supabase Storage).
+# Render's disk is ephemeral like Railway's was: run_narration wrote a local
+# path into video.audio_path, and once Render recycled the instance the file
+# was gone and audio_path was left pointing nowhere. narrate.yml persists the
+# audio to Supabase Storage the same way video_clips/assembly already do for
+# their outputs, so it survives restarts. run_narration/narration_agent.py is
+# no longer called by the supervisor and is now dead code (kept in the repo
+# in case anything else references it).
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
 STALE_TASK_MINUTES = 30
 CLIP_COOLDOWN_MINUTES = 25  # a 3-shot Agnes batch takes roughly 10-20 min; avoid re-triggering mid-run
 ASSEMBLY_COOLDOWN_MINUTES = 35  # assemble.yml has timeout-minutes: 30; give a 5-min safety margin before re-trigger
+NARRATION_COOLDOWN_MINUTES = 20  # narrate.yml has timeout-minutes: 15; give a 5-min safety margin before re-trigger
 LOG_PATH = "/app/data/supervisor_log.json"
 
 
@@ -133,7 +145,10 @@ def _find_next_task(db):
             "title": "Generate video clips for " + vid[:8] + " (" + str(clips_done) + "/" + str(total_shots) + ")",
         }
 
-    # Stage: narration (needs production_plan; no longer waits on asset_generation)
+    # Stage: narration (needs production_plan; no longer waits on asset_generation).
+    # Fire-and-forget via narrate.yml GitHub Actions workflow — same cooldown pattern
+    # as video_clips/assembly, since we have no visibility into whether the run
+    # is still going.
     for video in videos:
         if not video.production_plan or video.audio_path:
             continue
@@ -141,9 +156,7 @@ def _find_next_task(db):
         if not total_shots:
             continue
         vid = str(video.id)
-        if _has_active_task(db, "narration", "video_id", vid):
-            continue
-        if _failed_attempts(db, "narration", "video_id", vid) >= MAX_RETRIES:
+        if _has_recent_task(db, "narration", "video_id", vid, NARRATION_COOLDOWN_MINUTES):
             continue
         return {"agent_name": "narration", "payload": {"video_id": vid}, "title": "Narrate video " + vid[:8]}
 
@@ -196,7 +209,10 @@ def _execute(db, agent_name, payload):
     if agent_name == "video_planning":
         return run_video_planning(db, script_id=payload["script_id"])
     if agent_name == "narration":
-        return run_narration(db, video_id=payload["video_id"])
+        triggered = trigger_workflow("narrate.yml", {"video_id": payload["video_id"]})
+        if not triggered:
+            raise RuntimeError("Failed to trigger narrate.yml GitHub Actions workflow.")
+        return {"workflow_triggered": True, "video_id": payload["video_id"]}
     if agent_name == "video_clips":
         triggered = trigger_workflow("generate_videos.yml", {"video_id": payload["video_id"]})
         if not triggered:
