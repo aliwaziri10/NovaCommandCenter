@@ -43,13 +43,15 @@ AUDIO_BITRATE_KBPS = 128
 MIN_VIDEO_KBPS = 400
 OUTPUT_RESOLUTION_VF = "scale=1280:720"
 
+# Brighter, warmer grade - previous version (heavy vignette + film-grain noise +
+# blue-shadow colorbalance) was making every video look dark and gloomy.
+# Vignette and noise are dropped entirely; colorbalance now warms instead of
+# cooling; small brightness lift added.
 CINEMATIC_VF = (
     f"{OUTPUT_RESOLUTION_VF},"
-    "eq=contrast=1.08:saturation=0.95,"
+    "eq=contrast=1.05:brightness=0.04:saturation=1.05,"
     "curves=preset=medium_contrast,"
-    "colorbalance=rs=-0.05:bs=0.05:rh=0.05:bh=-0.05,"
-    "vignette=PI/5,"
-    "noise=c0s=6:allf=t+u"
+    "colorbalance=rs=0.03:rh=0.02"
 )
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
@@ -66,6 +68,14 @@ LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 # _extract_native_audio) and mixed in as a third layer alongside narration
 # and the generated score - it used to be silently discarded during block
 # rendering (write_videofile was called with audio=False).
+#
+# NOTE (flagged, not yet fixed): Agnes is currently called as a silent
+# text-to-video request (see generate_videos.py - no audio parameter in the
+# submit body), so in practice there is usually no native audio track to
+# extract here. This layer stays in place in case that changes, but right
+# now the background score is the only real audio layer besides narration -
+# which means ACE_MUSIC_API_KEY actually working is what determines whether
+# you hear any music/ambience at all.
 ACE_MUSIC_BASES = ["https://api.acemusic.ai", "https://ai.acemusic.ai"]
 ACE_MUSIC_HEADERS = {
     "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
@@ -115,12 +125,11 @@ def _find_next_video_to_assemble():
 
     candidates = []
     for v in videos:
-        # NOTE: must exclude BOTH "assembled" and "uploaded" - a video that's
-        # already live on YouTube must never be re-picked as "next to assemble".
-        # This used to check only "assembled", which let already-uploaded videos
-        # (still carrying old production_plan/clip_urls) get re-selected as the
-        # oldest candidate on every run, crashing on narration/media that no
-        # longer exists post-migration and starving every real pending video.
+        # Must exclude BOTH "assembled" and "uploaded" - a video already live on
+        # YouTube must never be re-picked as "next to assemble". This used to
+        # check only "assembled", which let already-uploaded videos get
+        # re-selected as the oldest candidate on every run and crash on
+        # narration/media that no longer exists post-migration.
         if v.get("status") in ("assembled", "uploaded"):
             continue
         production_plan = v.get("production_plan")
@@ -130,7 +139,11 @@ def _find_next_video_to_assemble():
         if total_shots == 0:
             continue
         clip_urls = v.get("clip_urls") or []
-        if len(clip_urls) >= total_shots:
+        # Require every slot filled, not just enough of them. clip_urls is now
+        # saved as a fixed-length list with null placeholders for shots still
+        # missing a clip (see generate_videos.py) - a video is only ready once
+        # there are no gaps left, not merely once the list is "long enough".
+        if len(clip_urls) >= total_shots and all(clip_urls[:total_shots]):
             candidates.append(v)
 
     if not candidates:
@@ -457,13 +470,14 @@ def main():
         print("ERROR: no shots parsed from production_plan")
         sys.exit(1)
 
-    if len(clip_urls) < total_shots:
+    if len(clip_urls) < total_shots or not all(clip_urls[:total_shots]):
+        have = len([u for u in clip_urls[:total_shots] if u])
         print(
             f"NOT READY: this video needs {total_shots} real video clips but only has "
-            f"{len(clip_urls)} so far ({len(asset_urls)} still images are available as "
+            f"{have} filled so far ({len(asset_urls)} still images are available as "
             f"reference only). Assembly will NOT fall back to still images - real Agnes "
             f"video clips are required for every shot. Let generate_videos.py finish "
-            f"(it runs hourly, 3 clips per run) until clip_urls reaches {total_shots}, "
+            f"(it runs hourly, batches per run) until every shot has a clip, "
             f"then re-run assembly for this video."
         )
         return
