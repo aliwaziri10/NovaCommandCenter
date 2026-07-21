@@ -5,6 +5,9 @@ on:
     - cron: '*/10 * * * *'  # every 10 minutes, 24/7
   workflow_dispatch:  # allows manual trigger from the Actions tab
 
+permissions:
+  issues: write
+
 jobs:
   ping:
     runs-on: ubuntu-latest
@@ -14,3 +17,32 @@ jobs:
           curl -sS -o /dev/null -w "Status: %{http_code}\n" \
             --max-time 100 \
             https://novacommandcenter.onrender.com/api/v1/videos || true
+
+      - name: Trigger supervisor cycle
+        run: |
+          curl -sS -X POST -o /dev/null -w "Supervisor run-now status: %{http_code}\n" \
+            --max-time 100 \
+            https://novacommandcenter.onrender.com/api/v1/supervisor/run-now || true
+
+      - name: Watchdog - alert on stuck/failed supervisor task
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATUS=$(curl -sS --max-time 30 https://novacommandcenter.onrender.com/api/v1/supervisor/status || echo '{}')
+          echo "$STATUS"
+          ACTION=$(echo "$STATUS" | jq -r '.action // empty')
+          if [ "$ACTION" = "failed" ]; then
+            TITLE=$(echo "$STATUS" | jq -r '.title // "Supervisor task failed"')
+            ERROR_MSG=$(echo "$STATUS" | jq -r '.error // "unknown error"')
+            ISSUE_TITLE="Supervisor stuck: $TITLE"
+            EXISTING=$(gh issue list --repo aliwaziri10/NovaCommandCenter --search "in:title \"$ISSUE_TITLE\"" --state open --json number --jq '.[0].number // empty')
+            if [ -z "$EXISTING" ]; then
+              gh issue create --repo aliwaziri10/NovaCommandCenter \
+                --title "$ISSUE_TITLE" \
+                --body "Detected by the keep-alive watchdog at $(date -u +%FT%TZ).
+
+**Error:** $ERROR_MSG
+
+Check /api/v1/supervisor/status on the Render backend for full detail. This issue will not be auto-closed — close it manually once fixed."
+            fi
+          fi
