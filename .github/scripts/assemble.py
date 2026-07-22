@@ -81,9 +81,17 @@ ACE_MUSIC_HEADERS = {
     "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
     "Content-Type": "application/json",
 }
-MUSIC_VOLUME = 0.22  # ducked well under narration
-NATIVE_SFX_VOLUME = 0.55  # clip-native ambient/sfx/laughter, ducked under narration but audible
-NARRATION_VOLUME_WITH_LAYERS = 0.70  # applied when music and/or native sfx is mixed in
+# --- AUDIO MIX FIX (2026-07-22) ---
+# Previous values (MUSIC_VOLUME=0.22, NATIVE_SFX_VOLUME=0.55,
+# NARRATION_VOLUME_WITH_LAYERS=0.70) put native ambient/sfx almost as loud as
+# the ducked narration (these are LINEAR gain multipliers, not dB - 0.55 vs
+# 0.70 is only ~2dB apart), so ambient noise/laughter baked into Agnes clips
+# was fighting the narration instead of sitting underneath it. loudnorm below
+# only normalizes overall mix loudness - it can't fix this internal balance.
+# Narration is now barely ducked, and both other layers sit well underneath.
+MUSIC_VOLUME = 0.10          # was 0.22
+NATIVE_SFX_VOLUME = 0.16     # was 0.55
+NARRATION_VOLUME_WITH_LAYERS = 0.95  # was 0.70
 LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would clip
 
 WORK_DIR = "/tmp/nova_assembly"
