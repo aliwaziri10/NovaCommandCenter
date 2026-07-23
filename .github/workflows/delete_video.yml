@@ -1,0 +1,24 @@
+name: Delete Video (Admin)
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID to permanently delete"
+        required: true
+        type: string
+
+jobs:
+  delete_video:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete video via backend API
+        run: |
+          STATUS=$(curl -sS -o /tmp/resp.txt -w "%{http_code}" -X DELETE "https://novacommandcenter.onrender.com/api/v1/videos/${{ inputs.video_id }}")
+          echo "HTTP status: $STATUS"
+          cat /tmp/resp.txt
+          if [ "$STATUS" != "204" ] && [ "$STATUS" != "404" ]; then
+            echo "Delete failed with unexpected status $STATUS"
+            exit 1
+          fi
+          echo "Video ${{ inputs.video_id }} deleted (or already gone)."
