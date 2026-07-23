@@ -119,7 +119,18 @@ def _continue_if_truncated(plan: str) -> str:
 def run_video_planning(db: Session, script_id: str):
     """Free version — generates a shot-by-shot breakdown from a script using Pollinations.ai.
     Splits the script into two halves (matching how script_writing_agent generates it)
-    instead of truncating, so the full script gets shot-planned, not just the first ~6000 chars."""
+    instead of truncating, so the full script gets shot-planned, not just the first ~6000 chars.
+
+    FAILURE FIX (2026-07-23): on a failed generation, this used to still create a
+    Video row with the literal error string saved as production_plan. Since the
+    supervisor's video_planning stage skips any script that already has a Video
+    row - regardless of whether its plan is real - that permanently stranded the
+    script: no future retry ever ran, narration could still fire on it (it only
+    needs script content, not production_plan), but video_clips/assembly never
+    could (they require total_shots > 0, which a failure string parses to zero).
+    Now this raises instead, so the failure goes through the same Task/
+    _failed_attempts retry path every other agent already uses, and no broken
+    Video row is ever created."""
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
     if not script:
@@ -146,28 +157,32 @@ def run_video_planning(db: Session, script_id: str):
     part1 = _query_pollinations(part1_prompt)
 
     if not part1:
-        plan = "Video planning failed on part 1 — try running this task again."
-    else:
-        part1 = _continue_if_truncated(part1)
-
-        part2_prompt = (
-            f'Continue the shot-by-shot production plan directly from where it left '
-            f'off, for the SECOND HALF of the same script:\n\n{part2_script}\n\n'
-            f'Here is the shot plan so far for context (do not repeat it, only '
-            f'continue numbering from the next shot number):\n\n{part1[-1500:]}\n\n'
-            f'Keep the same format: every shot starts with the literal word "Shot" '
-            f'followed by a number (never "Scene"), and every shot ends with a '
-            f'"Duration: Xs" line. Vary durations naturally. Avoid close-ups of '
-            f'readable text or documents. Cover this second half through to the end '
-            f'of the script.'
+        raise RuntimeError(
+            f"Video planning failed on part 1 for script {script_id} "
+            f"(Pollinations returned nothing usable after 3 attempts) - no Video row created, "
+            f"will be retried by the supervisor up to MAX_RETRIES."
         )
-        part2 = _query_pollinations(part2_prompt)
 
-        if part2:
-            part2 = _continue_if_truncated(part2)
-            plan = part1 + "\n" + part2
-        else:
-            plan = part1 + "\n[Second half of shot plan failed to generate — plan is incomplete]"
+    part1 = _continue_if_truncated(part1)
+
+    part2_prompt = (
+        f'Continue the shot-by-shot production plan directly from where it left '
+        f'off, for the SECOND HALF of the same script:\n\n{part2_script}\n\n'
+        f'Here is the shot plan so far for context (do not repeat it, only '
+        f'continue numbering from the next shot number):\n\n{part1[-1500:]}\n\n'
+        f'Keep the same format: every shot starts with the literal word "Shot" '
+        f'followed by a number (never "Scene"), and every shot ends with a '
+        f'"Duration: Xs" line. Vary durations naturally. Avoid close-ups of '
+        f'readable text or documents. Cover this second half through to the end '
+        f'of the script.'
+    )
+    part2 = _query_pollinations(part2_prompt)
+
+    if part2:
+        part2 = _continue_if_truncated(part2)
+        plan = part1 + "\n" + part2
+    else:
+        plan = part1 + "\n[Second half of shot plan failed to generate — plan is incomplete]"
 
     video = Video(
         title=script.title,
