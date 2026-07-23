@@ -10,6 +10,7 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 
 AGNES_BASE = "https://apihub.agnes-ai.com/v1/videos"
+AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
 CLIP_HEIGHT = 768
 CLIP_WIDTH = 1152
 CLIP_NUM_FRAMES = 121  # ~5 seconds at 24fps, must be 8*n+1
@@ -125,10 +126,11 @@ def _submit_clip(description, shot_index):
     if submit.status_code != 200:
         return None, f"submit failed: HTTP {submit.status_code}: {submit.text[:200]}"
 
-    task_id = submit.json().get("task_id")
-    if not task_id:
-        return None, "no task_id returned"
-    return task_id, None
+    data = submit.json()
+    video_id = data.get("video_id") or data.get("id") or data.get("task_id")
+    if not video_id:
+        return None, f"no video_id/id/task_id in submit response: {data}"
+    return video_id, None
 
 
 def _extract_video_url(data):
@@ -147,14 +149,19 @@ def _extract_video_url(data):
     return None
 
 
-def _poll_clip(task_id):
+def _poll_clip(video_id):
     waited = 0
     last_data = None
     while waited < MAX_WAIT_SECONDS:
         time.sleep(POLL_INTERVAL_SECONDS)
         waited += POLL_INTERVAL_SECONDS
         try:
-            check = requests.get(f"{AGNES_BASE}/{task_id}", headers=HEADERS, timeout=30)
+            check = requests.get(
+                AGNES_POLL_URL,
+                params={"video_id": video_id, "model_name": "agnes-video-v2.0"},
+                headers=HEADERS,
+                timeout=30,
+            )
         except requests.RequestException:
             continue
         if check.status_code != 200:
@@ -257,16 +264,16 @@ def main():
             time.sleep(wait_for)
 
         last_submit_time = time.monotonic()
-        task_id, error = _submit_clip(description, index)
+        agnes_video_id, error = _submit_clip(description, index)
 
-        if not task_id:
+        if not agnes_video_id:
             failure_reasons.append(f"shot {index}: {error}")
             print(f"Shot {index+1}/{total}: FAILED ({error})")
             if error and "RATE LIMITED" in error:
                 print("Backing off 60s after a 429 before continuing this run...")
                 time.sleep(60)
         else:
-            url, error = _poll_clip(task_id)
+            url, error = _poll_clip(agnes_video_id)
             if url:
                 clip_urls[index] = url
                 print(f"Shot {index+1}/{total}: OK -> {url}")
