@@ -62,14 +62,39 @@ def _clean_narration_text(raw_content):
     return " ".join(clean_lines)
 
 
+def _audio_path_is_live(audio_path):
+    """Verifies the narration file this video's audio_path points to
+    actually still exists (HEAD check), instead of trusting the field's
+    mere presence. A video whose audio_path is set but dead (deleted
+    Storage object, failed migration, partial upload) must be treated as
+    still needing narration, or it becomes permanently invisible to this
+    auto-select and can only ever be fixed by a manual video_id re-run."""
+    try:
+        resp = requests.head(audio_path, timeout=15, allow_redirects=True)
+        return resp.status_code == 200
+    except requests.RequestException as e:
+        print(f"audio_path check failed for {audio_path} ({e}) - treating as dead.")
+        return False
+
+
 def _find_next_video_needing_narration():
     resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/videos")
     resp.raise_for_status()
     videos = resp.json()
-    candidates = [
-        v for v in videos
-        if v.get("production_plan") and not v.get("audio_path")
-    ]
+
+    candidates = []
+    for v in videos:
+        if not v.get("production_plan"):
+            continue
+        audio_path = v.get("audio_path")
+        if not audio_path:
+            candidates.append(v)
+            continue
+        if not _audio_path_is_live(audio_path):
+            print(f"Video {v.get('id')} has audio_path set but the file is missing/dead - "
+                  f"treating as needing re-narration: {audio_path}")
+            candidates.append(v)
+
     if not candidates:
         return None
     candidates.sort(key=lambda v: v.get("created_at") or "")
