@@ -24,7 +24,7 @@ from moviepy.editor import (
     concatenate_audioclips,
 )
 
-RAILWAY_URL = os.environ["RAILWAY_URL"]  # name is legacy - this actually points to Render now
+RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 ACE_MUSIC_API_KEY = os.environ.get("ACE_MUSIC_API_KEY")
@@ -33,20 +33,13 @@ DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
-KEN_BURNS_ZOOM = 0.08  # slow 8% push-in over a still shot's duration
+KEN_BURNS_ZOOM = 0.08
 
-# Supabase Free plan hard-caps storage uploads at 50MB (not configurable without
-# upgrading to Pro). Target comfortably under that so encoding variance never
-# pushes a final video over the limit and failing the upload.
 TARGET_UPLOAD_MB = 45
 AUDIO_BITRATE_KBPS = 128
 MIN_VIDEO_KBPS = 400
 OUTPUT_RESOLUTION_VF = "scale=1280:720"
 
-# Brighter, warmer grade - previous version (heavy vignette + film-grain noise +
-# blue-shadow colorbalance) was making every video look dark and gloomy.
-# Vignette and noise are dropped entirely; colorbalance now warms instead of
-# cooling; small brightness lift added.
 CINEMATIC_VF_BASE = (
     f"{OUTPUT_RESOLUTION_VF},"
     "eq=contrast=1.05:brightness=0.04:saturation=1.05,"
@@ -55,57 +48,19 @@ CINEMATIC_VF_BASE = (
 )
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
-# --- Background score (ACE Music) ---
-# Nova's videos table has no per-shot sfx_cue/music_mood columns (unlike Marius),
-# so this generates ONE ambient/orchestral background score per video from a
-# mood prompt built off the title, ducked well under the narration. Per-shot SFX
-# is not implemented here - it needs a dedicated sfx_cue field added to the
-# script-generation step first, same as Marius has.
-#
-# HOWEVER, the source video clips from Agnes already carry their own native
-# audio (ambient sound, sfx, sometimes voices/laughter baked into the clip).
-# That native audio track is captured separately below (see
-# _extract_native_audio) and mixed in as a third layer alongside narration
-# and the generated score - it used to be silently discarded during block
-# rendering (write_videofile was called with audio=False).
-#
-# NOTE (flagged, not yet fixed): Agnes is currently called as a silent
-# text-to-video request (see generate_videos.py - no audio parameter in the
-# submit body), so in practice there is usually no native audio track to
-# extract here. This layer stays in place in case that changes, but right
-# now the background score is the only real audio layer besides narration -
-# which means ACE_MUSIC_API_KEY actually working is what determines whether
-# you hear any music/ambience at all.
 ACE_MUSIC_BASES = ["https://api.acemusic.ai", "https://ai.acemusic.ai"]
 ACE_MUSIC_HEADERS = {
     "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
     "Content-Type": "application/json",
 }
-# --- AUDIO MIX FIX (2026-07-22) ---
-# Previous values (MUSIC_VOLUME=0.22, NATIVE_SFX_VOLUME=0.55,
-# NARRATION_VOLUME_WITH_LAYERS=0.70) put native ambient/sfx almost as loud as
-# the ducked narration (these are LINEAR gain multipliers, not dB - 0.55 vs
-# 0.70 is only ~2dB apart), so ambient noise/laughter baked into Agnes clips
-# was fighting the narration instead of sitting underneath it. loudnorm below
-# only normalizes overall mix loudness - it can't fix this internal balance.
-# Narration is now barely ducked, and both other layers sit well underneath.
-MUSIC_VOLUME = 0.10          # was 0.22
-NATIVE_SFX_VOLUME = 0.16     # was 0.55
-NARRATION_VOLUME_WITH_LAYERS = 0.95  # was 0.70
-LIMITER_CEILING = 0.98  # scales the mixed narration+music peak down if it would clip
+MUSIC_VOLUME = 0.10
+NATIVE_SFX_VOLUME = 0.16
+NARRATION_VOLUME_WITH_LAYERS = 0.95
+LIMITER_CEILING = 0.98
 
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Matches BOTH production_plan formats seen so far:
-#   "Shot 1: ..." / "**Shot 2:** ..." (the intended format)
-#   "1. ..." / "1) ..."               (a "Scene N - ..." header format that
-#                                       some generations drift into, where the
-#                                       word "Shot" never appears but each
-#                                       shot is still its own numbered line)
-# "Scene N - ..." header lines themselves are correctly NOT matched here (they
-# start with the word "Scene", not a digit or "Shot"), so they're skipped as
-# pure section dividers and only the real numbered shot lines under them count.
 SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
 DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 
@@ -135,6 +90,24 @@ def _parse_durations(production_plan):
     return durations
 
 
+def _resolve_durations(video, production_plan, total_shots):
+    """Prefers real per-shot durations (video.shot_durations, computed by
+    narrate.py from actual Edge TTS audio length) over old text-parsed
+    planned durations. Falls back when missing/short/mismatched."""
+    real = video.get("shot_durations")
+    if real and len(real) >= total_shots:
+        print(f"Using real shot_durations from narrate.py ({len(real)} shots, "
+              f"summing to {sum(real[:total_shots]):.1f}s).")
+        return [float(d) for d in real[:total_shots]]
+    if real:
+        print(f"shot_durations present but only covers {len(real)}/{total_shots} shots - "
+              f"falling back to text-parsed planned durations.")
+    else:
+        print("No shot_durations on this video (narrated before the Edge TTS migration, or "
+              "narration hasn't run yet) - falling back to text-parsed planned durations.")
+    return _parse_durations(production_plan)
+
+
 def _find_next_video_to_assemble():
     resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=90)
     resp.raise_for_status()
@@ -142,11 +115,6 @@ def _find_next_video_to_assemble():
 
     candidates = []
     for v in videos:
-        # Must exclude BOTH "assembled" and "uploaded" - a video already live on
-        # YouTube must never be re-picked as "next to assemble". This used to
-        # check only "assembled", which let already-uploaded videos get
-        # re-selected as the oldest candidate on every run and crash on
-        # narration/media that no longer exists post-migration.
         if v.get("status") in ("assembled", "uploaded"):
             continue
         production_plan = v.get("production_plan")
@@ -156,10 +124,6 @@ def _find_next_video_to_assemble():
         if total_shots == 0:
             continue
         clip_urls = v.get("clip_urls") or []
-        # Require every slot filled, not just enough of them. clip_urls is now
-        # saved as a fixed-length list with null placeholders for shots still
-        # missing a clip (see generate_videos.py) - a video is only ready once
-        # there are no gaps left, not merely once the list is "long enough".
         if len(clip_urls) >= total_shots and all(clip_urls[:total_shots]):
             candidates.append(v)
 
@@ -262,9 +226,6 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
         return skipped, errors, False
 
     block_video = concatenate_videoclips(clips, method="compose", padding=-CROSSFADE)
-    # Keep each clip's native audio (ambient/sfx/laughter) in the block instead
-    # of discarding it - it gets extracted and mixed back in later, once the
-    # full video is concatenated, alongside narration and the generated score.
     block_video.write_videofile(
         block_output_path,
         fps=24,
@@ -288,9 +249,6 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
 
 
 def _extract_native_audio(video_path, out_path):
-    """Pulls the native audio track (ambient/sfx/laughter baked into the
-    Agnes clips) out of the fully concatenated video. Returns out_path if
-    the video actually had an audio stream, otherwise None."""
     ok = _run_ffmpeg(
         ["-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out_path],
         allow_fail=True,
@@ -301,16 +259,11 @@ def _extract_native_audio(video_path, out_path):
 
 
 def _get_video_duration(video_path):
-    """Probes a video file's duration in seconds using moviepy."""
     clip = VideoFileClip(video_path)
     duration = clip.duration
     clip.close()
     return duration
 
-
-# ---------------------------------------------------------------------------
-# Background score (ACE Music)
-# ---------------------------------------------------------------------------
 
 def _poll_ace_music_task(task_id, out_path, base_url, max_wait=180, interval=8):
     waited = 0
@@ -432,9 +385,6 @@ def _build_mixed_audio(narration_path, music_mood, native_sfx_path, out_path):
         print("No native clip audio detected to mix in for this video.")
 
     if extra_layers:
-        # Only duck the narration when there's actually something else to make
-        # room for. Ducking unconditionally (even with nothing else mixed in)
-        # was making narration too quiet on runs where every other layer failed.
         narration_clip = narration_clip.volumex(NARRATION_VOLUME_WITH_LAYERS)
         layers = [narration_clip] + extra_layers
     else:
@@ -452,9 +402,6 @@ def _build_mixed_audio(narration_path, music_mood, native_sfx_path, out_path):
 
 
 def _compute_target_video_kbps(duration_seconds):
-    """Computes a video bitrate that keeps the final file under
-    TARGET_UPLOAD_MB for the given duration, leaving room for the audio
-    track. Supabase Storage on the Free plan hard-caps uploads at 50MB."""
     total_kbps = (TARGET_UPLOAD_MB * 8000) / max(duration_seconds, 1)
     video_kbps = int(total_kbps - AUDIO_BITRATE_KBPS)
     return max(MIN_VIDEO_KBPS, video_kbps)
@@ -522,7 +469,7 @@ def main():
     with open(audio_path, "wb") as f:
         f.write(audio_resp.content)
 
-    durations = _parse_durations(production_plan)
+    durations = _resolve_durations(video, production_plan, total_shots)
     n = min(len(urls), len(durations))
     if n == 0:
         print("ERROR: no shots to assemble")
@@ -530,7 +477,7 @@ def main():
     urls = urls[:n]
     durations = durations[:n]
 
-    silent_path = os.path.join(WORK_DIR, "silent_final.mp4")  # carries native clip audio internally now; only its video stream is used in the final mux
+    silent_path = os.path.join(WORK_DIR, "silent_final.mp4")
     native_sfx_path = os.path.join(WORK_DIR, "native_sfx.wav")
     mixed_audio_path = os.path.join(WORK_DIR, "mixed_audio.wav")
     final_path = os.path.join(WORK_DIR, "final.mp4")
@@ -572,13 +519,6 @@ def main():
     music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
     total_duration = _build_mixed_audio(audio_path, music_mood, extracted_sfx, mixed_audio_path)
 
-    # SAFETY NET: the planned shot durations should roughly track the
-    # narration length, but if the shot plan ever under-covers the script
-    # (too few/short shots for a long narration), ffmpeg's "-shortest" below
-    # would silently cut the narration off early once the video track runs
-    # out. Instead of losing narration, freeze the last frame to pad the
-    # video out to the full narration length so the audio always plays in
-    # full and the video always matches its actual narration duration.
     video_duration = _get_video_duration(silent_path)
     pad_seconds = total_duration - video_duration
     if pad_seconds > 0.5:
