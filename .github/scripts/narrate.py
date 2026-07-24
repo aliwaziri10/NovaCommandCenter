@@ -1,31 +1,34 @@
+import asyncio
 import os
 import re
 import sys
-import subprocess
 import time
-import numpy as np
-import requests
-import soundfile as sf
-from kokoro import KPipeline
 
-RAILWAY_URL = os.environ["RAILWAY_URL"]  # name is legacy - this actually points to Render now
+import requests
+import edge_tts
+from pydub import AudioSegment
+from pydub.effects import normalize as pydub_normalize
+
+RAILWAY_URL = os.environ["RAILWAY_URL"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
-VOICE = os.environ.get("VOICE", "am_adam")
+
+VOICE_NAME = os.environ.get("VOICE", "en-US-GuyNeural")
+RATE = "-5%"
+
+PAUSE_SECONDS_MIN = 1.0
+PAUSE_SECONDS_MAX = 2.0
 
 WORK_DIR = "/tmp/nova_narration"
-BACKEND_TIMEOUT = 120  # Render cold starts can run past 30s
+BACKEND_TIMEOUT = 120
 
-# Strips a leading bracketed tag from a line, e.g. "[SCENE 1] A single strip..."
-# -> "A single strip...". Handles tags that sit at the START of a paragraph
-# line (not just lines that are ENTIRELY "[...]").
 LEADING_BRACKET_TAG_RE = re.compile(r"^\[[^\]]*\]\s*")
+
+SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
+DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
+DEFAULT_SHOT_DURATION = 3.0
 
 
 def _get_with_wakeup(url, max_attempts=4, **kwargs):
-    """
-    GETs a URL, retrying with backoff if the Render free-tier backend
-    is asleep and slow to wake up (read timeout / connection error).
-    """
     backoff_seconds = [10, 20, 40, 60]
     kwargs.setdefault("timeout", BACKEND_TIMEOUT)
 
@@ -63,12 +66,6 @@ def _clean_narration_text(raw_content):
 
 
 def _audio_path_is_live(audio_path):
-    """Verifies the narration file this video's audio_path points to
-    actually still exists (HEAD check), instead of trusting the field's
-    mere presence. A video whose audio_path is set but dead (deleted
-    Storage object, failed migration, partial upload) must be treated as
-    still needing narration, or it becomes permanently invisible to this
-    auto-select and can only ever be fixed by a manual video_id re-run."""
     try:
         resp = requests.head(audio_path, timeout=15, allow_redirects=True)
         return resp.status_code == 200
@@ -99,6 +96,59 @@ def _find_next_video_needing_narration():
         return None
     candidates.sort(key=lambda v: v.get("created_at") or "")
     return candidates[0]["id"]
+
+
+def split_into_segments(narration_text):
+    raw_segments = re.split(r"(?<=[.!?])\s+", narration_text.strip())
+    segments = [seg.strip() for seg in raw_segments if seg.strip()]
+    return segments if segments else [narration_text.strip()]
+
+
+async def _synthesize_sentence(text, voice, rate, out_path):
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
+    await communicate.save(out_path)
+
+
+def synthesize_sentence(text, voice, rate, tmp_path):
+    asyncio.run(_synthesize_sentence(text, voice, rate, tmp_path))
+    return AudioSegment.from_file(tmp_path)
+
+
+def synthesize_with_pauses(narration_text, voice, rate):
+    segments = split_into_segments(narration_text)
+    print(f"Narration split into {len(segments)} sentence(s) for pause insertion.")
+
+    combined = AudioSegment.silent(duration=0)
+    for i, segment in enumerate(segments):
+        clip = synthesize_sentence(segment, voice, rate, os.path.join(WORK_DIR, f"sent_{i}.mp3"))
+        combined += clip
+        if i < len(segments) - 1:
+            pause_len = PAUSE_SECONDS_MIN if i % 2 == 0 else PAUSE_SECONDS_MAX
+            combined += AudioSegment.silent(duration=int(pause_len * 1000))
+
+    return combined, len(combined) / 1000.0
+
+
+def _parse_shots_with_durations(production_plan):
+    durations = []
+    for line in production_plan.splitlines():
+        line = line.strip()
+        if not SHOT_START.match(line):
+            continue
+        match = DURATION_PATTERN.search(line)
+        durations.append(float(match.group(1)) if match else DEFAULT_SHOT_DURATION)
+    return durations
+
+
+def _scale_shot_durations(planned_durations, real_total_seconds):
+    if not planned_durations:
+        return []
+    planned_total = sum(planned_durations)
+    if planned_total <= 0:
+        even_share = real_total_seconds / len(planned_durations)
+        return [even_share] * len(planned_durations)
+    scale = real_total_seconds / planned_total
+    return [d * scale for d in planned_durations]
 
 
 def main():
@@ -136,21 +186,29 @@ def main():
     narration_text = _clean_narration_text(raw_content)
     print("Narration text length: " + str(len(narration_text)) + " characters")
 
-    print("Generating speech with Kokoro voice: " + VOICE)
-    pipeline = KPipeline(lang_code="a")
-    all_audio = []
-    for graphemes, phonemes, audio in pipeline(narration_text, voice=VOICE, speed=1.0):
-        all_audio.append(audio)
+    print(f"Generating speech with Edge TTS voice: {VOICE_NAME} (sentence-level, real pauses)")
+    combined_audio, real_total_seconds = synthesize_with_pauses(narration_text, VOICE_NAME, RATE)
+    combined_audio = pydub_normalize(combined_audio)
+    print(f"Real measured narration length: {real_total_seconds:.1f}s")
 
-    if not all_audio:
-        print("ERROR: Kokoro produced no audio")
-        sys.exit(1)
+    shot_durations = None
+    production_plan = video.get("production_plan")
+    if production_plan:
+        planned_durations = _parse_shots_with_durations(production_plan)
+        if planned_durations:
+            shot_durations = _scale_shot_durations(planned_durations, real_total_seconds)
+            print(f"Computed {len(shot_durations)} real per-shot durations "
+                  f"(scaled from planned, summing to {sum(shot_durations):.1f}s).")
+        else:
+            print("No shots parsed from production_plan yet - skipping shot_durations for now.")
+    else:
+        print("No production_plan yet on this video - skipping shot_durations for now.")
 
-    combined = np.concatenate(all_audio)
     wav_path = os.path.join(WORK_DIR, "narration.wav")
-    sf.write(wav_path, combined, 24000)
+    combined_audio.export(wav_path, format="wav")
 
     print("Converting WAV to MP3")
+    import subprocess
     mp3_path = os.path.join(WORK_DIR, "narration.mp3")
     result = subprocess.run(
         ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
@@ -171,6 +229,16 @@ def main():
     upload_resp.raise_for_status()
     print("SUCCESS")
     print(upload_resp.json())
+
+    if shot_durations is not None:
+        print("Saving real shot_durations to backend")
+        patch_resp = requests.patch(
+            f"{RAILWAY_URL}/api/v1/videos/{video_id}",
+            json={"shot_durations": shot_durations},
+            timeout=30,
+        )
+        patch_resp.raise_for_status()
+        print("shot_durations saved.")
 
 
 if __name__ == "__main__":
