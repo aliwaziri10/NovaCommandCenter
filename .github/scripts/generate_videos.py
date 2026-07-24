@@ -5,7 +5,7 @@ import time
 
 import requests
 
-RAILWAY_URL = os.environ["RAILWAY_URL"]
+RAILWAY_URL = os.environ["RAILWAY_URL"]  # points to Render, kept as RAILWAY_URL for compatibility
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 
@@ -41,6 +41,20 @@ LENS_STYLES = [
     "wide-angle lens, deep focus, expansive epic framing",
     "telephoto compression, soft background blur, natural motion blur",
 ]
+
+# FIX (2026-07-25): the old prompt only had a weak "natural lighting" tag
+# buried in the middle of the string, which got drowned out by shot
+# descriptions from video_planning_agent that defaulted to "moody," "storm,"
+# "dramatic shadows," etc. (that part is fixed separately in the planning
+# agent's prompt). This tag is now much stronger, explicit about NOT wanting
+# darkness, and placed at the END of the prompt so it's the last, most
+# emphatic instruction the model sees rather than one weak phrase in the
+# middle.
+LIGHTING_DIRECTIVE = (
+    "bright, clearly and evenly lit scene, strong daylight or warm well-lit "
+    "interior lighting, high visibility, no heavy shadows, no underexposed or "
+    "murky darkness"
+)
 
 
 def _parse_shots(production_plan):
@@ -101,8 +115,9 @@ def _submit_clip(description, shot_index):
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
     prompt = (
         f"{description}, shot by a Hollywood cinematographer, {camera_move}, {lens_style}, "
-        f"natural lighting, high-energy fast-paced documentary style, "
-        f"realistic motion, natural motion blur, high detail, engaging dynamic composition"
+        f"high-energy fast-paced documentary style, "
+        f"realistic motion, natural motion blur, high detail, engaging dynamic composition, "
+        f"{LIGHTING_DIRECTIVE}"
     )
     body = {
         "model": "agnes-video-v2.0",
