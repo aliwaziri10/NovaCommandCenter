@@ -8,10 +8,10 @@ on:
         required: false
         type: string
       voice:
-        description: "Kokoro voice to use"
+        description: "Edge TTS voice to use"
         required: false
         type: string
-        default: "am_adam"
+        default: "en-US-GuyNeural"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -28,12 +28,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install espeak-ng and ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y espeak-ng ffmpeg
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
         run: |
-          pip install kokoro>=0.9.4 soundfile requests numpy
+          pip install edge-tts pydub requests
 
       - name: Run narration
         env:
