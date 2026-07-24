@@ -9,7 +9,6 @@ class BaseSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# User
 class UserBase(BaseSchema):
     email: EmailStr
     name: str
@@ -34,7 +33,6 @@ class UserResponse(UserBase):
     updated_at: datetime
 
 
-# Topic
 class TopicBase(BaseSchema):
     title: str
     category: str
@@ -61,7 +59,6 @@ class TopicResponse(TopicBase):
     updated_at: datetime
 
 
-# Script
 class ScriptBase(BaseSchema):
     title: str
     content: str = ""
@@ -86,7 +83,6 @@ class ScriptResponse(ScriptBase):
     updated_at: datetime
 
 
-# Video
 class VideoBase(BaseSchema):
     title: str
     status: str = "planned"
@@ -97,6 +93,7 @@ class VideoBase(BaseSchema):
     audio_path: Optional[str] = None
     video_url: Optional[str] = None
     youtube_video_id: Optional[str] = None
+    shot_durations: Optional[list[float]] = None
     topic_id: Optional[uuid.UUID] = None
     script_id: Optional[uuid.UUID] = None
 
@@ -115,6 +112,7 @@ class VideoUpdate(BaseSchema):
     audio_path: Optional[str] = None
     video_url: Optional[str] = None
     youtube_video_id: Optional[str] = None
+    shot_durations: Optional[list[float]] = None
     topic_id: Optional[uuid.UUID] = None
     script_id: Optional[uuid.UUID] = None
 
@@ -125,7 +123,6 @@ class VideoResponse(VideoBase):
     updated_at: datetime
 
 
-# Short
 class ShortBase(BaseSchema):
     title: str
     platform: str = "youtube"
@@ -152,7 +149,6 @@ class ShortResponse(ShortBase):
     updated_at: datetime
 
 
-# Sponsor
 class SponsorBase(BaseSchema):
     name: str
     contact_email: EmailStr
@@ -177,7 +173,6 @@ class SponsorResponse(SponsorBase):
     updated_at: datetime
 
 
-# Revenue
 class RevenueBase(BaseSchema):
     amount: float
     type: str = "sponsor"
@@ -202,7 +197,6 @@ class RevenueResponse(RevenueBase):
     updated_at: datetime
 
 
-# Task
 class TaskBase(BaseSchema):
     title: str
     agent_name: str
@@ -229,7 +223,6 @@ class TaskResponse(TaskBase):
     updated_at: datetime
 
 
-# Dashboard
 class PipelineCounts(BaseSchema):
     scripts: int
     videos: int
