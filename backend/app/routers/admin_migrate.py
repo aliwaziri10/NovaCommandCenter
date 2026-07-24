@@ -2,6 +2,9 @@ import os
 import sqlite3
 
 from fastapi import APIRouter
+from sqlalchemy import text
+
+from app.database import engine
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -17,9 +20,6 @@ EXACT_CANDIDATES = [
 
 @router.get("/dump-sqlite")
 def dump_sqlite():
-    """Read-only: checks known exact paths for the legacy local SQLite db
-    and returns every row from every known table as JSON. No recursive
-    filesystem scanning (that hung before). Does not write anything."""
     found = None
     for p in EXACT_CANDIDATES:
         if os.path.isfile(p):
@@ -49,3 +49,10 @@ def dump_sqlite():
             data[t] = f"error reading table: {e}"
     conn.close()
     return {"sqlite_path": found, "tables": data}
+
+
+@router.get("/add-shot-durations-column")
+def add_shot_durations_column():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS shot_durations JSON"))
+    return {"status": "ok", "message": "shot_durations column present on videos table"}
