@@ -35,6 +35,26 @@ def _is_refusal(text: str) -> bool:
     return any(m in lowered for m in refusal_markers)
 
 
+def _is_bad_response(raw: str) -> bool:
+    """Catches non-plan responses: broken JSON envelopes AND error/gateway
+    HTML pages (e.g. Cloudflare 502s from Pollinations' origin going down).
+    FIX (2026-07-24): previously only checked for JSON-shaped errors, so a
+    Cloudflare 502 HTML page (which is long and doesn't start with '{')
+    sailed past the len(raw) > 100 check and got saved into production_plan
+    as if it were a real shot plan. That HTML got repeated up to 6x across
+    the 3 query retries + 3 continuation attempts, exactly matching what
+    was found stored on video 77d9f6ee's production_plan field."""
+    lowered = raw[:500].lower()
+    if raw.startswith('{"role"') or '"reasoning"' in raw[:200] or raw.startswith('{"error"'):
+        return True
+    if raw.startswith('<!DOCTYPE') or raw.startswith('<!doctype') or lowered.startswith('<html'):
+        return True
+    error_markers = ["bad gateway", "502:", "cloudflare", "<html", "cf-error-details", "cf-wrapper"]
+    if any(m in lowered for m in error_markers):
+        return True
+    return False
+
+
 SYSTEM_PROMPT = (
     "You are a professional video producer for a cinematic alternate-history "
     "YouTube channel. Break the given script into a clear shot-by-shot production "
@@ -73,7 +93,7 @@ def _query_pollinations(prompt: str) -> str | None:
                 timeout=60,
             )
             raw = response.text.strip()
-            if raw.startswith('{"role"') or '"reasoning"' in raw[:200] or raw.startswith('{"error"'):
+            if _is_bad_response(raw):
                 continue
             if len(raw) > 100:
                 return _strip_ad_footer(raw)
@@ -102,7 +122,7 @@ def _continue_if_truncated(plan: str) -> str:
                 timeout=60,
             )
             cont_raw = cont_response.text.strip()
-            if cont_raw.startswith('{"role"') or '"reasoning"' in cont_raw[:200] or cont_raw.startswith('{"error"'):
+            if _is_bad_response(cont_raw):
                 break
             cont_raw = _strip_ad_footer(cont_raw)
             if _is_refusal(cont_raw):
@@ -130,7 +150,14 @@ def run_video_planning(db: Session, script_id: str):
     could (they require total_shots > 0, which a failure string parses to zero).
     Now this raises instead, so the failure goes through the same Task/
     _failed_attempts retry path every other agent already uses, and no broken
-    Video row is ever created."""
+    Video row is ever created.
+
+    FAILURE FIX (2026-07-24): _query_pollinations previously only rejected
+    JSON-shaped error envelopes, not HTML error pages. A Cloudflare 502 page
+    from Pollinations' origin passed the len(raw) > 100 check and got saved
+    as production_plan verbatim. _is_bad_response() now also rejects HTML/
+    gateway-error pages, so this same failure mode raises and retries instead
+    of silently corrupting production_plan."""
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
     if not script:
