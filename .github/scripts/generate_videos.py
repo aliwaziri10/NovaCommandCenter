@@ -42,18 +42,28 @@ LENS_STYLES = [
     "telephoto compression, soft background blur, natural motion blur",
 ]
 
-# FIX (2026-07-25): the old prompt only had a weak "natural lighting" tag
-# buried in the middle of the string, which got drowned out by shot
-# descriptions from video_planning_agent that defaulted to "moody," "storm,"
-# "dramatic shadows," etc. (that part is fixed separately in the planning
-# agent's prompt). This tag is now much stronger, explicit about NOT wanting
-# darkness, and placed at the END of the prompt so it's the last, most
-# emphatic instruction the model sees rather than one weak phrase in the
-# middle.
+# FIX (2026-07-29): ported from Marius's 2026-07-29 "quality/anachronism guard"
+# fix. Marius found two problems that apply here too: (1) video models weight
+# EARLIER tokens in the prompt more heavily, so a lighting cue tacked onto the
+# very end of a long prompt was getting drowned out - moved to the FRONT.
+# (2) with no explicit guard, historical/alt-history topics (Alexander, Silk
+# Road, Hormuz chokepoint, etc.) were prone to modern objects leaking into
+# frame (cars, modern clothing, digital devices) and to a flat, desaturated,
+# "CGI" look. Added the same two guard strings Marius uses.
 LIGHTING_DIRECTIVE = (
     "bright, clearly and evenly lit scene, strong daylight or warm well-lit "
     "interior lighting, high visibility, no heavy shadows, no underexposed or "
     "murky darkness"
+)
+
+ANACHRONISM_GUARD = (
+    "historically accurate to this exact time period and setting, no modern technology, "
+    "no cars, no drones, no modern clothing, no digital devices, no anachronistic objects of any kind"
+)
+
+QUALITY_GUARD = (
+    "shot on film, natural film grain, vivid saturated color, no sepia tone, "
+    "no heavy desaturation, no muted documentary color grading, no artificial CGI look, no plastic skin"
 )
 
 
@@ -114,10 +124,10 @@ def _submit_clip(description, shot_index):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
     prompt = (
+        f"{LIGHTING_DIRECTIVE}, {QUALITY_GUARD}, {ANACHRONISM_GUARD}, "
         f"{description}, shot by a Hollywood cinematographer, {camera_move}, {lens_style}, "
         f"high-energy fast-paced documentary style, "
-        f"realistic motion, natural motion blur, high detail, engaging dynamic composition, "
-        f"{LIGHTING_DIRECTIVE}"
+        f"realistic motion, natural motion blur, high detail, engaging dynamic composition"
     )
     body = {
         "model": "agnes-video-v2.0",
