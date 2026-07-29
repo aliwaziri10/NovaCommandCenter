@@ -1,3 +1,4 @@
+import os
 import re
 import uuid
 import requests
@@ -5,6 +6,18 @@ from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models.script import Script
 from app.models.video import Video
+
+# FIX (2026-07-29): Pollinations retired the old standalone text.pollinations.ai
+# service and merged everything into one unified endpoint, gen.pollinations.ai.
+# The old URL was returning nothing usable on every call, which is why every
+# video-planning task for the last 6 days failed after 3 retries and no new
+# Video row ever got created. This was silent - the supervisor just kept
+# rescheduling the same doomed task forever instead of surfacing it as broken.
+# The new endpoint may also expect an API key (see POLLINATIONS_API_KEY below).
+# If a key turns out to be required, this will fail loudly with a clear error
+# instead of silently retrying forever like the old bug did.
+POLLINATIONS_TEXT_URL = "https://gen.pollinations.ai/text"
+POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")  # optional - free tier may not need one
 
 
 def _strip_ad_footer(text: str) -> str:
@@ -118,14 +131,13 @@ SYSTEM_PROMPT = (
 
 
 def _query_pollinations(prompt: str) -> str | None:
-    url = f"https://text.pollinations.ai/{quote(prompt)}"
+    url = f"{POLLINATIONS_TEXT_URL}/{quote(prompt)}"
+    params = {"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8}
+    if POLLINATIONS_API_KEY:
+        params["key"] = POLLINATIONS_API_KEY
     for _ in range(3):
         try:
-            response = requests.get(
-                url,
-                params={"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8},
-                timeout=60,
-            )
+            response = requests.get(url, params=params, timeout=60)
             raw = response.text.strip()
             if _is_bad_response(raw):
                 continue
@@ -148,13 +160,12 @@ def _continue_if_truncated(plan: str) -> str:
             f"line must start with the literal word 'Shot' followed by a number, "
             f"never 'Scene':\n\n{plan[-1500:]}"
         )
-        cont_url = f"https://text.pollinations.ai/{quote(continuation_prompt)}"
+        cont_url = f"{POLLINATIONS_TEXT_URL}/{quote(continuation_prompt)}"
+        cont_params = {"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8}
+        if POLLINATIONS_API_KEY:
+            cont_params["key"] = POLLINATIONS_API_KEY
         try:
-            cont_response = requests.get(
-                cont_url,
-                params={"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8},
-                timeout=60,
-            )
+            cont_response = requests.get(cont_url, params=cont_params, timeout=60)
             cont_raw = cont_response.text.strip()
             if _is_bad_response(cont_raw):
                 break
@@ -208,7 +219,17 @@ def run_video_planning(db: Session, script_id: str):
     entirely up to the model's judgment. This addresses long scripts getting
     the same small handful of shots as short ones, which forced assembly's
     frozen-last-frame safety net to stretch a handful of real clips across
-    minutes of narration."""
+    minutes of narration.
+
+    FIX (2026-07-29): switched from the retired text.pollinations.ai endpoint
+    to the current gen.pollinations.ai/text endpoint. The old endpoint was
+    silently dead - every call failed, every retry failed, and the supervisor
+    just kept rescheduling this task forever instead of surfacing it as
+    permanently broken. This is why no new video had been planned in 6 days
+    despite two scripts (cde377be, 1b31fbc5) sitting ready and waiting. Also
+    added optional POLLINATIONS_API_KEY support, since the new unified
+    endpoint's docs list a key parameter that the old free endpoint never
+    required."""
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
     if not script:
