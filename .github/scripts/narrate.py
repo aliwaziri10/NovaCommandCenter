@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 import sys
 import time
@@ -13,7 +14,7 @@ RAILWAY_URL = os.environ["RAILWAY_URL"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
 VOICE_NAME = os.environ.get("VOICE", "en-US-GuyNeural")
-RATE = "-5%"
+BASE_RATE = -5  # percent, matches prior flat setting as the baseline
 
 PAUSE_SECONDS_MIN = 1.0
 PAUSE_SECONDS_MAX = 2.0
@@ -104,23 +105,61 @@ def split_into_segments(narration_text):
     return segments if segments else [narration_text.strip()]
 
 
-async def _synthesize_sentence(text, voice, rate, out_path):
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
+# --- Prosody variation (added 2026-08-02) ---
+# A single flat rate for every sentence is one of the most obvious "AI voice"
+# tells - real human narrators speed up for punchy/tense lines, slow down for
+# weighty ones, and lift pitch on questions. This picks a rate/pitch per
+# sentence based on its shape (question, short/punchy, long) plus a small
+# bounded random jitter so back-to-back sentences of the same type don't
+# sound identically robotic either. Bounds are kept tight so it reads as
+# natural variation, not erratic or distracting.
+def _prosody_for_sentence(text, index):
+    rng = random.Random(index)  # deterministic per-sentence, still varies run to run via index
+    word_count = len(text.split())
+    is_question = text.rstrip().endswith("?")
+    is_exclamation = text.rstrip().endswith("!")
+
+    rate = BASE_RATE
+    pitch = 0
+
+    if is_question:
+        pitch += rng.randint(2, 5)
+        rate += rng.randint(-2, 1)
+    elif is_exclamation or word_count <= 7:
+        rate += rng.randint(2, 6)
+        pitch += rng.randint(1, 3)
+    elif word_count >= 25:
+        rate += rng.randint(-8, -4)
+        pitch += rng.randint(-2, 0)
+    else:
+        rate += rng.randint(-3, 2)
+        pitch += rng.randint(-1, 2)
+
+    rate = max(-20, min(15, rate))
+    pitch = max(-6, min(8, pitch))
+    rate_str = f"{'+' if rate >= 0 else ''}{rate}%"
+    pitch_str = f"{'+' if pitch >= 0 else ''}{pitch}Hz"
+    return rate_str, pitch_str
+
+
+async def _synthesize_sentence(text, voice, rate, pitch, out_path):
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     await communicate.save(out_path)
 
 
-def synthesize_sentence(text, voice, rate, tmp_path):
-    asyncio.run(_synthesize_sentence(text, voice, rate, tmp_path))
+def synthesize_sentence(text, voice, rate, pitch, tmp_path):
+    asyncio.run(_synthesize_sentence(text, voice, rate, pitch, tmp_path))
     return AudioSegment.from_file(tmp_path)
 
 
-def synthesize_with_pauses(narration_text, voice, rate):
+def synthesize_with_pauses(narration_text, voice):
     segments = split_into_segments(narration_text)
-    print(f"Narration split into {len(segments)} sentence(s) for pause insertion.")
+    print(f"Narration split into {len(segments)} sentence(s) for pause insertion and prosody variation.")
 
     combined = AudioSegment.silent(duration=0)
     for i, segment in enumerate(segments):
-        clip = synthesize_sentence(segment, voice, rate, os.path.join(WORK_DIR, f"sent_{i}.mp3"))
+        rate, pitch = _prosody_for_sentence(segment, i)
+        clip = synthesize_sentence(segment, voice, rate, pitch, os.path.join(WORK_DIR, f"sent_{i}.mp3"))
         combined += clip
         if i < len(segments) - 1:
             pause_len = PAUSE_SECONDS_MIN if i % 2 == 0 else PAUSE_SECONDS_MAX
@@ -186,8 +225,8 @@ def main():
     narration_text = _clean_narration_text(raw_content)
     print("Narration text length: " + str(len(narration_text)) + " characters")
 
-    print(f"Generating speech with Edge TTS voice: {VOICE_NAME} (sentence-level, real pauses)")
-    combined_audio, real_total_seconds = synthesize_with_pauses(narration_text, VOICE_NAME, RATE)
+    print(f"Generating speech with Edge TTS voice: {VOICE_NAME} (sentence-level, prosody-varied, real pauses)")
+    combined_audio, real_total_seconds = synthesize_with_pauses(narration_text, VOICE_NAME)
     combined_audio = pydub_normalize(combined_audio)
     print(f"Real measured narration length: {real_total_seconds:.1f}s")
 
