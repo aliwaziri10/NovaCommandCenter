@@ -38,21 +38,30 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
     try:
         agent = _normalize(task.agent_name)
         print(f"DEBUG: agent_name raw={task.agent_name!r} normalized={agent!r}")
+        # FIX (2026-08-02): on a successful run, drop any stale "error" key left
+        # over from a PREVIOUS failed attempt on this same task row. Previously
+        # this only ever added new keys on top of the existing payload dict, so
+        # a task that failed once and then succeeded on retry still displayed
+        # the old error message forever alongside the real, successful result -
+        # exactly what happened on the two video_planning retries after the
+        # Pollinations API key was added (both showed "completed" with a real
+        # result AND a leftover "Pollinations returned nothing usable" error).
+        clean_payload = {k: v for k, v in (task.payload or {}).items() if k != "error"}
         if agent == "topic_research":
             category = (task.payload or {}).get("category", "History")
             result = run_topic_research(db, category=category)
             task.status = "completed"
-            task.payload = {**(task.payload or {}), "result": result}
+            task.payload = {**clean_payload, "result": result}
         elif agent == "script_writing":
             topic_id = (task.payload or {})["topic_id"]
             result = run_script_writing(db, topic_id=topic_id)
             task.status = "completed"
-            task.payload = {**(task.payload or {}), "result": result}
+            task.payload = {**clean_payload, "result": result}
         elif agent == "video_planning":
             script_id = (task.payload or {})["script_id"]
             result = run_video_planning(db, script_id=script_id)
             task.status = "completed"
-            task.payload = {**(task.payload or {}), "result": result}
+            task.payload = {**clean_payload, "result": result}
         elif agent == "asset_generation":
             payload = task.payload or {}
             video_id = payload["video_id"]
@@ -60,17 +69,17 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
             count = payload.get("count", 5)
             result = run_asset_generation(db, video_id=video_id, start_shot=start_shot, count=count)
             task.status = "completed"
-            task.payload = {**(task.payload or {}), "result": result}
+            task.payload = {**clean_payload, "result": result}
         elif agent == "narration":
             video_id = (task.payload or {})["video_id"]
             result = run_narration(db, video_id=video_id)
             task.status = "completed"
-            task.payload = {**(task.payload or {}), "result": result}
+            task.payload = {**clean_payload, "result": result}
         elif agent == "assembly":
             video_id = (task.payload or {})["video_id"]
             result = run_assembly(db, video_id=video_id)
             task.status = "completed"
-            task.payload = {**(task.payload or {}), "result": result}
+            task.payload = {**clean_payload, "result": result}
         else:
             print(f"DEBUG: no matching branch for agent={agent!r}, falling through to else")
             task.status = "completed"
