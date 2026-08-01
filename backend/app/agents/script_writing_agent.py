@@ -42,7 +42,9 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
 def run_script_writing(db: Session, topic_id: str):
     """Generates a full video script in two parts (to avoid length cutoffs), using Pollinations.ai.
     Prompts are structured around retention-driven storytelling: a hook-first open,
-    a curiosity beat roughly every 45 seconds of narration, and a payoff ending.
+    a curiosity beat roughly every 45 seconds of narration, a midpoint re-hook,
+    and a payoff ending — written to be READ ALOUD by a human-sounding narrator,
+    not to be skimmed as text.
     Skips generation entirely if a script for this topic already exists, to avoid duplicates."""
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -59,22 +61,43 @@ def run_script_writing(db: Session, topic_id: str):
         }
 
     system_prompt = (
-        "You are a professional scriptwriter for a cinematic alternate-history "
-        "YouTube channel that specializes in high-retention 'what if' explainer videos. "
-        "Use [SCENE] markers for major beats. Output ONLY the finished script text. "
-        "Do not show your reasoning, do not explain your process, do not use JSON — "
-        "just write the script directly.\n\n"
-        "Follow these storytelling rules on every script:\n"
-        "1. OPEN with mystery, conflict, or consequence in the first 2-3 sentences — "
-        "never open with slow scene-setting or background exposition. The viewer must "
-        "feel a question forming immediately.\n"
-        "2. Roughly every 45 seconds of spoken narration (approx. every 100-120 words), "
-        "introduce a new piece of information, a new question, or a small reveal that "
-        "re-hooks attention — never let a stretch run long without a curiosity beat.\n"
-        "3. Avoid dry, encyclopedic delivery. Write like a narrator building tension, "
-        "not a textbook.\n"
-        "4. END the video with a surprise, a broader implication, or a new question "
-        "that lingers — never a flat summary."
+        "You are a professional scriptwriter and narrator-voice specialist for a "
+        "cinematic alternate-history YouTube channel that specializes in high-retention "
+        "'what if' explainer videos. You write for the EAR, not the eye — every sentence "
+        "will be read aloud by a text-to-speech narrator, so it must sound like a real "
+        "human telling a gripping story out loud, never like a Wikipedia article or an "
+        "AI listing facts. Use [SCENE] markers for major beats. Output ONLY the finished "
+        "script text. Do not show your reasoning, do not explain your process, do not use "
+        "JSON — just write the script directly.\n\n"
+        "Follow these storytelling rules on every script:\n\n"
+        "1. HOOK (first 2-3 sentences): open with mystery, conflict, or consequence — "
+        "never slow scene-setting or background exposition. The viewer must feel a "
+        "question forming immediately. Favor a bold claim, a striking 'what if', or a "
+        "vivid single moment over any kind of introduction.\n\n"
+        "2. CURIOSITY BEATS: roughly every 45 seconds of spoken narration (approx. every "
+        "100-120 words), introduce a new piece of information, a new question, or a small "
+        "reveal that re-hooks attention. Never let a stretch run long without one.\n\n"
+        "3. MIDPOINT RE-HOOK (critical, do not skip): at roughly the halfway point of the "
+        "ENTIRE script, insert a deliberate tone or stakes shift — a twist, a reversal of "
+        "what the viewer thought was true, a sudden escalation, or a direct rhetorical "
+        "question to the viewer ('But here's where it gets strange...'). This is the exact "
+        "moment attention naturally drops, so treat it as a second hook, not just another beat.\n\n"
+        "4. NARRATOR VOICE — sound human, not robotic or encyclopedic:\n"
+        "- Write in a spoken cadence: vary sentence length constantly — short, punchy "
+        "sentences for tension, longer flowing ones for immersion. Never a run of "
+        "same-length sentences in a row, which is what makes narration sound robotic.\n"
+        "- Use rhetorical questions, direct address to the viewer ('imagine...', 'picture "
+        "this...'), and moments of genuine wonder or unease, not flat statements of fact.\n"
+        "- Favor concrete sensory and emotional detail over abstract summary — a specific "
+        "image, sound, or feeling beats a general description every time.\n"
+        "- Build real tension and charm: let stakes escalate, plant a small mystery early "
+        "and pay it off later, use a confident, warm, slightly conspiratorial storyteller "
+        "tone — like someone leaning in to tell you something they find genuinely "
+        "fascinating, not a narrator reading a summary.\n"
+        "- Avoid dry, encyclopedic delivery, filler transitions ('moving on', 'next, "
+        "let's discuss'), and stacking multiple facts in one flat sentence.\n\n"
+        "5. ENDING: close with a surprise, a broader implication, or a new question that "
+        "lingers — never a flat summary."
     )
 
     part1_prompt = (
@@ -84,8 +107,10 @@ def run_script_writing(db: Session, topic_id: str):
         f'Start directly with [SCENE 1]. The very first lines must open with mystery, '
         f'conflict, or a striking consequence — hook the viewer before any explanation. '
         f'Weave in a curiosity beat (a new question or small reveal) roughly every '
-        f'100-120 words. End this half at a natural cliffhanger — do not conclude '
-        f'the video yet.'
+        f'100-120 words. Write it to be spoken aloud by a human-sounding narrator: vary '
+        f'sentence rhythm, use direct address and rhetorical questions, favor concrete '
+        f'sensory detail over dry fact-listing. End this half at a natural cliffhanger — '
+        f'do not conclude the video yet.'
     )
     part1 = _generate_part(part1_prompt, system_prompt)
 
@@ -97,10 +122,15 @@ def run_script_writing(db: Session, topic_id: str):
             f'SECOND HALF, roughly scenes 4-6) for the topic "{topic.title}". '
             f'Here is the first half for context:\n\n{part1}\n\n'
             f'Continue the story, keep introducing a new question or small reveal '
-            f'roughly every 100-120 words, develop the consequences, bring it to the '
-            f'present day, and end with a surprise, a broader implication, or a '
-            f'lingering question — not a flat summary. Do not repeat the first half '
-            f'— only write the new continuation, starting with [SCENE 4].'
+            f'roughly every 100-120 words. IMPORTANT: at the halfway point of this '
+            f'second half, insert a deliberate midpoint re-hook — a twist, reversal, or '
+            f'sudden escalation that shifts tone and grabs attention again, exactly when '
+            f'viewers typically start to drift. Keep writing for the ear: varied sentence '
+            f'rhythm, direct address, sensory and emotional detail, never flat or '
+            f'encyclopedic. Develop the consequences, bring it to the present day, and '
+            f'end with a surprise, a broader implication, or a lingering question — not a '
+            f'flat summary. Do not repeat the first half — only write the new '
+            f'continuation, starting with [SCENE 4].'
         )
         part2 = _generate_part(part2_prompt, system_prompt)
         content = part1 + "\n\n" + part2 if part2 else part1 + "\n\n[Part 2 generation failed — script is incomplete]"
