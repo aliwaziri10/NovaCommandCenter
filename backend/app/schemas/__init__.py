@@ -89,7 +89,13 @@ class VideoBase(BaseSchema):
     views: int = 0
     production_plan: Optional[str] = None
     asset_urls: Optional[list[str]] = None
-    clip_urls: Optional[list[str]] = None
+    # FIX (2026-08-02): was list[str]. generate_videos.py saves clip_urls as a
+    # fixed-length, position-aligned list with None placeholders for shots not
+    # yet generated (intentional - keeps clip N aligned with shot N even when
+    # earlier shots fail). Pydantic rejected null inside list[str] with a 422
+    # on every single save, silently discarding every successfully generated
+    # clip. list[Optional[str]] allows the placeholders through.
+    clip_urls: Optional[list[Optional[str]]] = None
     audio_path: Optional[str] = None
     video_url: Optional[str] = None
     youtube_video_id: Optional[str] = None
@@ -108,7 +114,7 @@ class VideoUpdate(BaseSchema):
     views: Optional[int] = None
     production_plan: Optional[str] = None
     asset_urls: Optional[list[str]] = None
-    clip_urls: Optional[list[str]] = None
+    clip_urls: Optional[list[Optional[str]]] = None
     audio_path: Optional[str] = None
     video_url: Optional[str] = None
     youtube_video_id: Optional[str] = None
