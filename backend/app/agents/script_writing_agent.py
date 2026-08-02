@@ -5,6 +5,22 @@ from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models.topic import Topic
 from app.models.script import Script
+from app.models import Task
+
+
+def _latest_strategy_notes(db: Session) -> str | None:
+    """Pulls the most recent completed strategy_research task's notes, if any.
+    Returns None if that agent has never run - script generation works fine
+    without it, this is a bonus signal when available."""
+    task = (
+        db.query(Task)
+        .filter(Task.agent_name == "strategy_research", Task.status == "completed")
+        .order_by(Task.created_at.desc())
+        .first()
+    )
+    if not task or not task.payload:
+        return None
+    return (task.payload.get("result") or {}).get("notes")
 
 
 def _extract_script(raw: str) -> str | None:
@@ -118,10 +134,18 @@ def run_script_writing(db: Session, topic_id: str):
         "implication, or a new question that lingers — never a flat summary."
     )
 
+    strategy_notes = _latest_strategy_notes(db)
+    strategy_block = (
+        f'\nCurrent niche trend notes (from recent competitor/self performance data, '
+        f'use as light inspiration for title/hook framing, do not copy titles '
+        f'directly):\n{strategy_notes}\n'
+        if strategy_notes else ''
+    )
+
     part1_prompt = (
         f'Write the FIRST HALF (roughly scenes 1-3) of a YouTube video script '
         f'for this topic:\nTitle: "{topic.title}"\nCategory: {topic.category}\n'
-        f'Notes: {topic.notes}\n\n'
+        f'Notes: {topic.notes}\n{strategy_block}\n'
         f'Start directly with [SCENE 1]. The very first lines must open with mystery, '
         f'conflict, or a striking consequence — hook the viewer before any explanation, '
         f'and clearly state or imply the ONE central "what if" question this whole video '
