@@ -11,6 +11,7 @@ from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import run_asset_generation
 from app.agents.narration_agent import run_narration
 from app.agents.assembly_agent import run_assembly
+from app.agents.strategy_research_agent import run_strategy_research
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 def _normalize(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
@@ -78,6 +79,10 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
         elif agent == "assembly":
             video_id = (task.payload or {})["video_id"]
             result = run_assembly(db, video_id=video_id)
+            task.status = "completed"
+            task.payload = {**clean_payload, "result": result}
+        elif agent == "strategy_research":
+            result = run_strategy_research(db)
             task.status = "completed"
             task.payload = {**clean_payload, "result": result}
         else:
