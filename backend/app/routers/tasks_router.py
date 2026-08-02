@@ -12,6 +12,7 @@ from app.agents.asset_generation_agent import run_asset_generation
 from app.agents.narration_agent import run_narration
 from app.agents.assembly_agent import run_assembly
 from app.agents.strategy_research_agent import run_strategy_research
+from app.agents.github_actions_client import trigger_workflow
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 def _normalize(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
@@ -76,6 +77,18 @@ def run_task(task_id: uuid.UUID, db: Session = Depends(get_db)):
             result = run_narration(db, video_id=video_id)
             task.status = "completed"
             task.payload = {**clean_payload, "result": result}
+        elif agent == "video_clips":
+            # FIX (2026-08-02): this branch was missing entirely. Any manual
+            # "Run" click on a video_clips task from the dashboard fell through
+            # to the else clause below and was marked "completed" without ever
+            # triggering generate_videos.yml — identical bug to the old missing
+            # strategy_research branch, just for the clip-generation stage.
+            video_id = (task.payload or {})["video_id"]
+            triggered = trigger_workflow("generate_videos.yml", {"video_id": video_id})
+            if not triggered:
+                raise RuntimeError("Failed to trigger generate_videos.yml GitHub Actions workflow.")
+            task.status = "completed"
+            task.payload = {**clean_payload, "result": {"workflow_triggered": True, "video_id": video_id}}
         elif agent == "assembly":
             video_id = (task.payload or {})["video_id"]
             result = run_assembly(db, video_id=video_id)
