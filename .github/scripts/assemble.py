@@ -45,11 +45,6 @@ CINEMATIC_VF_BASE = (
 )
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
-# NOTE (change): background music (ACE Music) removed from the pipeline.
-# Native SFX/ambient audio extracted from the Agnes clips themselves is kept -
-# it's free (already baked into the clips), adds realism, and doesn't compete
-# with narration clarity the way a generated score did. ACE Music was also an
-# unreliable dependency (both hosts had timed out in prior runs).
 NATIVE_SFX_VOLUME = 0.16
 NARRATION_VOLUME_WITH_LAYERS = 0.95
 LIMITER_CEILING = 0.98
@@ -87,9 +82,6 @@ def _parse_durations(production_plan):
 
 
 def _resolve_durations(video, production_plan, total_shots):
-    """Prefers real per-shot durations (video.shot_durations, computed by
-    narrate.py from actual Edge TTS audio length) over old text-parsed
-    planned durations. Falls back when missing/short/mismatched."""
     real = video.get("shot_durations")
     if real and len(real) >= total_shots:
         print(f"Using real shot_durations from narrate.py ({len(real)} shots, "
@@ -157,6 +149,25 @@ def _still_image_clip(image_path, duration):
     return framed
 
 
+def _fit_clip_to_duration(clip, target_duration, fps=24):
+    """FIX (2026-08-03): the old version of this file did
+    `clip.set_duration(clip.duration)` when a downloaded clip was SHORTER
+    than the shot's target duration - a no-op that silently left the shot
+    under-filled instead of fixing anything. That's very likely connected to
+    the "~58 second videos" issue Zia flagged, since per-shot durations were
+    never actually being honored. Now holds the final frame for the missing
+    remainder, same mechanism Marius uses (`fit_clip_to_duration` in
+    Marius's `video_generation.py`), so every shot always reaches its real
+    target duration."""
+    if clip.duration >= target_duration:
+        return clip.subclip(0, target_duration)
+
+    extra = target_duration - clip.duration
+    freeze_frame = clip.to_ImageClip(t=max(clip.duration - 1 / fps, 0))
+    freeze_frame = freeze_frame.set_duration(extra).set_fps(fps)
+    return concatenate_videoclips([clip, freeze_frame])
+
+
 def _video_clip(video_path, duration):
     target_w, target_h = RESOLUTION
     base_clip = VideoFileClip(video_path)
@@ -170,10 +181,10 @@ def _video_clip(video_path, duration):
     clip = clip.set_position(("center", "center"))
     clip = clip.crop(x_center=resized_w / 2, y_center=resized_h / 2, width=target_w, height=target_h)
 
-    if clip.duration >= duration:
-        clip = clip.subclip(0, duration)
-    else:
-        clip = clip.set_duration(clip.duration)
+    # FIX (2026-08-03): was `clip.set_duration(clip.duration)` here (a no-op)
+    # when the clip came back shorter than needed - see _fit_clip_to_duration
+    # docstring above for why this matters.
+    clip = _fit_clip_to_duration(clip, duration)
 
     clip = clip.crossfadein(min(CROSSFADE, clip.duration / 2))
     return clip
