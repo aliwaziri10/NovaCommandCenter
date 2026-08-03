@@ -1,20 +1,24 @@
-import asyncio
 import os
-import random
 import re
 import sys
 import time
 
 import requests
-import edge_tts
+import torchaudio
+from chatterbox.tts import ChatterboxTTS
 from pydub import AudioSegment
 from pydub.effects import normalize as pydub_normalize
 
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
-VOICE_NAME = os.environ.get("VOICE", "en-US-GuyNeural")
-BASE_RATE = -5  # percent, matches prior flat setting as the baseline
+# CHATTERBOX (ported from Marius, 2026-08-04): replaces Edge TTS. Runs on a
+# GitHub-hosted runner (this workflow), same as Marius - plenty of RAM,
+# no Render in-process risk. Chatterbox has no rate/pitch param, so the
+# per-sentence prosody-variation trick used under Edge TTS is dropped;
+# Chatterbox's own prosody is already more natural than Edge TTS's flat
+# delivery was.
+SLOWDOWN_FACTOR = "0.95"
 
 PAUSE_SECONDS_MIN = 1.0
 PAUSE_SECONDS_MAX = 2.0
@@ -27,6 +31,40 @@ LEADING_BRACKET_TAG_RE = re.compile(r"^\[[^\]]*\]\s*")
 SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
 DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 DEFAULT_SHOT_DURATION = 3.0
+
+# GUARD (2026-08-04): this is the actual live pipeline path (triggered by the
+# Supervisor Agent's automated 20-minute cycle) - narration_agent.py's
+# equivalent guard only protects the separate manual/admin dashboard path,
+# NOT this one. Without this, "Hidden Code"-style script corruption (a
+# Pollinations error page saved as script content) can still reach TTS here
+# even after script_writing_agent.py's 2026-08-03 fix, for any script row
+# that predates that fix or reaches this script through any future path.
+_CODE_LIKE_MARKERS = (
+    "<html", "<!doctype", "<div", "<span", "<body", "<script",
+    "```", "function(", "function (", "=>", "SELECT *", "import ",
+    "def ", "class ", "{\"", "[{", "</",
+)
+
+
+def _looks_like_code_or_markup(text):
+    lowered = text.lower()
+    hits = sum(1 for marker in _CODE_LIKE_MARKERS if marker.lower() in lowered)
+    if hits >= 2:
+        return True
+    symbol_count = sum(text.count(ch) for ch in "{}<>[]")
+    if symbol_count > 5 and (symbol_count / max(len(text), 1)) > 0.01:
+        return True
+    return False
+
+
+_tts_model = None
+
+
+def get_tts_model():
+    global _tts_model
+    if _tts_model is None:
+        _tts_model = ChatterboxTTS.from_pretrained(device="cpu")
+    return _tts_model
 
 
 def _get_with_wakeup(url, max_attempts=4, **kwargs):
@@ -105,61 +143,19 @@ def split_into_segments(narration_text):
     return segments if segments else [narration_text.strip()]
 
 
-# --- Prosody variation (added 2026-08-02) ---
-# A single flat rate for every sentence is one of the most obvious "AI voice"
-# tells - real human narrators speed up for punchy/tense lines, slow down for
-# weighty ones, and lift pitch on questions. This picks a rate/pitch per
-# sentence based on its shape (question, short/punchy, long) plus a small
-# bounded random jitter so back-to-back sentences of the same type don't
-# sound identically robotic either. Bounds are kept tight so it reads as
-# natural variation, not erratic or distracting.
-def _prosody_for_sentence(text, index):
-    rng = random.Random(index)  # deterministic per-sentence, still varies run to run via index
-    word_count = len(text.split())
-    is_question = text.rstrip().endswith("?")
-    is_exclamation = text.rstrip().endswith("!")
-
-    rate = BASE_RATE
-    pitch = 0
-
-    if is_question:
-        pitch += rng.randint(2, 5)
-        rate += rng.randint(-2, 1)
-    elif is_exclamation or word_count <= 7:
-        rate += rng.randint(2, 6)
-        pitch += rng.randint(1, 3)
-    elif word_count >= 25:
-        rate += rng.randint(-8, -4)
-        pitch += rng.randint(-2, 0)
-    else:
-        rate += rng.randint(-3, 2)
-        pitch += rng.randint(-1, 2)
-
-    rate = max(-20, min(15, rate))
-    pitch = max(-6, min(8, pitch))
-    rate_str = f"{'+' if rate >= 0 else ''}{rate}%"
-    pitch_str = f"{'+' if pitch >= 0 else ''}{pitch}Hz"
-    return rate_str, pitch_str
-
-
-async def _synthesize_sentence(text, voice, rate, pitch, out_path):
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await communicate.save(out_path)
-
-
-def synthesize_sentence(text, voice, rate, pitch, tmp_path):
-    asyncio.run(_synthesize_sentence(text, voice, rate, pitch, tmp_path))
+def synthesize_sentence(text, tts, tmp_path):
+    wav = tts.generate(text)
+    torchaudio.save(tmp_path, wav, tts.sr)
     return AudioSegment.from_file(tmp_path)
 
 
-def synthesize_with_pauses(narration_text, voice):
+def synthesize_with_pauses(narration_text, tts):
     segments = split_into_segments(narration_text)
-    print(f"Narration split into {len(segments)} sentence(s) for pause insertion and prosody variation.")
+    print(f"Narration split into {len(segments)} sentence(s) for pause insertion.")
 
     combined = AudioSegment.silent(duration=0)
     for i, segment in enumerate(segments):
-        rate, pitch = _prosody_for_sentence(segment, i)
-        clip = synthesize_sentence(segment, voice, rate, pitch, os.path.join(WORK_DIR, f"sent_{i}.mp3"))
+        clip = synthesize_sentence(segment, tts, os.path.join(WORK_DIR, f"sent_{i}.wav"))
         combined += clip
         if i < len(segments) - 1:
             pause_len = PAUSE_SECONDS_MIN if i % 2 == 0 else PAUSE_SECONDS_MAX
@@ -222,11 +218,22 @@ def main():
         print("ERROR: script has no content")
         sys.exit(1)
 
+    if _looks_like_code_or_markup(raw_content):
+        print(f"ERROR: script {script_id} looks like code/markup, not narration text - "
+              f"refusing to narrate it. This script needs to be regenerated "
+              f"(delete this Script row and re-run script_writing), not narrated as-is.")
+        sys.exit(1)
+
     narration_text = _clean_narration_text(raw_content)
     print("Narration text length: " + str(len(narration_text)) + " characters")
 
-    print(f"Generating speech with Edge TTS voice: {VOICE_NAME} (sentence-level, prosody-varied, real pauses)")
-    combined_audio, real_total_seconds = synthesize_with_pauses(narration_text, VOICE_NAME)
+    if _looks_like_code_or_markup(narration_text):
+        print(f"ERROR: script {script_id} looks like code/markup after cleaning - refusing to narrate it.")
+        sys.exit(1)
+
+    print("Generating speech with Chatterbox TTS (sentence-level, real pauses)")
+    tts = get_tts_model()
+    combined_audio, real_total_seconds = synthesize_with_pauses(narration_text, tts)
     combined_audio = pydub_normalize(combined_audio)
     print(f"Real measured narration length: {real_total_seconds:.1f}s")
 
@@ -243,11 +250,23 @@ def main():
     else:
         print("No production_plan yet on this video - skipping shot_durations for now.")
 
+    raw_wav_path = os.path.join(WORK_DIR, "narration_raw.wav")
     wav_path = os.path.join(WORK_DIR, "narration.wav")
-    combined_audio.export(wav_path, format="wav")
+    combined_audio.export(raw_wav_path, format="wav")
+
+    print("Applying slowdown (pitch preserved)")
+    import subprocess
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", raw_wav_path, "-filter:a", f"atempo={SLOWDOWN_FACTOR}", wav_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0:
+        print("ffmpeg error: " + result.stdout.decode(errors="ignore"))
+        sys.exit(1)
+    os.remove(raw_wav_path)
 
     print("Converting WAV to MP3")
-    import subprocess
     mp3_path = os.path.join(WORK_DIR, "narration.mp3")
     result = subprocess.run(
         ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
@@ -271,6 +290,8 @@ def main():
 
     if shot_durations is not None:
         print("Saving real shot_durations to backend")
+        slowdown = float(SLOWDOWN_FACTOR)
+        shot_durations = [d / slowdown for d in shot_durations]
         patch_resp = requests.patch(
             f"{RAILWAY_URL}/api/v1/videos/{video_id}",
             json={"shot_durations": shot_durations},
