@@ -11,15 +11,13 @@ on:
     - cron: "30 * * * *"
 
 concurrency:
-  # FIX (2026-08-02): no concurrency control meant the supervisor's own
-  # ~20-40 min trigger and this workflow's hourly cron could both be running
-  # at once, doubling up Agnes submissions (causing the 429 rate-limit
-  # failures seen in the logs) and racing to PATCH clip_urls back to the
-  # backend, where the loser's progress got silently overwritten. Grouping
-  # by video_id (or "scheduled" when auto-selecting) makes a new trigger
-  # wait for the current run on that same video to finish instead of
-  # running alongside it.
-  group: generate-videos-${{ inputs.video_id || 'scheduled' }}
+  # FIX (2026-08-03): the previous fix grouped by video_id, but Agnes's rate
+  # limit is account-wide, not per-video - so two DIFFERENT videos generating
+  # clips at the same time could still collide and cause 429s. Using one
+  # fixed group name for every run (regardless of which video_id) makes any
+  # new trigger wait for whichever run is currently using the Agnes account
+  # to finish first, no matter which video it's for.
+  group: generate-videos-agnes-account
   cancel-in-progress: false
 
 jobs:
