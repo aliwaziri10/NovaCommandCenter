@@ -9,63 +9,19 @@ from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import _parse_shots
 from app.agents.github_actions_client import trigger_workflow
-# NOTE: run_assembly (Railway-native) is intentionally no longer imported/called —
-# assembly now runs via the assemble.yml GitHub Actions workflow instead, same
-# pattern as video_clips, to avoid crashing Railway's 512MB RAM stitching real clips.
-#
-# NOTE (2026-07-19): asset_generation (Pollinations.ai still images) has been
-# removed from the pipeline entirely. Audit found the images it produced were
-# never used anywhere downstream — video_clips generates real clips straight
-# from each shot's text description via Agnes, and assembly only ever reads
-# clip_urls (assemble.py explicitly treats asset_urls as "reference only" and
-# never uses them). asset_generation was a pure gate: narration, video_clips,
-# and assembly all refused to proceed until it fully finished, and Pollinations'
-# free tier was failing with HTTP 500s often enough that videos stalled forever
-# waiting on images nothing downstream reads. Removing the gate unblocks the
-# real pipeline. run_asset_generation/_parse_shots import kept only for shot
-# counting; the agent function itself is no longer called.
-#
-# NOTE (2026-07-21): narration switched from the in-process run_narration()
-# (backend/app/agents/narration_agent.py — gTTS, writes to local Render disk)
-# to the narrate.yml GitHub Actions workflow (.github/scripts/narrate.py —
-# Kokoro TTS, uploads via the backend's upload endpoint to Supabase Storage).
-# Render's disk is ephemeral like Railway's was: run_narration wrote a local
-# path into video.audio_path, and once Render recycled the instance the file
-# was gone and audio_path was left pointing nowhere. narrate.yml persists the
-# audio to Supabase Storage the same way video_clips/assembly already do for
-# their outputs, so it survives restarts. run_narration/narration_agent.py is
-# no longer called by the supervisor and is now dead code (kept in the repo
-# in case anything else references it).
-#
-# NOTE (2026-07-21b): the active-videos query below previously only excluded
-# status "assembled", not "uploaded". That let already-uploaded videos (like
-# 424a809e, fully on YouTube) get re-selected by the assembly stage forever —
-# their narration file had since been cleaned up from Supabase Storage, so
-# every re-trigger of assemble.yml failed with a 400 fetching it. "uploaded"
-# is now excluded too so finished videos stop being reprocessed.
-#
-# NOTE (2026-07-21c): narration and video_clips fired via GitHub Actions
-# workflows with only a cooldown check (_has_recent_task), never a permanent-
-# failure cap. Every other stage (assembly, video_planning, script_writing,
-# topic_research) checks _failed_attempts >= MAX_RETRIES and gives up for
-# good — narration/video_clips didn't, so a video whose narration or clip
-# generation workflow fails every time (bad input, expired API key, etc.)
-# would get re-triggered forever every cooldown window, exactly the same
-# failure mode as the "uploaded" bug above just for a different stage. Both
-# now check _failed_attempts like assembly does.
+from app.agents.strategy_research_agent import run_strategy_research
 
 MAX_RETRIES = 2
 MIN_TOPICS_IN_PIPELINE = 3
 STALE_TASK_MINUTES = 30
-CLIP_COOLDOWN_MINUTES = 25  # a 3-shot Agnes batch takes roughly 10-20 min; avoid re-triggering mid-run
-ASSEMBLY_COOLDOWN_MINUTES = 35  # assemble.yml has timeout-minutes: 30; give a 5-min safety margin before re-trigger
-NARRATION_COOLDOWN_MINUTES = 20  # narrate.yml has timeout-minutes: 15; give a 5-min safety margin before re-trigger
+CLIP_COOLDOWN_MINUTES = 25
+ASSEMBLY_COOLDOWN_MINUTES = 35
+NARRATION_COOLDOWN_MINUTES = 20
+STRATEGY_RESEARCH_COOLDOWN_MINUTES = 7 * 24 * 60
 LOG_PATH = "/app/data/supervisor_log.json"
 
 
 def _clear_stale_tasks(db):
-    """Any task stuck in pending/running past the timeout is marked failed
-    so it stops permanently blocking the Supervisor's active-task check."""
     cutoff = datetime.utcnow() - timedelta(minutes=STALE_TASK_MINUTES)
     stuck = db.query(Task).filter(
         Task.status.in_(["pending", "running"]),
@@ -104,9 +60,6 @@ def _has_active_task(db, agent_name, id_key, id_value):
 
 
 def _has_recent_task(db, agent_name, id_key, id_value, minutes):
-    """Unlike _has_active_task, this checks ANY task (regardless of status)
-    created within the cooldown window. Used for fire-and-forget GitHub Actions
-    triggers, where we have no visibility into whether the run is still going."""
     cutoff = datetime.utcnow() - timedelta(minutes=minutes)
     tasks = db.query(Task).filter(
         Task.agent_name == agent_name,
@@ -122,7 +75,6 @@ def _has_recent_task(db, agent_name, id_key, id_value, minutes):
 def _find_next_task(db):
     videos = db.query(Video).filter(Video.status.notin_(["assembled", "uploaded"])).all()
 
-    # Stage: assembly (needs narration audio + all clips done)
     for video in videos:
         if not video.production_plan or not video.audio_path:
             continue
@@ -132,17 +84,14 @@ def _find_next_task(db):
         clip_urls = video.clip_urls or []
         clips_done = len([u for u in clip_urls if u])
         if clips_done < total_shots:
-            continue  # clips not finished yet — handled by the video_clips stage below
+            continue
         vid = str(video.id)
-        # Fire-and-forget like video_clips: use recency cooldown, not active-status check,
-        # since we have no visibility into whether assemble.yml is still running.
         if _has_recent_task(db, "assembly", "video_id", vid, ASSEMBLY_COOLDOWN_MINUTES):
             continue
         if _failed_attempts(db, "assembly", "video_id", vid) >= MAX_RETRIES:
             continue
         return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
 
-    # Stage: video_clips (needs narration audio; clips not yet complete)
     for video in videos:
         if not video.production_plan or not video.audio_path:
             continue
@@ -164,10 +113,6 @@ def _find_next_task(db):
             "title": "Generate video clips for " + vid[:8] + " (" + str(clips_done) + "/" + str(total_shots) + ")",
         }
 
-    # Stage: narration (needs production_plan; no longer waits on asset_generation).
-    # Fire-and-forget via narrate.yml GitHub Actions workflow — same cooldown pattern
-    # as video_clips/assembly, since we have no visibility into whether the run
-    # is still going.
     for video in videos:
         if not video.production_plan or video.audio_path:
             continue
@@ -181,7 +126,6 @@ def _find_next_task(db):
             continue
         return {"agent_name": "narration", "payload": {"video_id": vid}, "title": "Narrate video " + vid[:8]}
 
-    # Stage: video_planning
     scripts = db.query(Script).all()
     for script in scripts:
         has_video = db.query(Video).filter(Video.script_id == script.id).first()
@@ -194,7 +138,6 @@ def _find_next_task(db):
             continue
         return {"agent_name": "video_planning", "payload": {"script_id": sid}, "title": "Plan video for script " + sid[:8]}
 
-    # Stage: script_writing
     topics = db.query(Topic).all()
     for topic in topics:
         has_script = db.query(Script).filter(Script.topic_id == topic.id).first()
@@ -207,7 +150,6 @@ def _find_next_task(db):
             continue
         return {"agent_name": "script_writing", "payload": {"topic_id": tid}, "title": "Write script for topic " + tid[:8]}
 
-    # Stage: topic_research
     topics_without_scripts = []
     for t in topics:
         has_script = db.query(Script).filter(Script.topic_id == t.id).first()
@@ -218,6 +160,9 @@ def _find_next_task(db):
         if _has_active_task(db, "topic_research", "category", "History"):
             return None
         return {"agent_name": "topic_research", "payload": {"category": "History"}, "title": "Research new topics"}
+
+    if not _has_recent_task(db, "strategy_research", "scope", "weekly", STRATEGY_RESEARCH_COOLDOWN_MINUTES):
+        return {"agent_name": "strategy_research", "payload": {"scope": "weekly"}, "title": "Weekly competitor/self strategy research"}
 
     return None
 
@@ -244,6 +189,8 @@ def _execute(db, agent_name, payload):
         if not triggered:
             raise RuntimeError("Failed to trigger assemble.yml GitHub Actions workflow.")
         return {"workflow_triggered": True, "video_id": payload["video_id"]}
+    if agent_name == "strategy_research":
+        return run_strategy_research(db)
     raise ValueError("Unknown agent_name: " + str(agent_name))
 
 
