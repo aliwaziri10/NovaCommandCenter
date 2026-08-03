@@ -10,5 +10,10 @@
 - Root-caused the bad video via direct Supabase query: video "The Hidden Code" (Voynich Manuscript topic), script id `1b31fbc5`, created 2026-07-17 — over two weeks before the Aug 3 fix existed. A Cloudflare 502 HTML error page from Pollinations got saved as the second half of the script verbatim, then narrated as-is. The script sat unused until 2026-08-01 when video_planning finally picked it up, by which point today's narration guard didn't exist yet either.
 - User deleted the video from YouTube. Video row `04f9a0ab` and corrupted script row `1b31fbc5` both deleted from Supabase (confirmed 0 rows remaining for both). The "Voynich Manuscript" topic (`c5def7c7`) was left in `research` status so the supervisor naturally regenerates a clean script for it, this time protected by both the 2026-08-03 and 2026-08-04 fixes.
 
+## 2026-08-04 (session 2)
+- Attempted to run the Delete Video Admin workflow to clean up the "The Hidden Code" leftovers — it 500'd: `psycopg2.errors.UndefinedColumn: videos.character_reference_url does not exist`.
+- Root cause: `character_reference_url` was added to `Video` model on 2026-08-03 (Marius continuity port) but no migration was ever run against Supabase — model and live schema had drifted.
+- Fixed directly: added the column to Supabase live, added the missing alembic migration `006_add_character_reference_url_to_videos.py` for schema-history correctness.
+
 ## Rule
 Append one entry per session, before ending it. Never edit past entries — only add new ones.
