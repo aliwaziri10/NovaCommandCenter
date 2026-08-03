@@ -7,11 +7,6 @@ on:
         description: "Video ID to narrate (leave blank to auto-select)"
         required: false
         type: string
-      voice:
-        description: "Edge TTS voice to use"
-        required: false
-        type: string
-        default: "en-US-GuyNeural"
   schedule:
     - cron: "0 */6 * * *"
 
@@ -33,11 +28,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install edge-tts pydub requests
+          pip install chatterbox-tts torchaudio pydub requests
 
       - name: Run narration
         env:
           RAILWAY_URL: https://novacommandcenter.onrender.com
           VIDEO_ID: ${{ inputs.video_id }}
-          VOICE: ${{ inputs.voice }}
         run: python .github/scripts/narrate.py
