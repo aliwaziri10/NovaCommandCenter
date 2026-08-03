@@ -1,19 +1,22 @@
 # Nova Command Center - Task Queue
 
 ## In Progress
-- Decommission Railway (delete project) once confirmed stable
+- (none)
 
 ## Next
-- Re-enable youtube_upload.yml ONLY after YT_REFRESH_TOKEN is regenerated (still unresolved — see Known Bugs)
+- Port Chatterbox TTS from Marius into Nova, replacing gTTS in `narration_agent.py` and `backend/requirements.txt`. Marius's working reference: Edge TTS/Chatterbox setup in its own narration code — use it as the model for Nova's port. This is the top priority after today's narration-guard fix, since gTTS is the weakest link in current output quality.
+- Verify YT_REFRESH_TOKEN is actually authorized against the "Alternate Earth" channel (not "Erased"). Chat history claims this was fixed, but the repo has no record confirming it — needs a live check in Google OAuth Playground / a real upload test before trusting it.
+- Watch assembly's `-shortest` ffmpeg flag in `assembly_agent.py`: it trims final output to whichever of (silent video, narration audio) is shorter. With longer-form videos now the direction, a shot-duration/narration-length mismatch could silently truncate a video or cut off narration early. Not yet confirmed as an active bug — flagged for monitoring, investigate if a published long video looks cut short.
 
 ## Known Bugs
-- YouTube uploads were landing on the wrong channel (Erased instead of Alternate Earth) — YT_REFRESH_TOKEN authorized against wrong Google account. Workflow still DISABLED, still needs regenerating via OAuth Playground signed into Alternate Earth's account. NOT YET FIXED.
+See KNOWN_BUGS.md for the full log — this section only tracks what's still unresolved:
+- YT channel authorization (see above, unconfirmed).
 
-## Completed
-- Confirmed DATABASE_URL already points to Supabase Postgres (vpflhiotidvvvaojwfgf) — no DB migration needed.
-- Disabled youtube_upload.yml to stop further wrong-channel uploads.
-- Added SUPABASE_URL / SUPABASE_SECRET_KEY to Railway, confirmed /health returns healthy.
-- Created Render Web Service (Docker, root dir backend), all env vars copied, confirmed live and healthy at https://novacommandcenter.onrender.com/health.
-- Rewrote hardcoded Railway URL to Render URL in all 5 workflow files (assemble.yml, generate_images.yml, generate_video_agnes.yml, generate_videos.yml, narrate.yml).
-- Updated youtube_upload.yml's RAILWAY_URL GitHub Secret to Render URL.
-- Verified narrate.yml runs successfully against Render (clean business-logic response, no connection errors).
+## Completed (recent)
+- 2026-08-04: Added defensive code/markup guard to `narration_agent.py` (see KNOWN_BUGS.md).
+- 2026-08-03: `script_writing_agent.py` patched to reject code/markup/JSON garbage before saving a script (root cause of the narration-reads-code bug).
+- 2026-07-29: Fixed dead Pollinations text endpoint in `video_planning_agent.py` (migrated to `gen.pollinations.ai/text`).
+- 2026-07-15: Backend migration to Render completed and verified end-to-end.
+
+## Rule
+Every new task or bug goes here immediately, not just in chat.
