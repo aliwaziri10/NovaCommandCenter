@@ -8,13 +8,12 @@ Record important technical and business decisions so future sessions understand 
 ### 2026-07-08
 - Agnes API requests are sent sequentially to avoid HTTP 429 rate limits.
 - Progress is saved after every generated clip.
-- Never rely on chat history.
-- The /brain folder is the single source of truth for project memory.
+- Never rely on chat history. The /brain folder is the single source of truth for project memory.
 
-### 2026-07-15
-- Migrating off Railway to Render (free tier) before Railway billing starts. Database stays on Supabase (already there). File storage moves fully to Supabase Storage (bucket: nova-media) — not any host's local disk — since Render's free tier has no persistent disk.
-- Chose Render over Oracle Cloud Always Free (requires Linux/SSH admin, recently had its free allocation quietly cut) and Google Cloud Run (requires gcloud/Docker familiarity) — Render deploys straight from GitHub with no server admin, best fit for non-technical operation.
-- YT_REFRESH_TOKEN in this repo's secrets was generated against the Erased channel's Google account by mistake. No shared credentials exist between marius-command-center and NovaCommandCenter otherwise.
+### 2026-08-04
+- Content direction: Nova now produces long-form videos, not short ~30s clips.
+- Nova will be migrated from gTTS to Chatterbox TTS (matching Marius) — see TASK_QUEUE.md. Decision made, not yet implemented.
+- `/brain` restructured: three files required by `INDEX.md` (`ARCHITECTURE.md`, `KNOWN_BUGS.md`, `SESSION_LOG.md`) existed only in name, never in content — this was the root cause of stale/contradictory project state across sessions. All six files in `INDEX.md`'s read order now actually exist and are kept current. The old ad-hoc `NOTES.md` file (which duplicated and contradicted `PROJECT_STATE.md`) is deleted — `/brain` is the only source of truth going forward.
 
 ## Rule
-Every significant decision must be added here with its reason.
+Every significant decision must be added here with its reason. Historical entries about decommissioned infrastructure (e.g. the old Railway hosting) are not kept — once something is fully replaced, its rationale stops being useful and is removed rather than archived.
