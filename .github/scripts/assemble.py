@@ -1,10 +1,8 @@
 import gc
-import json
 import os
 import re
 import subprocess
 import sys
-import time
 
 import numpy as np
 import requests
@@ -27,7 +25,6 @@ from moviepy.editor import (
 RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
-ACE_MUSIC_API_KEY = os.environ.get("ACE_MUSIC_API_KEY")
 
 DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
@@ -48,12 +45,11 @@ CINEMATIC_VF_BASE = (
 )
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
-ACE_MUSIC_BASES = ["https://api.acemusic.ai", "https://ai.acemusic.ai"]
-ACE_MUSIC_HEADERS = {
-    "Authorization": f"Bearer {ACE_MUSIC_API_KEY}",
-    "Content-Type": "application/json",
-}
-MUSIC_VOLUME = 0.10
+# NOTE (change): background music (ACE Music) removed from the pipeline.
+# Native SFX/ambient audio extracted from the Agnes clips themselves is kept -
+# it's free (already baked into the clips), adds realism, and doesn't compete
+# with narration clarity the way a generated score did. ACE Music was also an
+# unreliable dependency (both hosts had timed out in prior runs).
 NATIVE_SFX_VOLUME = 0.16
 NARRATION_VOLUME_WITH_LAYERS = 0.95
 LIMITER_CEILING = 0.98
@@ -265,79 +261,6 @@ def _get_video_duration(video_path):
     return duration
 
 
-def _poll_ace_music_task(task_id, out_path, base_url, max_wait=180, interval=8):
-    waited = 0
-    while waited < max_wait:
-        resp = requests.post(
-            f"{base_url}/query_result",
-            headers=ACE_MUSIC_HEADERS,
-            json={"task_id_list": [task_id]},
-            timeout=30,
-        )
-        if resp.status_code >= 400:
-            print(f"ACE MUSIC POLL ERROR ({base_url}) {resp.status_code}: {resp.text}")
-            return None
-        entries = resp.json().get("data", [])
-        if not entries:
-            time.sleep(interval)
-            waited += interval
-            continue
-        entry = entries[0]
-        status = entry.get("status")
-        if status == 1:
-            result_list = json.loads(entry.get("result", "[]"))
-            if not result_list or not result_list[0].get("file"):
-                print(f"ACE Music task succeeded but no file in result: {result_list}")
-                return None
-            file_path = result_list[0]["file"]
-            audio_resp = requests.get(f"{base_url}{file_path}", timeout=60)
-            audio_resp.raise_for_status()
-            with open(out_path, "wb") as f:
-                f.write(audio_resp.content)
-            return out_path
-        if status == 2:
-            print(f"ACE Music task failed: {entry}")
-            return None
-        time.sleep(interval)
-        waited += interval
-    print(f"ACE Music task {task_id} timed out after {max_wait}s")
-    return None
-
-
-def _generate_background_music(prompt, duration, out_path):
-    if not ACE_MUSIC_API_KEY:
-        print("No ACE_MUSIC_API_KEY set - skipping background music.")
-        return None
-
-    for base in ACE_MUSIC_BASES:
-        try:
-            resp = requests.post(
-                f"{base}/release_task",
-                headers=ACE_MUSIC_HEADERS,
-                json={
-                    "prompt": prompt,
-                    "audio_duration": max(10, min(int(duration) + 5, 600)),
-                    "thinking": True,
-                },
-                timeout=60,
-            )
-            if resp.status_code >= 400:
-                print(f"ACE MUSIC ERROR ({base}) {resp.status_code}: {resp.text}")
-                continue
-            task_id = resp.json().get("data", {}).get("task_id")
-            if not task_id:
-                print(f"ACE Music response had no task_id ({base}): {resp.json()}")
-                continue
-            result = _poll_ace_music_task(task_id, out_path, base_url=base)
-            if result:
-                return result
-        except Exception as e:
-            print(f"ACE Music generation raised an exception on {base}, trying next host: {e}")
-
-    print("Continuing without background music - every ACE Music host failed this run.")
-    return None
-
-
 def _fit_audio_to_duration(audio_clip, target):
     if audio_clip.duration >= target:
         return audio_clip.subclip(0, target)
@@ -358,22 +281,11 @@ def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
     return audio_clip.volumex(scale)
 
 
-def _build_mixed_audio(narration_path, music_mood, native_sfx_path, out_path):
+def _build_mixed_audio(narration_path, native_sfx_path, out_path):
     narration_clip = AudioFileClip(narration_path)
     duration = narration_clip.duration
 
-    music_path = os.path.join(WORK_DIR, "background_music.mp3")
-    music_file = _generate_background_music(music_mood, duration, music_path)
-
     extra_layers = []
-
-    if music_file:
-        music_clip = AudioFileClip(music_file)
-        music_clip = _fit_audio_to_duration(music_clip, duration)
-        music_clip = music_clip.volumex(MUSIC_VOLUME)
-        extra_layers.append(music_clip)
-    else:
-        print("No background score this run (ACE Music unavailable).")
 
     if native_sfx_path:
         print("Mixing in native clip audio (ambient/sfx/laughter from the source clips).")
@@ -515,9 +427,8 @@ def main():
     print("Extracting native clip audio (ambient/sfx/laughter) for the mix...")
     extracted_sfx = _extract_native_audio(silent_path, native_sfx_path)
 
-    print("Building audio mix (narration + native clip audio + background score)...")
-    music_mood = f"cinematic orchestral historical documentary score for '{title}', epic and atmospheric, no vocals"
-    total_duration = _build_mixed_audio(audio_path, music_mood, extracted_sfx, mixed_audio_path)
+    print("Building audio mix (narration + native clip audio)...")
+    total_duration = _build_mixed_audio(audio_path, extracted_sfx, mixed_audio_path)
 
     video_duration = _get_video_duration(silent_path)
     pad_seconds = total_duration - video_duration
