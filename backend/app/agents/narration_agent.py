@@ -10,6 +10,35 @@ from gtts import gTTS
 MEDIA_ROOT = "/app/data/media"
 NARRATION_SPEED = 0.9
 
+# FIX (2026-08-04): narration_agent had NO defense of its own against bad
+# script content reaching text-to-speech. script_writing_agent.py was patched
+# on 2026-08-03 to reject code/markup/JSON before saving a Script row, but
+# that only protects scripts generated AFTER that fix went live. Any Script
+# row already sitting in the database from before the fix (or reaching this
+# agent through any future code path that isn't script_writing_agent) had
+# zero protection - narration_agent would TTS whatever was in script.content,
+# no questions asked. This is exactly how a video ended up narrating raw
+# Python source. This guard makes narration_agent defend itself instead of
+# trusting upstream to have done it, so this failure mode can't recur even
+# if a future change to script_writing_agent (or a new code path) reopens
+# the same hole.
+_CODE_LIKE_MARKERS = (
+    "<html", "<!doctype", "<div", "<span", "<body", "<script",
+    "```", "function(", "function (", "=>", "SELECT *", "import ",
+    "def ", "class ", "{\"", "[{", "</",
+)
+
+
+def _looks_like_code_or_markup(text: str) -> bool:
+    lowered = text.lower()
+    hits = sum(1 for marker in _CODE_LIKE_MARKERS if marker.lower() in lowered)
+    if hits >= 2:
+        return True
+    symbol_count = sum(text.count(ch) for ch in "{}<>[]")
+    if symbol_count > 5 and (symbol_count / max(len(text), 1)) > 0.01:
+        return True
+    return False
+
 
 def _clean_narration_text(script_content: str) -> str:
     text = re.sub(r'\[SCENE[^\]]*\]', '', script_content, flags=re.IGNORECASE)
@@ -28,9 +57,25 @@ def run_narration(db: Session, video_id: str):
     script = db.query(Script).filter(Script.id == video.script_id).first()
     if not script or not script.content:
         raise ValueError("Linked script has no content to narrate")
+
+    if _looks_like_code_or_markup(script.content):
+        raise ValueError(
+            f"Script {script.id} for video {video_id} looks like code/markup, "
+            f"not narration text - refusing to narrate it. This script needs to "
+            f"be regenerated (delete this Script row and re-run script_writing), "
+            f"not narrated as-is."
+        )
+
     narration_text = _clean_narration_text(script.content)
     if not narration_text:
         raise ValueError("Narration text was empty after cleaning script content")
+
+    if _looks_like_code_or_markup(narration_text):
+        raise ValueError(
+            f"Script {script.id} for video {video_id} looks like code/markup "
+            f"after cleaning - refusing to narrate it."
+        )
+
     video_dir = os.path.join(MEDIA_ROOT, str(video.id), "audio")
     os.makedirs(video_dir, exist_ok=True)
     raw_path = os.path.join(video_dir, "narration_raw.mp3")
