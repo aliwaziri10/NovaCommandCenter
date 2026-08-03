@@ -23,20 +23,49 @@ def _latest_strategy_notes(db: Session) -> str | None:
     return (task.payload.get("result") or {}).get("notes")
 
 
+# FIX (2026-08-03): the old fallback ("if len(text) > 100: return text") accepted
+# ANY long response as valid script text, including malformed/broken output from
+# the free Pollinations API - raw HTML error pages, JSON fragments, code, etc.
+# That garbage was passing straight through to narration/TTS, which is why some
+# videos start "speaking code/HTML" partway through (typically Part 2, when the
+# free API degrades or errors under load). This now rejects anything that looks
+# like code/markup/JSON before accepting it as narration-ready script text.
+_CODE_LIKE_MARKERS = (
+    "<html", "<!doctype", "<div", "<span", "<body", "<script",
+    "```", "function(", "function (", "=>", "SELECT *", "import ",
+    "def ", "class ", "{\"", "[{", "</",
+)
+
+
+def _looks_like_code_or_markup(text: str) -> bool:
+    lowered = text.lower()
+    hits = sum(1 for marker in _CODE_LIKE_MARKERS if marker.lower() in lowered)
+    if hits >= 2:
+        return True
+    # Heavy brace/bracket/angle-bracket density is a strong signal of code/JSON/HTML,
+    # not spoken narration - narration should be almost entirely plain prose.
+    symbol_count = sum(text.count(ch) for ch in "{}<>[]")
+    if symbol_count > 5 and (symbol_count / max(len(text), 1)) > 0.01:
+        return True
+    return False
+
+
 def _extract_script(raw: str) -> str | None:
-    """Pull usable script text out of a raw AI reply, even if it's wrapped in JSON/reasoning."""
+    """Pull usable script text out of a raw AI reply, even if it's wrapped in JSON/reasoning.
+    Returns None (reject) if what's left doesn't actually look like narration text."""
     text = raw.strip()
     match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
     if match:
         extracted = match.group(1)
         extracted = extracted.replace('\\n', '\n').replace('\\"', '"')
-        if len(extracted) > 100:
+        if len(extracted) > 100 and not _looks_like_code_or_markup(extracted):
             return extracted
+        return None
     if '"reasoning"' in text[:300] or text.startswith('{"role"'):
         return None
     if text.startswith('{"error"'):
         return None
-    if len(text) > 100:
+    if len(text) > 100 and not _looks_like_code_or_markup(text):
         return text
     return None
 
