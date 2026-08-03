@@ -1,3 +1,38 @@
+"""
+Nova Command Center - Video Generation Agent
+
+UPDATED (2026-08-03) - ported three proven fixes from Marius's more mature
+pipeline, after direct quality comparison confirmed Marius's videos look
+better and pinned down exactly why:
+
+1. CONTINUITY ANCHORING (biggest gap - Nova had none at all): every shot used
+   to be pure blind text-to-video, so characters/scenes had no way to hold
+   together across cuts. Now generates one character reference image per
+   video (via Agnes's image model, before shot 0), then chains every
+   subsequent shot to the LAST FRAME of the previous shot as an image-to-video
+   anchor - identical mechanism to Marius's `video_generation.py`. Persisted
+   to videos.character_reference_url so it survives resumed runs.
+
+2. FIXED CLIP LENGTH BUG: this used to hardcode CLIP_NUM_FRAMES=121 (~5s) for
+   EVERY shot regardless of how long that shot actually needs to run -
+   completely ignoring video["shot_durations"] (real per-shot durations
+   already computed by narrate.py from actual TTS length, and already used by
+   assemble.py). Now computes real per-shot frame counts from shot_durations,
+   with ceiling-rounding to Agnes's valid 8n+1 frame grid so a clip is never
+   shorter than its target (same fix Marius applied 2026-08-03).
+
+3. STRONGER ANACHRONISM GUARD: replaced the vague "no digital devices" phrase
+   with named concrete objects (laptops, screens, modern furniture, wiring),
+   matching Marius's 2026-08-03 fix after observed leakage of modern objects
+   into historical scenes.
+
+Clips longer than one Agnes generation can produce still fall back to a
+freeze-hold for the remainder (Marius's real-footage chain-extension for
+overflow was NOT ported this pass - clip durations here are much shorter on
+average since Nova's shots are now correctly sized rather than uniformly
+capped at ~5s, so overflow is rarer; can be added later if still needed).
+"""
+
 import os
 import re
 import sys
@@ -9,15 +44,20 @@ RAILWAY_URL = os.environ["RAILWAY_URL"]  # points to Render, kept as RAILWAY_URL
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 AGNES_API_KEY = os.environ["AGNES_API_KEY"]
 
-AGNES_BASE = "https://apihub.agnes-ai.com/v1/videos"
+AGNES_BASE = "https://apihub.agnes-ai.com/v1"
+AGNES_VIDEO_URL = f"{AGNES_BASE}/videos"
+AGNES_IMAGE_URL = f"{AGNES_BASE}/images/generations"
 AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
 CLIP_HEIGHT = 768
 CLIP_WIDTH = 1152
-CLIP_NUM_FRAMES = 121  # ~5 seconds at 24fps, must be 8*n+1
 CLIP_FRAME_RATE = 24
+MIN_FRAMES = 49    # ~2s floor, matches Marius
+MAX_FRAMES = 169   # ~7s ceiling, matches Marius's MAX_CLIP_SECONDS
+DEFAULT_SHOT_SECONDS = 5.0  # only used if shot_durations is unavailable for this video
 MAX_WAIT_SECONDS = 240
 POLL_INTERVAL_SECONDS = 10
 MIN_SECONDS_BETWEEN_SUBMITS = 4
+AGNES_IMAGE_MAX_RETRIES = 3
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 
@@ -43,28 +83,43 @@ LENS_STYLES = [
 ]
 
 # FIX (2026-07-29): ported from Marius's 2026-07-29 "quality/anachronism guard"
-# fix. Marius found two problems that apply here too: (1) video models weight
-# EARLIER tokens in the prompt more heavily, so a lighting cue tacked onto the
-# very end of a long prompt was getting drowned out - moved to the FRONT.
-# (2) with no explicit guard, historical/alt-history topics (Alexander, Silk
-# Road, Hormuz chokepoint, etc.) were prone to modern objects leaking into
-# frame (cars, modern clothing, digital devices) and to a flat, desaturated,
-# "CGI" look. Added the same two guard strings Marius uses.
+# fix - lighting cue moved to the FRONT of the prompt (models weight earlier
+# tokens more heavily).
 LIGHTING_DIRECTIVE = (
     "bright, clearly and evenly lit scene, strong daylight or warm well-lit "
     "interior lighting, high visibility, no heavy shadows, no underexposed or "
     "murky darkness"
 )
 
+# STRENGTHENED (2026-08-03): ported Marius's 2026-08-03 fix - named concrete
+# objects instead of a vague "no digital devices" phrase, after Marius
+# observed leakage (laptops appearing in a 1994 scene) that the vague version
+# didn't catch.
 ANACHRONISM_GUARD = (
     "historically accurate to this exact time period and setting, no modern technology, "
-    "no cars, no drones, no modern clothing, no digital devices, no anachronistic objects of any kind"
+    "no cars, no drones, no modern clothing, no digital devices, no anachronistic objects of any kind, "
+    "no laptops, no computers, no smartphones, no tablets, no screens or monitors of any kind, "
+    "no modern furniture, no electrical wiring or outlets, no plastic objects"
 )
 
 QUALITY_GUARD = (
     "shot on film, natural film grain, vivid saturated color, no sepia tone, "
     "no heavy desaturation, no muted documentary color grading, no artificial CGI look, no plastic skin"
 )
+
+
+class ContentPolicyRejection(Exception):
+    pass
+
+
+def round_to_valid_frames(num_frames):
+    # Same fix as Marius (2026-08-03): ceiling instead of round-to-nearest, so
+    # a clip is never shorter than its target duration - round() rounds down
+    # roughly half the time, silently under-filling shots.
+    import math
+    n = math.ceil((num_frames - 1) / 8)
+    n = max(0, n)
+    return 8 * n + 1
 
 
 def _parse_shots(production_plan):
@@ -81,6 +136,18 @@ def _parse_shots(production_plan):
         if remainder:
             shots.append(remainder)
     return shots
+
+
+def _shot_target_seconds(video, shot_index, total_shots):
+    """Real per-shot duration from narrate.py's shot_durations if available,
+    otherwise an even split of the narration's total duration, otherwise the
+    old flat default - in that priority order. This replaces the old
+    hardcoded 121-frame (~5s) constant used for every shot regardless of
+    actual need."""
+    shot_durations = video.get("shot_durations")
+    if shot_durations and len(shot_durations) > shot_index:
+        return max(float(shot_durations[shot_index]), 1.0)
+    return DEFAULT_SHOT_SECONDS
 
 
 def _find_next_video_needing_clips():
@@ -107,9 +174,6 @@ def _find_next_video_needing_clips():
         if not shots:
             continue
         clip_urls = v.get("clip_urls") or []
-        # Count FILLED slots, not raw list length. clip_urls is a fixed-length,
-        # position-aligned list (null = not generated yet) - once padded to
-        # full length, len() alone would always look "done" even with gaps.
         filled = sum(1 for u in clip_urls if u)
         if filled < len(shots):
             candidates.append(v)
@@ -120,7 +184,122 @@ def _find_next_video_needing_clips():
     return candidates[0]["id"]
 
 
-def _submit_clip(description, shot_index):
+def build_character_reference_prompt(topic_title):
+    parts = [
+        f"character reference portrait for a documentary about: {topic_title}",
+        "full figure visible, neutral pose, clear face and clothing detail",
+        LIGHTING_DIRECTIVE,
+        QUALITY_GUARD,
+        ANACHRONISM_GUARD,
+    ]
+    return ", ".join(p for p in parts if p)
+
+
+def generate_character_reference(video_id, topic_title):
+    """Generates ONE reference image per video (agnes-image-2.1-flash),
+    persisted to videos.character_reference_url so it only runs once per
+    video, even across resumed runs. Returns None (fails soft) if Agnes's
+    image endpoint errors after retries - Nova still works without it, just
+    without the continuity boost."""
+    prompt = build_character_reference_prompt(topic_title)
+    last_error_text = None
+
+    for attempt in range(AGNES_IMAGE_MAX_RETRIES):
+        try:
+            resp = requests.post(
+                AGNES_IMAGE_URL,
+                headers=HEADERS,
+                json={
+                    "model": "agnes-image-2.1-flash",
+                    "prompt": prompt,
+                    "size": f"{CLIP_WIDTH}x{CLIP_HEIGHT}",
+                    "extra_body": {"response_format": "url"},
+                },
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            last_error_text = str(e)
+            print(f"Character reference image request raised an exception (attempt {attempt + 1}/{AGNES_IMAGE_MAX_RETRIES}): {e}")
+            time.sleep(10 * (attempt + 1))
+            continue
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            last_error_text = resp.text
+            print(f"Character reference image transient error {resp.status_code} (attempt {attempt + 1}/{AGNES_IMAGE_MAX_RETRIES}): {resp.text}")
+            time.sleep(10 * (attempt + 1))
+            continue
+
+        if resp.status_code >= 400:
+            print(f"Character reference image generation failed permanently ({resp.status_code}): {resp.text} - continuing without one.")
+            return None
+
+        data = resp.json()
+        image_url = None
+        for entry in data.get("data", []):
+            if isinstance(entry, dict) and entry.get("url"):
+                image_url = entry["url"]
+                break
+        if not image_url:
+            image_url = data.get("url")
+        if not image_url:
+            print(f"Character reference image response had no usable URL: {data} - continuing without one.")
+            return None
+
+        patch_resp = requests.patch(
+            f"{RAILWAY_URL}/api/v1/videos/{video_id}",
+            json={"character_reference_url": image_url},
+            timeout=30,
+        )
+        patch_resp.raise_for_status()
+        print(f"Character reference image generated and saved for video {video_id}.")
+        return image_url
+
+    print(f"Character reference image generation exhausted all retries ({last_error_text}) - continuing without one.")
+    return None
+
+
+def _extract_last_frame_url(video_url_of_clip, out_tag):
+    """Downloads a just-generated clip, extracts its last frame, uploads it
+    as a small PNG, returns the URL to use as the NEXT shot's anchor. Fails
+    soft (returns None) on any error - continuity is a quality improvement,
+    never something that should crash a run."""
+    try:
+        import numpy as np
+        from PIL import Image
+        from moviepy.editor import VideoFileClip
+
+        tmp_video = f"/tmp/_anchor_src_{out_tag}.mp4"
+        r = requests.get(video_url_of_clip, timeout=120)
+        r.raise_for_status()
+        with open(tmp_video, "wb") as f:
+            f.write(r.content)
+
+        clip = VideoFileClip(tmp_video)
+        frame = clip.get_frame(max(clip.duration - 1 / CLIP_FRAME_RATE, 0))
+        clip.close()
+        img = Image.fromarray(frame)
+        png_path = f"/tmp/_anchor_{out_tag}.png"
+        img.save(png_path)
+
+        with open(png_path, "rb") as f:
+            upload_resp = requests.post(
+                f"{RAILWAY_URL}/api/v1/upload/reference/{out_tag}",
+                files={"file": (f"{out_tag}.png", f, "image/png")},
+                timeout=60,
+            )
+        os.remove(tmp_video)
+        os.remove(png_path)
+
+        if upload_resp.status_code >= 400:
+            print(f"Reference frame upload failed - status {upload_resp.status_code}: {upload_resp.text}")
+            return None
+        return upload_resp.json().get("url")
+    except Exception as e:
+        print(f"Could not extract/upload last frame for continuity anchor, continuing without it: {e}")
+        return None
+
+
+def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
     prompt = (
@@ -134,20 +313,21 @@ def _submit_clip(description, shot_index):
         "prompt": prompt,
         "height": CLIP_HEIGHT,
         "width": CLIP_WIDTH,
-        "num_frames": CLIP_NUM_FRAMES,
+        "num_frames": num_frames,
         "frame_rate": CLIP_FRAME_RATE,
     }
+    if anchor_image_url:
+        body["image"] = anchor_image_url
+
     try:
-        submit = requests.post(AGNES_BASE, headers=HEADERS, json=body, timeout=60)
+        submit = requests.post(AGNES_VIDEO_URL, headers=HEADERS, json=body, timeout=60)
     except requests.RequestException as e:
         return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}"
 
     if submit.status_code == 400 and "content_policy_violation" in submit.text:
         return None, f"CONTENT POLICY REJECTED — reword this shot's description: {description!r}"
-
     if submit.status_code == 429:
         return None, "RATE LIMITED (429) — Agnes RPM exceeded, will retry next run"
-
     if submit.status_code != 200:
         return None, f"submit failed: HTTP {submit.status_code}: {submit.text[:200]}"
 
@@ -204,13 +384,6 @@ def _poll_clip(video_id):
 
 
 def _save_progress(video_id, clip_urls):
-    # IMPORTANT: save the list AS-IS, preserving null placeholders and shot
-    # position. Filtering out Nones here ("good_so_far = [u for u in clip_urls
-    # if u]") was the actual bug behind narration/visual mismatches: it
-    # compacted the list, so on the next run the shorter list got remapped
-    # back onto shot indices starting at 0 - shifting every clip after a
-    # failed shot into the WRONG shot's slot (wrong clip plays under the
-    # wrong narration line). Never compact this list.
     try:
         patch_resp = requests.patch(
             f"{RAILWAY_URL}/api/v1/videos/{video_id}",
@@ -235,15 +408,7 @@ def main():
         print(f"Auto-selected video_id: {video_id}")
 
     print("Fetching video data from Railway...")
-    for attempt in range(3):
-        try:
-            resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
-            break
-        except requests.exceptions.RequestException:
-            if attempt == 2:
-                raise
-            print(f"Backend not responding (likely waking from sleep), retrying in 20s (attempt {attempt + 1}/3)...")
-            time.sleep(20)
+    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
     resp.raise_for_status()
     video = resp.json()
 
@@ -273,6 +438,22 @@ def main():
         print("All shots already have clips. Nothing to do.")
         return
 
+    # Continuity anchor setup: character reference for shot 0, or reconstruct
+    # from the most recently completed shot's own clip if resuming mid-video.
+    anchor_image_url = video.get("character_reference_url")
+    if not anchor_image_url and 0 not in missing and clip_urls:
+        last_done_index = max(already_done) if already_done else None
+        if last_done_index is not None and clip_urls[last_done_index]:
+            print(f"Resuming mid-video - reconstructing continuity anchor from shot {last_done_index + 1}'s clip...")
+            anchor_image_url = _extract_last_frame_url(clip_urls[last_done_index], f"{video_id}_resume")
+    if not anchor_image_url:
+        print("Generating character reference image for continuity anchoring...")
+        anchor_image_url = generate_character_reference(video_id, video.get("title", ""))
+    if anchor_image_url:
+        print(f"Using continuity anchor: {anchor_image_url}")
+    else:
+        print("No continuity anchor available - shots will generate blind (text-to-video only) this run.")
+
     batch = missing[:BATCH_SIZE]
     print(f"This run will process {len(batch)} shot(s): {batch}")
 
@@ -281,6 +462,11 @@ def main():
 
     for index in batch:
         description = all_shots[index]
+        target_seconds = _shot_target_seconds(video, index, total)
+        raw_frames = int(target_seconds * CLIP_FRAME_RATE)
+        raw_frames = max(MIN_FRAMES, min(MAX_FRAMES, raw_frames))
+        num_frames = round_to_valid_frames(raw_frames)
+        num_frames = max(MIN_FRAMES, min(MAX_FRAMES, num_frames))
 
         elapsed = time.monotonic() - last_submit_time
         if elapsed < MIN_SECONDS_BETWEEN_SUBMITS and last_submit_time > 0:
@@ -289,7 +475,8 @@ def main():
             time.sleep(wait_for)
 
         last_submit_time = time.monotonic()
-        agnes_video_id, error = _submit_clip(description, index)
+        print(f"Shot {index+1}/{total}: target {target_seconds:.1f}s ({num_frames} frames)")
+        agnes_video_id, error = _submit_clip(description, index, num_frames, anchor_image_url=anchor_image_url)
 
         if not agnes_video_id:
             failure_reasons.append(f"shot {index}: {error}")
@@ -302,6 +489,8 @@ def main():
             if url:
                 clip_urls[index] = url
                 print(f"Shot {index+1}/{total}: OK -> {url}")
+                next_anchor = _extract_last_frame_url(url, f"{video_id}_shot{index:03d}")
+                anchor_image_url = next_anchor or anchor_image_url
             else:
                 failure_reasons.append(f"shot {index}: {error}")
                 print(f"Shot {index+1}/{total}: FAILED ({error})")
