@@ -20,6 +20,13 @@ class Video(Base):
     video_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     youtube_video_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     shot_durations: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # ADDED (2026-08-03): ported from Marius's continuity-anchoring fix. Stores
+    # a single reference image (generated once per video, before shot 0) that
+    # every shot's Agnes call anchors to - either directly (shot 0) or via the
+    # previous shot's own last frame (every shot after). This is what gives
+    # Nova character/scene consistency across cuts, which it previously had
+    # zero mechanism for (pure blind text-to-video on every shot).
+    character_reference_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     topic_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("topics.id", ondelete="SET NULL"), nullable=True
     )
