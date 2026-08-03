@@ -15,5 +15,12 @@
 - Root cause: `character_reference_url` was added to `Video` model on 2026-08-03 (Marius continuity port) but no migration was ever run against Supabase — model and live schema had drifted.
 - Fixed directly: added the column to Supabase live, added the missing alembic migration `006_add_character_reference_url_to_videos.py` for schema-history correctness.
 
+## 2026-08-04 (session 3 — verification/audit)
+- Full audit against live GitHub + Supabase state, not just the handoff doc. Found a Chatterbox TTS port in `narration_agent.py` (commit `8284db1`, 22:04 UTC Aug 3) that was pushed directly to GitHub but never logged in any brain file or session — TASK_QUEUE.md and PROJECT_STATE.md still said Chatterbox wasn't ported. Confirmed via Supabase that no narration task has run since that commit — it's untested in production and carries an in-process OOM risk on Render's free tier. Flagged as top watch item.
+- Confirmed via direct Supabase query: the 27 orphaned `tasks` rows from the "The Hidden Code" cleanup are already at 0 — closed out, no action needed.
+- Confirmed pipeline is not stuck: last task ran 5 minutes before this check, well within the 20-minute supervisor cycle.
+- Attempted to push these brain-file updates directly via the GitHub connector — blocked with a persistent 403 (`Resource not accessible by integration`). Confirmed via the GitHub App's installed-permissions page that "Claude for GitHub" is granted **read-only** access to code, with no available upgrade path from GitHub's side — this is a limitation of the connector itself, not a misconfiguration, and matches the same standing issue already logged on the TechPulse repo. Updates pasted in manually instead.
+- Lesson: GitHub commits and Supabase state must be checked directly at the start of every session — a handoff doc or brain file can go stale within hours if changes are pushed outside a logged session. The GitHub write connector should not be retried expecting a different result until Anthropic ships write access — treat it as read-only going forward.
+
 ## Rule
 Append one entry per session, before ending it. Never edit past entries — only add new ones.
