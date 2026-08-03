@@ -2,6 +2,9 @@
 
 ## Fixed
 
+### Delete Video endpoint crashed with 500 — missing DB column (fixed 2026-08-04)
+`character_reference_url` was added to `Video` model (`backend/app/models/video.py`) on 2026-08-03 as part of the Marius continuity-anchoring port, but no migration was ever run against Supabase. Model and live table drifted apart — any query touching `videos` (including Delete Video Admin) failed with `psycopg2.errors.UndefinedColumn`. Fixed by adding the column directly to Supabase and adding the missing alembic migration (`006_add_character_reference_url_to_videos.py`) so schema history matches the model going forward.
+
 ### Narration spoke raw code/markup instead of the script (fixed 2026-08-04)
 `script_writing_agent.py` was patched 2026-08-03 to reject code/HTML/JSON garbage from Pollinations before saving it as a script. But `narration_agent.py` had zero defense of its own — it would TTS whatever was in `script.content` with no check. Any script saved before the 2026-08-03 fix, or reaching narration through any future code path, was unprotected. Fixed by adding the same rejection guard directly inside `narration_agent.py`, so narration defends itself instead of trusting script_writing to have already done it.
 
@@ -14,6 +17,7 @@ Old fallback logic accepted any response over 100 characters as valid script tex
 ## Unresolved / needs verification
 - **YouTube channel authorization**: chat history claims `YT_REFRESH_TOKEN` was fixed to target "Alternate Earth" instead of "Erased", but nothing in this repo confirms it. Needs a live OAuth Playground check or a real test upload before being trusted.
 - **Long-video audio/video length mismatch risk**: `assembly_agent.py` uses ffmpeg's `-shortest` flag when muxing narration audio with the assembled silent video, which trims to whichever is shorter. Now that Nova targets longer-form videos, a shot-duration/narration-length mismatch could silently cut a video short or truncate narration. Not yet confirmed to have happened — watch for it.
+- **Schema drift risk**: `character_reference_url` proved a model column can be added without its migration ever running. Worth spot-checking new model columns against live Supabase schema when reviewing future agent code changes, not just trusting the model file.
 
 ## Rule
 Every new bug (and its fix, once resolved) gets logged here immediately.
