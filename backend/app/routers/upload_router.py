@@ -82,3 +82,20 @@ async def upload_video(
         "file_size_bytes": len(contents),
         "status": video.status,
     }
+
+
+# ADDED (2026-08-03): supports continuity anchoring in generate_videos.py -
+# stores an extracted last-frame PNG (used as the next shot's image-to-video
+# anchor) in the same durable Supabase Storage used by narration/final video.
+# `tag` is caller-defined (e.g. "{video_id}_shot003" or "{video_id}_resume")
+# purely for a readable storage path - this endpoint doesn't touch the videos
+# table at all, it just stores a file and hands back a public URL.
+@router.post("/reference/{tag}")
+async def upload_reference_frame(tag: str, file: UploadFile = File(...)):
+    contents = await file.read()
+    image_url = upload_to_storage(f"reference/{tag}.png", contents, "image/png")
+    return {
+        "tag": tag,
+        "url": image_url,
+        "file_size_bytes": len(contents),
+    }
