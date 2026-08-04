@@ -24,3 +24,4 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          VIDEO_ID: ${{ inputs.video_id }}
