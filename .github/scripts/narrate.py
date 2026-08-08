@@ -1,44 +1,49 @@
 import asyncio
 import os
 import re
-import subprocess
-import uuid
-from sqlalchemy.orm import Session
-from app.models.video import Video
-from app.models.script import Script
+import sys
+import time
+
 import edge_tts
+import requests
 from pydub import AudioSegment
 from pydub.effects import normalize as pydub_normalize
 
-MEDIA_ROOT = "/app/data/media"
+RAILWAY_URL = os.environ["RAILWAY_URL"]
+VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
 # EDGE TTS (reverted 2026-08-09, matching Marius): replaces Chatterbox TTS.
-# Chatterbox was ported in 2026-08-03/04 but never confirmed safe - see
-# brain/KNOWN_BUGS.md and brain/SESSION_LOG.md. It carried two confirmed
-# problems: (1) it loaded a real neural model IN-PROCESS inside the FastAPI
-# backend on Render's free tier, a standing OOM/crash risk that was never
-# resolved, and (2) its first (and only) live run on 2026-08-08 produced
-# ~4s of audio for a ~555s-planned script - a near-total synthesis failure
-# caught via Supabase task history, not by any exception. Edge TTS is
-# lighter weight (no in-process model, calls Microsoft's cloud TTS service)
-# and is the same engine already confirmed reliable on Marius. No built-in
-# rate/speed param is used here either; slowdown is applied once at the end
-# via ffmpeg atempo, same pattern the old gTTS/Chatterbox code already used.
+# Chatterbox was ported here 2026-08-04 but never confirmed reliable - its
+# first live run (2026-08-08) produced ~4s of audio for a ~555s-planned
+# script, a near-total synthesis failure that no exception caught (see
+# MIN_PLAUSIBLE_RATIO guard below, added 2026-08-09 after the fact). Edge
+# TTS is the same engine already confirmed reliable on Marius, and this is
+# a straight revert for this file specifically - narrate.py ran Edge TTS
+# before Chatterbox ever replaced it here. Runs on a GitHub-hosted runner
+# same as before - plenty of RAM either way, but no longer relying on an
+# in-process neural model at all.
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
 SLOWDOWN_FACTOR = "0.95"
 
 PAUSE_SECONDS_MIN = 1.0
 PAUSE_SECONDS_MAX = 2.0
 
-# FIX (2026-08-04): narration_agent had NO defense of its own against bad
-# script content reaching text-to-speech. script_writing_agent.py was patched
-# on 2026-08-03 to reject code/markup/JSON before saving a Script row, but
-# that only protects scripts generated AFTER that fix went live. Any Script
-# row already sitting in the database from before the fix (or reaching this
-# agent through any future code path that isn't script_writing_agent) had
-# zero protection - narration_agent would TTS whatever was in script.content,
-# no questions asked. This guard makes narration_agent defend itself instead
-# of trusting upstream to have done it.
+WORK_DIR = "/tmp/nova_narration"
+BACKEND_TIMEOUT = 120
+
+LEADING_BRACKET_TAG_RE = re.compile(r"^\[[^\]]*\]\s*")
+
+SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
+DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
+DEFAULT_SHOT_DURATION = 3.0
+
+# GUARD (2026-08-04): this is the actual live pipeline path (triggered by the
+# Supervisor Agent's automated 20-minute cycle) - narration_agent.py's
+# equivalent guard only protects the separate manual/admin dashboard path,
+# NOT this one. Without this, "Hidden Code"-style script corruption (a
+# Pollinations error page saved as script content) can still reach TTS here
+# even after script_writing_agent.py's 2026-08-03 fix, for any script row
+# that predates that fix or reaches this script through any future path.
 _CODE_LIKE_MARKERS = (
     "<html", "<!doctype", "<div", "<span", "<body", "<script",
     "```", "function(", "function (", "=>", "SELECT *", "import ",
@@ -46,7 +51,7 @@ _CODE_LIKE_MARKERS = (
 )
 
 
-def _looks_like_code_or_markup(text: str) -> bool:
+def _looks_like_code_or_markup(text):
     lowered = text.lower()
     hits = sum(1 for marker in _CODE_LIKE_MARKERS if marker.lower() in lowered)
     if hits >= 2:
@@ -57,110 +62,279 @@ def _looks_like_code_or_markup(text: str) -> bool:
     return False
 
 
-def _clean_narration_text(script_content: str) -> str:
-    text = re.sub(r'\[SCENE[^\]]*\]', '', script_content, flags=re.IGNORECASE)
-    text = re.sub(r'\n{2,}', '\n', text).strip()
-    return text
-
-
-def _split_into_sentences(narration_text):
-    raw_segments = re.split(r"(?<=[.!?])\s+", narration_text.strip())
-    segments = [seg.strip() for seg in raw_segments if seg.strip()]
-    return segments if segments else [narration_text.strip()]
-
-
 async def _synthesize_sentence_edge(text, tmp_path):
     communicate = edge_tts.Communicate(text, voice=EDGE_TTS_VOICE)
     await communicate.save(tmp_path)
 
 
-def _synthesize_with_pauses(narration_text, tmp_dir):
-    segments = _split_into_sentences(narration_text)
+def _get_with_wakeup(url, max_attempts=4, **kwargs):
+    backoff_seconds = [10, 20, 40, 60]
+    kwargs.setdefault("timeout", BACKEND_TIMEOUT)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return requests.get(url, **kwargs)
+        except requests.exceptions.ReadTimeout:
+            print(f"Backend not awake yet (attempt {attempt}/{max_attempts}): read timeout")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Backend not reachable yet (attempt {attempt}/{max_attempts}): {e}")
+
+        if attempt < max_attempts:
+            wait = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            print(f"Waiting {wait}s before retry...")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Backend at {url} did not respond after {max_attempts} attempts.")
+
+
+def _clean_narration_text(raw_content):
+    clean_lines = []
+    for line in raw_content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            continue
+        if stripped.upper().startswith("NARRATOR"):
+            continue
+        stripped = LEADING_BRACKET_TAG_RE.sub("", stripped).strip()
+        if not stripped:
+            continue
+        clean_lines.append(stripped)
+    return " ".join(clean_lines)
+
+
+def _audio_path_is_live(audio_path):
+    try:
+        resp = requests.head(audio_path, timeout=15, allow_redirects=True)
+        return resp.status_code == 200
+    except requests.RequestException as e:
+        print(f"audio_path check failed for {audio_path} ({e}) - treating as dead.")
+        return False
+
+
+def _find_next_video_needing_narration():
+    resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/videos")
+    resp.raise_for_status()
+    videos = resp.json()
+
+    candidates = []
+    for v in videos:
+        if not v.get("production_plan"):
+            continue
+        audio_path = v.get("audio_path")
+        if not audio_path:
+            candidates.append(v)
+            continue
+        if not _audio_path_is_live(audio_path):
+            print(f"Video {v.get('id')} has audio_path set but the file is missing/dead - "
+                  f"treating as needing re-narration: {audio_path}")
+            candidates.append(v)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]["id"]
+
+
+def split_into_segments(narration_text):
+    raw_segments = re.split(r"(?<=[.!?])\s+", narration_text.strip())
+    segments = [seg.strip() for seg in raw_segments if seg.strip()]
+    return segments if segments else [narration_text.strip()]
+
+
+def synthesize_sentence(text, tmp_path):
+    asyncio.run(_synthesize_sentence_edge(text, tmp_path))
+    clip = AudioSegment.from_file(tmp_path)
+    # DIAGNOSTIC (2026-08-09): kept from the Chatterbox near-empty-audio
+    # bug - logs each segment's real length so a future failure points at
+    # the exact sentence(s) that came out wrong, not just the aggregate.
+    print(f"  segment ({len(text)} chars): {len(clip) / 1000.0:.2f}s audio -> {text[:60]!r}")
+    return clip
+
+
+def synthesize_with_pauses(narration_text):
+    segments = split_into_segments(narration_text)
+    print(f"Narration split into {len(segments)} sentence(s) for pause insertion.")
+
     combined = AudioSegment.silent(duration=0)
     for i, segment in enumerate(segments):
-        tmp_path = os.path.join(tmp_dir, f"sent_{i}.mp3")
-        asyncio.run(_synthesize_sentence_edge(segment, tmp_path))
-        clip = AudioSegment.from_file(tmp_path)
-        # DIAGNOSTIC (carried over from the Chatterbox near-empty-audio bug):
-        # log each segment's real length so a future failure points at the
-        # exact sentence(s) that came out wrong, not just the aggregate total.
-        print(f"  segment ({len(segment)} chars): {len(clip) / 1000.0:.2f}s audio")
+        clip = synthesize_sentence(segment, os.path.join(WORK_DIR, f"sent_{i}.mp3"))
         combined += clip
         if i < len(segments) - 1:
             pause_len = PAUSE_SECONDS_MIN if i % 2 == 0 else PAUSE_SECONDS_MAX
             combined += AudioSegment.silent(duration=int(pause_len * 1000))
-    return combined
+
+    return combined, len(combined) / 1000.0
 
 
-def run_narration(db: Session, video_id: str):
-    if isinstance(video_id, str):
-        video_id = uuid.UUID(video_id)
-    video = db.query(Video).filter(Video.id == video_id).first()
-    if not video:
-        raise ValueError(f"Video {video_id} not found")
-    if not video.script_id:
-        raise ValueError(f"Video {video_id} has no linked script")
-    script = db.query(Script).filter(Script.id == video.script_id).first()
-    if not script or not script.content:
-        raise ValueError("Linked script has no content to narrate")
+def _parse_shots_with_durations(production_plan):
+    durations = []
+    for line in production_plan.splitlines():
+        line = line.strip()
+        if not SHOT_START.match(line):
+            continue
+        match = DURATION_PATTERN.search(line)
+        durations.append(float(match.group(1)) if match else DEFAULT_SHOT_DURATION)
+    return durations
 
-    if _looks_like_code_or_markup(script.content):
-        raise ValueError(
-            f"Script {script.id} for video {video_id} looks like code/markup, "
-            f"not narration text - refusing to narrate it. This script needs to "
-            f"be regenerated (delete this Script row and re-run script_writing), "
-            f"not narrated as-is."
+
+def _scale_shot_durations(planned_durations, real_total_seconds):
+    if not planned_durations:
+        return []
+    planned_total = sum(planned_durations)
+    if planned_total <= 0:
+        even_share = real_total_seconds / len(planned_durations)
+        return [even_share] * len(planned_durations)
+    scale = real_total_seconds / planned_total
+    return [d * scale for d in planned_durations]
+
+
+# GUARD (2026-08-09): Chatterbox's first live production run measured
+# real_total_seconds at ~4.1s for a script whose planned shots summed to
+# ~555s (a ~130x shortfall) - every sentence apparently synthesized to
+# near-nothing, but nothing raised an exception, so the corrupted length
+# silently propagated into shot_durations and wrecked assemble.py's
+# per-shot timing. Refuse to trust a narration length this implausible -
+# fail loudly here instead of quietly corrupting shot_durations for
+# assemble.py to consume later. Kept as a safety net after the Chatterbox
+# -> Edge TTS switch, since it's a cheap, engine-agnostic sanity check.
+MIN_PLAUSIBLE_RATIO = 0.15
+MIN_SECONDS_PER_SEGMENT = 0.5
+
+
+def _check_narration_length_plausible(real_total_seconds, planned_total_seconds, num_segments):
+    if planned_total_seconds <= 0:
+        return
+    ratio = real_total_seconds / planned_total_seconds
+    if ratio < MIN_PLAUSIBLE_RATIO or real_total_seconds < num_segments * MIN_SECONDS_PER_SEGMENT:
+        raise RuntimeError(
+            f"Narration length implausible: measured {real_total_seconds:.1f}s of audio "
+            f"for a script whose planned shots sum to {planned_total_seconds:.1f}s "
+            f"(ratio {ratio:.3f}, {num_segments} sentence segments). This almost certainly "
+            f"means TTS produced near-empty audio for some/all segments - check the "
+            f"per-segment lengths logged above for the exact sentence(s) that failed. "
+            f"Refusing to upload this narration or save shot_durations."
         )
 
-    narration_text = _clean_narration_text(script.content)
-    if not narration_text:
-        raise ValueError("Narration text was empty after cleaning script content")
+
+def main():
+    os.makedirs(WORK_DIR, exist_ok=True)
+
+    video_id = VIDEO_ID
+    if not video_id:
+        print("No VIDEO_ID provided — auto-selecting next video needing narration...")
+        video_id = _find_next_video_needing_narration()
+        if not video_id:
+            print("No videos currently need narration. Exiting cleanly.")
+            return
+        print(f"Auto-selected video_id: {video_id}")
+
+    print("Fetching video data from backend")
+    video_resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/videos/{video_id}")
+    video_resp.raise_for_status()
+    video = video_resp.json()
+
+    script_id = video.get("script_id")
+    if not script_id:
+        print("ERROR: video has no script_id")
+        sys.exit(1)
+
+    print("Fetching script data from backend")
+    script_resp = _get_with_wakeup(f"{RAILWAY_URL}/api/v1/scripts/{script_id}")
+    script_resp.raise_for_status()
+    script = script_resp.json()
+
+    raw_content = script.get("content")
+    if not raw_content:
+        print("ERROR: script has no content")
+        sys.exit(1)
+
+    if _looks_like_code_or_markup(raw_content):
+        print(f"ERROR: script {script_id} looks like code/markup, not narration text - "
+              f"refusing to narrate it. This script needs to be regenerated "
+              f"(delete this Script row and re-run script_writing), not narrated as-is.")
+        sys.exit(1)
+
+    narration_text = _clean_narration_text(raw_content)
+    print("Narration text length: " + str(len(narration_text)) + " characters")
 
     if _looks_like_code_or_markup(narration_text):
-        raise ValueError(
-            f"Script {script.id} for video {video_id} looks like code/markup "
-            f"after cleaning - refusing to narrate it."
+        print(f"ERROR: script {script_id} looks like code/markup after cleaning - refusing to narrate it.")
+        sys.exit(1)
+
+    print("Generating speech with Edge TTS (sentence-level, real pauses)")
+    combined_audio, real_total_seconds = synthesize_with_pauses(narration_text)
+    combined_audio = pydub_normalize(combined_audio)
+    print(f"Real measured narration length: {real_total_seconds:.1f}s")
+
+    shot_durations = None
+    production_plan = video.get("production_plan")
+    if production_plan:
+        planned_durations = _parse_shots_with_durations(production_plan)
+        if planned_durations:
+            planned_total = sum(planned_durations)
+            _check_narration_length_plausible(
+                real_total_seconds, planned_total, len(split_into_segments(narration_text))
+            )
+            shot_durations = _scale_shot_durations(planned_durations, real_total_seconds)
+            print(f"Computed {len(shot_durations)} real per-shot durations "
+                  f"(scaled from planned, summing to {sum(shot_durations):.1f}s).")
+        else:
+            print("No shots parsed from production_plan yet - skipping shot_durations for now.")
+    else:
+        print("No production_plan yet on this video - skipping shot_durations for now.")
+
+    raw_wav_path = os.path.join(WORK_DIR, "narration_raw.wav")
+    wav_path = os.path.join(WORK_DIR, "narration.wav")
+    combined_audio.export(raw_wav_path, format="wav")
+
+    print("Applying slowdown (pitch preserved)")
+    import subprocess
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", raw_wav_path, "-filter:a", f"atempo={SLOWDOWN_FACTOR}", wav_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0:
+        print("ffmpeg error: " + result.stdout.decode(errors="ignore"))
+        sys.exit(1)
+    os.remove(raw_wav_path)
+
+    print("Converting WAV to MP3")
+    mp3_path = os.path.join(WORK_DIR, "narration.mp3")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0:
+        print("ffmpeg error: " + result.stdout.decode(errors="ignore"))
+        sys.exit(1)
+
+    print("Uploading narration to backend")
+    with open(mp3_path, "rb") as f:
+        upload_resp = requests.post(
+            f"{RAILWAY_URL}/api/v1/upload/narration/{video_id}",
+            files={"file": ("narration.mp3", f, "audio/mpeg")},
+            timeout=120,
         )
+    upload_resp.raise_for_status()
+    print("SUCCESS")
+    print(upload_resp.json())
 
-    video_dir = os.path.join(MEDIA_ROOT, str(video.id), "audio")
-    os.makedirs(video_dir, exist_ok=True)
-    raw_path = os.path.join(video_dir, "narration_raw.wav")
-    final_path = os.path.join(video_dir, "narration.mp3")
-
-    try:
-        combined_audio = _synthesize_with_pauses(narration_text, video_dir)
-        combined_audio = pydub_normalize(combined_audio)
-        combined_audio.export(raw_path, format="wav")
-    except Exception as e:
-        raise ValueError(f"Narration generation failed: {type(e).__name__}: {str(e)[:200]}")
-
-    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
-        raise ValueError("Narration file was not created or is empty")
-
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", raw_path,
-                "-filter:a", f"atempo={SLOWDOWN_FACTOR}",
-                final_path,
-            ],
-            check=True,
-            capture_output=True,
+    if shot_durations is not None:
+        print("Saving real shot_durations to backend")
+        slowdown = float(SLOWDOWN_FACTOR)
+        shot_durations = [d / slowdown for d in shot_durations]
+        patch_resp = requests.patch(
+            f"{RAILWAY_URL}/api/v1/videos/{video_id}",
+            json={"shot_durations": shot_durations},
+            timeout=30,
         )
-        os.remove(raw_path)
-    except Exception:
-        os.rename(raw_path, final_path)
+        patch_resp.raise_for_status()
+        print("shot_durations saved.")
 
-    if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
-        raise ValueError("Narration file was not created or is empty after speed adjustment")
 
-    video.audio_path = final_path
-    db.commit()
-    db.refresh(video)
-    return {
-        "video_id": str(video.id),
-        "audio_path": final_path,
-        "file_size_bytes": os.path.getsize(final_path),
-        "engine": "EdgeTTS",
-        "slowdown_factor": SLOWDOWN_FACTOR,
-    }
+if __name__ == "__main__":
+    main()
