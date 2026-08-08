@@ -28,7 +28,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install chatterbox-tts torchaudio pydub requests
+          pip install edge-tts pydub requests
 
       - name: Run narration
         env:
