@@ -54,6 +54,7 @@ FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
 SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
 DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
+FFMPEG_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
@@ -266,10 +267,35 @@ def _extract_native_audio(video_path, out_path):
 
 
 def _get_video_duration(video_path):
-    clip = VideoFileClip(video_path)
-    duration = clip.duration
-    clip.close()
-    return duration
+    """FIX (2026-08-09): moviepy's VideoFileClip (via ffmpeg_reader) parses
+    ffmpeg's probe output for a 'video_fps' field and raises KeyError when
+    that field is missing - which happens on files produced by our own
+    `ffmpeg -f concat -c copy` step earlier in this script, because stream
+    copying can leave the container's fps metadata in a form moviepy's
+    regex doesn't recognize. This crashed 70+ consecutive assemble runs
+    at this exact line even though every real step (rendering, concat,
+    audio mix) had already succeeded.
+
+    Fix: read duration straight from ffmpeg's own text output instead of
+    going through moviepy at all - ffmpeg always prints a 'Duration:
+    HH:MM:SS.ms' line regardless of whether it can also parse fps, so this
+    never depends on the missing field.
+    """
+    result = subprocess.run(
+        [FFMPEG_BINARY, "-i", video_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output = result.stdout.decode(errors="ignore")
+    match = FFMPEG_DURATION_PATTERN.search(output)
+    if not match:
+        raise RuntimeError(
+            "Could not determine video duration from ffmpeg output for "
+            + video_path + ". Last 1000 chars of ffmpeg output:\n"
+            + output[-1000:]
+        )
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def _fit_audio_to_duration(audio_clip, target):
