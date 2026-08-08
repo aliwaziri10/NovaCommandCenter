@@ -146,7 +146,14 @@ def split_into_segments(narration_text):
 def synthesize_sentence(text, tts, tmp_path):
     wav = tts.generate(text)
     torchaudio.save(tmp_path, wav, tts.sr)
-    return AudioSegment.from_file(tmp_path)
+    clip = AudioSegment.from_file(tmp_path)
+    # DIAGNOSTIC (2026-08-09): added after Chatterbox's first live run produced
+    # ~4s of audio for a ~555s-planned script - no exception was raised, so
+    # there was no way to tell which sentence(s) actually failed to synthesize.
+    # Logs each segment's real length so the next failure points at the exact
+    # sentence(s) that came out wrong, instead of just the aggregate total.
+    print(f"  segment ({len(text)} chars): {len(clip) / 1000.0:.2f}s audio -> {text[:60]!r}")
+    return clip
 
 
 def synthesize_with_pauses(narration_text, tts):
@@ -184,6 +191,35 @@ def _scale_shot_durations(planned_durations, real_total_seconds):
         return [even_share] * len(planned_durations)
     scale = real_total_seconds / planned_total
     return [d * scale for d in planned_durations]
+
+
+# GUARD (2026-08-09): Chatterbox's first live production run measured
+# real_total_seconds at ~4.1s for a script whose planned shots summed to
+# ~555s (a ~130x shortfall) - every sentence apparently synthesized to
+# near-nothing, but nothing raised an exception, so the corrupted length
+# silently propagated into shot_durations and wrecked assemble.py's
+# per-shot timing (each shot rendered at ~1/130th its real length,
+# producing a near-empty final video that then crashed the ffmpeg merge
+# step for an unrelated-looking reason). Refuse to trust a narration
+# length this implausible - fail loudly here instead of quietly
+# corrupting shot_durations for assemble.py to consume later.
+MIN_PLAUSIBLE_RATIO = 0.15
+MIN_SECONDS_PER_SEGMENT = 0.5
+
+
+def _check_narration_length_plausible(real_total_seconds, planned_total_seconds, num_segments):
+    if planned_total_seconds <= 0:
+        return
+    ratio = real_total_seconds / planned_total_seconds
+    if ratio < MIN_PLAUSIBLE_RATIO or real_total_seconds < num_segments * MIN_SECONDS_PER_SEGMENT:
+        raise RuntimeError(
+            f"Narration length implausible: measured {real_total_seconds:.1f}s of audio "
+            f"for a script whose planned shots sum to {planned_total_seconds:.1f}s "
+            f"(ratio {ratio:.3f}, {num_segments} sentence segments). This almost certainly "
+            f"means Chatterbox TTS produced near-empty audio for some/all segments - check "
+            f"the per-segment lengths logged above for the exact sentence(s) that failed. "
+            f"Refusing to upload this narration or save shot_durations."
+        )
 
 
 def main():
@@ -242,6 +278,10 @@ def main():
     if production_plan:
         planned_durations = _parse_shots_with_durations(production_plan)
         if planned_durations:
+            planned_total = sum(planned_durations)
+            _check_narration_length_plausible(
+                real_total_seconds, planned_total, len(split_into_segments(narration_text))
+            )
             shot_durations = _scale_shot_durations(planned_durations, real_total_seconds)
             print(f"Computed {len(shot_durations)} real per-shot durations "
                   f"(scaled from planned, summing to {sum(shot_durations):.1f}s).")
