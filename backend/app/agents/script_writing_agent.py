@@ -93,7 +93,20 @@ def run_script_writing(db: Session, topic_id: str):
     two lightweight viewer-engagement prompts, and a payoff ending with a next-episode
     tease — written to be READ ALOUD by a human-sounding narrator, not to be skimmed
     as text.
-    Skips generation entirely if a script for this topic already exists, to avoid duplicates."""
+    Skips generation entirely if a script for this topic already exists, to avoid duplicates.
+
+    FAILURE FIX (2026-08-08): on a failed generation, this used to still save a
+    Script row with a literal placeholder string as content ("Script generation
+    failed on part 1 — try running this task again." or a part-1-only script with
+    "[Part 2 generation failed — script is incomplete]" tacked onto the end).
+    That placeholder text isn't code/markup, so it sailed straight past
+    narration_agent's _looks_like_code_or_markup guard and got spoken aloud by
+    Chatterbox in the finished video. It also meant video_planning_agent would
+    happily shot-plan and video-generate a script that was never real content.
+    This now raises instead — matching the pattern video_planning_agent.py
+    already uses for exactly this failure mode — so a failed generation goes
+    through the normal Task/_failed_attempts retry path and no broken Script
+    row is ever created or allowed downstream."""
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
     if not topic:
@@ -227,37 +240,52 @@ def run_script_writing(db: Session, topic_id: str):
     part1 = _generate_part(part1_prompt, system_prompt)
 
     if not part1:
-        content = "Script generation failed on part 1 — try running this task again."
-    else:
-        part2_prompt = (
-            f'Continue this script directly from where it left off (write the '
-            f'SECOND HALF, roughly scenes 4-6) for the topic "{topic.title}". '
-            f'Here is the first half for context:\n\n{part1}\n\n'
-            f'Continue the story, keep introducing a new question or small reveal '
-            f'roughly every 100-120 words, and keep giving each turning point its own '
-            f'small twist rather than relying on only one big reversal. IMPORTANT: at the '
-            f'halfway point of this second half, insert a deliberate midpoint re-hook — a '
-            f'twist, reversal, or sudden escalation that shifts tone and grabs attention '
-            f'again, exactly when viewers typically start to drift. Immediately after that '
-            f'shift, add a short direct-address line explicitly teasing the single biggest '
-            f'turning point still to come, and a second short direct-address line inviting '
-            f'the viewer\'s prediction or opinion on what happens next — both natural asides, '
-            f'not ad breaks. Include one "false resolution" moment somewhere in this half '
-            f'where something appears settled, then undercut it in the very next beat. Keep '
-            f'the scale escalating — personal, then national, then civilizational stakes — '
-            f'and keep swinging the emotional tone between tension/dread and hope/relief; '
-            f'give the viewer real moments to root for before the next escalation. Keep '
-            f'writing for the ear: varied sentence rhythm, direct address, sensory and '
-            f'emotional detail, never flat or encyclopedic. Develop the consequences, bring '
-            f'it to the present day, and close the central "what if" question from the '
-            f'opening hook by explicitly returning to that opening image or claim and '
-            f'revealing it means something different now that the full story is known — '
-            f'end with a surprise or lingering implication, then one closing line teasing a '
-            f'related next-episode angle. Do not repeat the first half — only write the new '
-            f'continuation, starting with [SCENE 4].'
+        raise RuntimeError(
+            f"Script generation failed on part 1 for topic {topic_id} "
+            f"(Pollinations returned nothing usable after 3 attempts) - no Script row "
+            f"created, will be retried by the supervisor up to MAX_RETRIES instead of "
+            f"saving a placeholder that would end up spoken aloud in the final video."
         )
-        part2 = _generate_part(part2_prompt, system_prompt)
-        content = part1 + "\n\n" + part2 if part2 else part1 + "\n\n[Part 2 generation failed — script is incomplete]"
+
+    part2_prompt = (
+        f'Continue this script directly from where it left off (write the '
+        f'SECOND HALF, roughly scenes 4-6) for the topic "{topic.title}". '
+        f'Here is the first half for context:\n\n{part1}\n\n'
+        f'Continue the story, keep introducing a new question or small reveal '
+        f'roughly every 100-120 words, and keep giving each turning point its own '
+        f'small twist rather than relying on only one big reversal. IMPORTANT: at the '
+        f'halfway point of this second half, insert a deliberate midpoint re-hook — a '
+        f'twist, reversal, or sudden escalation that shifts tone and grabs attention '
+        f'again, exactly when viewers typically start to drift. Immediately after that '
+        f'shift, add a short direct-address line explicitly teasing the single biggest '
+        f'turning point still to come, and a second short direct-address line inviting '
+        f'the viewer\'s prediction or opinion on what happens next — both natural asides, '
+        f'not ad breaks. Include one "false resolution" moment somewhere in this half '
+        f'where something appears settled, then undercut it in the very next beat. Keep '
+        f'the scale escalating — personal, then national, then civilizational stakes — '
+        f'and keep swinging the emotional tone between tension/dread and hope/relief; '
+        f'give the viewer real moments to root for before the next escalation. Keep '
+        f'writing for the ear: varied sentence rhythm, direct address, sensory and '
+        f'emotional detail, never flat or encyclopedic. Develop the consequences, bring '
+        f'it to the present day, and close the central "what if" question from the '
+        f'opening hook by explicitly returning to that opening image or claim and '
+        f'revealing it means something different now that the full story is known — '
+        f'end with a surprise or lingering implication, then one closing line teasing a '
+        f'related next-episode angle. Do not repeat the first half — only write the new '
+        f'continuation, starting with [SCENE 4].'
+    )
+    part2 = _generate_part(part2_prompt, system_prompt)
+
+    if not part2:
+        raise RuntimeError(
+            f"Script generation failed on part 2 for topic {topic_id} "
+            f"(Pollinations returned nothing usable after 3 attempts, part 1 "
+            f"succeeded). No Script row created — will be retried by the supervisor "
+            f"up to MAX_RETRIES instead of shipping a truncated script with a "
+            f"failure marker that would end up spoken aloud in the final video."
+        )
+
+    content = part1 + "\n\n" + part2
 
     script = Script(
         title=topic.title,
