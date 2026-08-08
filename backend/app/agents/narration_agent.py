@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import subprocess
@@ -5,30 +6,25 @@ import uuid
 from sqlalchemy.orm import Session
 from app.models.video import Video
 from app.models.script import Script
-from chatterbox.tts import ChatterboxTTS
-import torchaudio
+import edge_tts
 from pydub import AudioSegment
 from pydub.effects import normalize as pydub_normalize
 
 MEDIA_ROOT = "/app/data/media"
 
-# CHATTERBOX (ported from Marius, 2026-08-04): replaces gTTS. Chatterbox has
-# noticeably more natural prosody than gTTS - same switch already made on
-# Marius and TechPulse. No built-in rate/speed param, so slowdown is applied
-# once at the end via ffmpeg atempo (same pattern the old gTTS code already
-# used here).
-#
-# KNOWN RISK - NOT YET CONFIRMED SAFE: unlike Marius (where narration runs as
-# its own GitHub Actions job with ~7GB RAM headroom), this function runs
-# IN-PROCESS inside the FastAPI backend on Render's free web instance,
-# triggered directly by the Supervisor Agent every 20 minutes. Chatterbox
-# loads a real neural TTS model into memory. If Render's free tier doesn't
-# have enough RAM for that, this won't just fail narration - it can crash
-# the whole backend process. Watch the Render logs closely after the next
-# narration run for OOM/crash/restart-loop behavior. If that happens, the
-# fix is to move Chatterbox synthesis out of this in-process agent and into
-# a separate job (e.g. a GitHub Actions script, like Marius does), rather
-# than running it inside the always-on API process.
+# EDGE TTS (reverted 2026-08-09, matching Marius): replaces Chatterbox TTS.
+# Chatterbox was ported in 2026-08-03/04 but never confirmed safe - see
+# brain/KNOWN_BUGS.md and brain/SESSION_LOG.md. It carried two confirmed
+# problems: (1) it loaded a real neural model IN-PROCESS inside the FastAPI
+# backend on Render's free tier, a standing OOM/crash risk that was never
+# resolved, and (2) its first (and only) live run on 2026-08-08 produced
+# ~4s of audio for a ~555s-planned script - a near-total synthesis failure
+# caught via Supabase task history, not by any exception. Edge TTS is
+# lighter weight (no in-process model, calls Microsoft's cloud TTS service)
+# and is the same engine already confirmed reliable on Marius. No built-in
+# rate/speed param is used here either; slowdown is applied once at the end
+# via ffmpeg atempo, same pattern the old gTTS/Chatterbox code already used.
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
 SLOWDOWN_FACTOR = "0.95"
 
 PAUSE_SECONDS_MIN = 1.0
@@ -48,15 +44,6 @@ _CODE_LIKE_MARKERS = (
     "```", "function(", "function (", "=>", "SELECT *", "import ",
     "def ", "class ", "{\"", "[{", "</",
 )
-
-_tts_model = None
-
-
-def _get_tts_model():
-    global _tts_model
-    if _tts_model is None:
-        _tts_model = ChatterboxTTS.from_pretrained(device="cpu")
-    return _tts_model
 
 
 def _looks_like_code_or_markup(text: str) -> bool:
@@ -82,14 +69,23 @@ def _split_into_sentences(narration_text):
     return segments if segments else [narration_text.strip()]
 
 
-def _synthesize_with_pauses(narration_text, tts, tmp_dir):
+async def _synthesize_sentence_edge(text, tmp_path):
+    communicate = edge_tts.Communicate(text, voice=EDGE_TTS_VOICE)
+    await communicate.save(tmp_path)
+
+
+def _synthesize_with_pauses(narration_text, tmp_dir):
     segments = _split_into_sentences(narration_text)
     combined = AudioSegment.silent(duration=0)
     for i, segment in enumerate(segments):
-        tmp_path = os.path.join(tmp_dir, f"sent_{i}.wav")
-        wav = tts.generate(segment)
-        torchaudio.save(tmp_path, wav, tts.sr)
-        combined += AudioSegment.from_file(tmp_path)
+        tmp_path = os.path.join(tmp_dir, f"sent_{i}.mp3")
+        asyncio.run(_synthesize_sentence_edge(segment, tmp_path))
+        clip = AudioSegment.from_file(tmp_path)
+        # DIAGNOSTIC (carried over from the Chatterbox near-empty-audio bug):
+        # log each segment's real length so a future failure points at the
+        # exact sentence(s) that came out wrong, not just the aggregate total.
+        print(f"  segment ({len(segment)} chars): {len(clip) / 1000.0:.2f}s audio")
+        combined += clip
         if i < len(segments) - 1:
             pause_len = PAUSE_SECONDS_MIN if i % 2 == 0 else PAUSE_SECONDS_MAX
             combined += AudioSegment.silent(duration=int(pause_len * 1000))
@@ -132,8 +128,7 @@ def run_narration(db: Session, video_id: str):
     final_path = os.path.join(video_dir, "narration.mp3")
 
     try:
-        tts = _get_tts_model()
-        combined_audio = _synthesize_with_pauses(narration_text, tts, video_dir)
+        combined_audio = _synthesize_with_pauses(narration_text, video_dir)
         combined_audio = pydub_normalize(combined_audio)
         combined_audio.export(raw_path, format="wav")
     except Exception as e:
@@ -166,6 +161,6 @@ def run_narration(db: Session, video_id: str):
         "video_id": str(video.id),
         "audio_path": final_path,
         "file_size_bytes": os.path.getsize(final_path),
-        "engine": "Chatterbox",
+        "engine": "EdgeTTS",
         "slowdown_factor": SLOWDOWN_FACTOR,
     }
