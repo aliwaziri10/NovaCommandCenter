@@ -22,6 +22,11 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 # before Chatterbox ever replaced it here. Runs on a GitHub-hosted runner
 # same as before - plenty of RAM either way, but no longer relying on an
 # in-process neural model at all.
+# FIX (2026-08-09, later same day): default voice was silently AriaNeural
+# (female) despite every brain doc documenting GuyNeural (male) as Nova's
+# voice since the original Edge TTS adoption. narrate.yml has no override,
+# so this default is what actually ran in production. Corrected to match
+# the documented/intended voice.
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-GuyNeural")
 SLOWDOWN_FACTOR = "0.95"
 
