@@ -15,14 +15,4 @@ Keep the pipeline running reliably and improve narration/video quality. No infra
 - The 73-issue "Assemble workflow failed" streak (2026-08-06 to 2026-08-08) is root-caused and fixed: a moviepy KeyError on missing ffmpeg fps metadata after the script's own concat step. Fix confirmed live, no new failures since; not yet proven by an actual successful assembly run.
 - Schema/repo hygiene: a stray duplicate migration file from a 2026-07-02 GitHub web-editor mistake was found and deleted 2026-08-09. Full repo swept for similar issues — none found elsewhere.
 - `.env.example` and `config.py`'s `database_url` default still reference the old SQLite path, stale since the July Postgres/Supabase migration — fix given to Ali for `.env.example`, not yet confirmed committed.
-- Long-form videos (longer runtime, not short ~30s clips) is the current content direction.
-
-## Rules
-- Read all files in /brain before starting work.
-- Never rely on chat history — this repo is the single source of truth.
-- Update this file whenever the project state changes.
-- Do not reference Railway anywhere. It was fully decommissioned 2026-07-15 and is not part of this project's history worth tracking.
-- Check GitHub commit history and Supabase directly at the start of every session — do not assume this file or the last handoff is current; changes get pushed directly outside logged sessions.
-
-## Last Updated
-2026-08-09
+- Long-form videos (longer runtime, not short ~30s
