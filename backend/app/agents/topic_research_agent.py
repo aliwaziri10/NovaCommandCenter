@@ -1,10 +1,122 @@
 import random
+import time
 import requests
 import json
 from urllib.parse import quote
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.topic import Topic
+
+
+# RETRY-WITH-BACKOFF FIX (2026-08-10): same bug class already found and fixed
+# in script_writing_agent.py's _generate_part() and in Marius/TDP's equivalent
+# LLM-call functions - this function made a single Pollinations request with
+# NO status_code check at all and NO retry. When Pollinations returned a
+# transient 429/5xx, a rate-limited empty body, or a malformed/truncated JSON
+# response, the existing fallback logic ("if not isinstance(topics, list):
+# topics = []") silently swallowed it into an empty list instead of raising -
+# so the task recorded status "completed" with created=0, titles=[],
+# skipped_duplicates=[] and gave zero signal that anything had gone wrong.
+# That is exactly the pattern observed in production: 7 consecutive runs on
+# 2026-08-09 all returned created:0 with empty everything, while topics.title
+# had not gained a new row since 2026-07-19 - the topic supply silently dried
+# up and every downstream agent (script_writing, narration, assembly) starved
+# with nothing to report as broken. This now explicitly validates
+# response.status_code, retries retryable failures with escalating backoff,
+# separates network exceptions from bad HTTP responses for clear logging, and
+# - critically - raises instead of silently returning an empty result when no
+# usable topics could be extracted after all attempts, so a real failure
+# shows up as a failed task instead of a quietly "completed" no-op.
+MAX_GENERATION_ATTEMPTS = 4
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_NETWORK_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+def _parse_topics(raw: str):
+    """Extract a list of topic dicts from a raw Pollinations reply.
+    Returns None (reject, triggers a retry) if nothing usable was found -
+    never silently returns [] here, that decision is made once, explicitly,
+    by the caller after all attempts are exhausted."""
+    text = raw.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        topics = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start == -1 or end <= start:
+            return None
+        try:
+            topics = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            return None
+
+    if isinstance(topics, str):
+        try:
+            topics = json.loads(topics)
+        except json.JSONDecodeError:
+            return None
+
+    if isinstance(topics, dict) and "title" in topics:
+        topics = [topics]
+    elif isinstance(topics, dict):
+        found_list = None
+        for value in topics.values():
+            if isinstance(value, list) and value:
+                found_list = value
+                break
+        topics = found_list
+
+    if isinstance(topics, list) and topics and isinstance(topics[0], str):
+        topics = [{"title": t} for t in topics]
+
+    if not isinstance(topics, list) or not topics:
+        return None
+
+    return topics
+
+
+def _fetch_topics(url: str, params: dict) -> list | None:
+    last_reason = None
+
+    for attempt in range(MAX_GENERATION_ATTEMPTS):
+        try:
+            response = requests.get(url, params=params, timeout=30)
+        except RETRYABLE_NETWORK_EXCEPTIONS as e:
+            wait = (attempt + 1) * 10
+            last_reason = f"{e.__class__.__name__}: {e}"
+            print(f"Pollinations network error ({last_reason}), waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
+            continue
+
+        if response.status_code in RETRYABLE_STATUS_CODES:
+            wait = (attempt + 1) * 10
+            last_reason = f"HTTP {response.status_code}"
+            print(f"Pollinations transient error ({last_reason}), waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}): {response.text[:200]}")
+            time.sleep(wait)
+            continue
+
+        if response.status_code != 200:
+            last_reason = f"HTTP {response.status_code} (non-retryable)"
+            print(f"Pollinations returned {last_reason}, attempt {attempt + 1}/"
+                  f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
+            continue
+
+        topics = _parse_topics(response.text)
+        if topics:
+            return topics
+
+        last_reason = "200 OK but response failed topic-list validation " \
+                       "(empty, malformed JSON, or no usable list found)"
+        print(f"Pollinations attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
+
+    print(f"Pollinations still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
+    return None
 
 
 def run_topic_research(db: Session, category: str = "History", count: int = 5):
@@ -49,37 +161,16 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
         "temperature": 0.9,
         "seed": seed,
     }
-    response = requests.get(url, params=params, timeout=30)
-    raw = response.text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    try:
-        topics = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        topics = json.loads(raw[start:end])
-    # If the AI wrapped the list inside quotes (a string), unwrap it
-    if isinstance(topics, str):
-        topics = json.loads(topics)
-    # If the AI returned ONE topic as a single object (has a "title" key), wrap it in a list
-    if isinstance(topics, dict) and "title" in topics:
-        topics = [topics]
-    # If the AI wrapped the list inside a dictionary/object, pull the list out
-    elif isinstance(topics, dict):
-        found_list = None
-        for value in topics.values():
-            if isinstance(value, list):
-                found_list = value
-                break
-        topics = found_list if found_list is not None else []
-    # If items are plain strings instead of objects, convert them
-    if isinstance(topics, list) and topics and isinstance(topics[0], str):
-        topics = [
-            {"title": t, "category": category, "trend_score": 50, "notes": ""}
-            for t in topics
-        ]
-    if not isinstance(topics, list):
-        topics = []
+
+    topics = _fetch_topics(url, params)
+    if topics is None:
+        raise RuntimeError(
+            f"Topic research failed for category '{category}' (Pollinations returned "
+            f"nothing usable after {MAX_GENERATION_ATTEMPTS} backoff-spaced attempts) - "
+            f"no topics created, raising instead of silently reporting created=0 as a "
+            f"success so this shows up as a failed task and gets retried."
+        )
+
     created = []
     skipped = []
     for t in topics:
@@ -110,6 +201,17 @@ def run_topic_research(db: Session, category: str = "History", count: int = 5):
             # first. Not a real error — treat it as a duplicate and move on.
             db.rollback()
             skipped.append(title)
+
+    if not created and not skipped:
+        # All parsed "topics" were unusable garbage (not dicts, or dicts with
+        # no meaningful title) even though _fetch_topics returned a non-empty
+        # list. This is a real failure, not a quiet no-op.
+        raise RuntimeError(
+            f"Topic research for category '{category}' returned a parsed topic list "
+            f"but none of its entries were usable dicts with titles — raising instead "
+            f"of reporting a false-success created=0."
+        )
+
     return {
         "created": len(created),
         "titles": [t.title for t in created],
