@@ -22,7 +22,7 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 # before Chatterbox ever replaced it here. Runs on a GitHub-hosted runner
 # same as before - plenty of RAM either way, but no longer relying on an
 # in-process neural model at all.
-EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-GuyNeural")
 SLOWDOWN_FACTOR = "0.95"
 
 PAUSE_SECONDS_MIN = 1.0
