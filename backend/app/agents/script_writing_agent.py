@@ -1,8 +1,8 @@
-import time
+import os
 import uuid
 import re
+import time
 import requests
-from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models.topic import Topic
 from app.models.script import Script
@@ -24,6 +24,21 @@ def _latest_strategy_notes(db: Session) -> str | None:
     return (task.payload.get("result") or {}).get("notes")
 
 
+# PROVIDER SWITCH (2026-08-10): Pollinations' free legacy text API
+# (text.pollinations.ai) started returning HTTP 402 Payment Required with a
+# deprecation notice - confirmed live in Render logs. Switched to calling the
+# Gemini API directly instead, same free-key approach already proven working
+# in Marius's scripts/script_writing.py and TDP's generate_script.py.
+# Requires the GEMINI_API_KEY secret (added to this repo on Render
+# 2026-08-10, a separate key from Marius/TDP's). This replaces the old
+# _generate_part()/Pollinations retry logic; _looks_like_code_or_markup and
+# _extract_script below are UNCHANGED and still apply to Gemini's raw text
+# output for the same reason they applied to Pollinations' - guards against
+# garbage/malformed output being spoken aloud by the TTS narrator.
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+
 # FIX (2026-08-03): the old fallback ("if len(text) > 100: return text") accepted
 # ANY long response as valid script text, including malformed/broken output from
 # the free Pollinations API - raw HTML error pages, JSON fragments, code, etc.
@@ -31,6 +46,7 @@ def _latest_strategy_notes(db: Session) -> str | None:
 # videos start "speaking code/HTML" partway through (typically Part 2, when the
 # free API degrades or errors under load). This now rejects anything that looks
 # like code/markup/JSON before accepting it as narration-ready script text.
+# Still relevant under Gemini - guards against any malformed/wrapped output.
 _CODE_LIKE_MARKERS = (
     "<html", "<!doctype", "<div", "<span", "<body", "<script",
     "```", "function(", "function (", "=>", "SELECT *", "import ",
@@ -43,8 +59,6 @@ def _looks_like_code_or_markup(text: str) -> bool:
     hits = sum(1 for marker in _CODE_LIKE_MARKERS if marker.lower() in lowered)
     if hits >= 2:
         return True
-    # Heavy brace/bracket/angle-bracket density is a strong signal of code/JSON/HTML,
-    # not spoken narration - narration should be almost entirely plain prose.
     symbol_count = sum(text.count(ch) for ch in "{}<>[]")
     if symbol_count > 5 and (symbol_count / max(len(text), 1)) > 0.01:
         return True
@@ -71,24 +85,7 @@ def _extract_script(raw: str) -> str | None:
     return None
 
 
-# RETRY-WITH-BACKOFF FIX (2026-08-09): same bug class already found and fixed
-# in Marius's call_llm() and TDP's generate_script.py - this loop retried 3
-# times but with ZERO backoff (retries fired back-to-back instantly, which
-# makes a transient 429/rate-limit or overloaded-server condition worse, not
-# better) and NEVER inspected response.status_code at all. A 429/500/502/503
-# from Pollinations just fell straight through to _extract_script(), silently
-# failed the code/markup check (or worse, sometimes an error body happened to
-# look enough like prose to slip past it), burned a retry attempt with no
-# logging of why, and offered the Pollinations backend zero recovery time
-# between hits. This now: (1) explicitly checks status_code against a
-# retryable set and backs off before retrying instead of hammering
-# immediately, (2) separates network-exceptions (timeout/connection-error)
-# from a bad response so each gets a clear log line, (3) still returns None
-# (not raises) after exhausting attempts, preserving run_script_writing()'s
-# existing "raise RuntimeError, no placeholder Script row" contract below -
-# only the retry behavior inside _generate_part changed.
 MAX_GENERATION_ATTEMPTS = 4
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 RETRYABLE_NETWORK_EXCEPTIONS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
@@ -97,53 +94,73 @@ RETRYABLE_NETWORK_EXCEPTIONS = (
 
 
 def _generate_part(prompt: str, system_prompt: str) -> str | None:
-    url = f"https://text.pollinations.ai/{quote(prompt)}"
-    params = {"model": "openai", "system": system_prompt, "temperature": 0.9}
+    """PROVIDER SWITCH (2026-08-10): now calls Gemini directly instead of
+    Pollinations. Same retry/backoff shape as before."""
+    body_text = f"{system_prompt}\n\n{prompt}"
     last_reason = None
 
     for attempt in range(MAX_GENERATION_ATTEMPTS):
         try:
-            response = requests.get(url, params=params, timeout=60)
+            response = requests.post(
+                GEMINI_URL,
+                json={"contents": [{"parts": [{"text": body_text}]}]},
+                headers={"Content-Type": "application/json"},
+                timeout=90,
+            )
         except RETRYABLE_NETWORK_EXCEPTIONS as e:
-            wait = (attempt + 1) * 10
+            wait = (attempt + 1) * 15
             last_reason = f"{e.__class__.__name__}: {e}"
-            print(f"Pollinations network error ({last_reason}), waiting {wait}s before retry "
+            print(f"Gemini network error ({last_reason}), waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
             time.sleep(wait)
             continue
 
-        if response.status_code in RETRYABLE_STATUS_CODES:
-            wait = (attempt + 1) * 10
+        if response.status_code == 429:
+            wait = (attempt + 1) * 15
+            last_reason = "HTTP 429 rate limited"
+            print(f"Gemini rate limited, waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
+            continue
+
+        if response.status_code in (500, 502, 503, 504):
+            wait = (attempt + 1) * 15
             last_reason = f"HTTP {response.status_code}"
-            print(f"Pollinations transient error ({last_reason}), waiting {wait}s before retry "
+            print(f"Gemini transient error ({last_reason}), waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}): {response.text[:200]}")
             time.sleep(wait)
             continue
 
         if response.status_code != 200:
-            # Non-retryable HTTP error (4xx other than 429) - no point backing
-            # off and hammering the same bad request again, but still worth
-            # one more attempt in case it's an intermittent bad response body
-            # rather than a truly malformed request.
             last_reason = f"HTTP {response.status_code} (non-retryable)"
-            print(f"Pollinations returned {last_reason}, attempt {attempt + 1}/"
+            print(f"Gemini returned {last_reason}, attempt {attempt + 1}/"
                   f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
             continue
 
-        extracted = _extract_script(response.text.strip())
+        try:
+            raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except (requests.exceptions.JSONDecodeError, KeyError, IndexError) as e:
+            wait = (attempt + 1) * 15
+            last_reason = f"malformed response envelope ({e})"
+            print(f"Gemini {last_reason}, waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
+            continue
+
+        extracted = _extract_script(raw_text.strip())
         if extracted:
             return extracted
 
         last_reason = "200 OK but response failed narration-text validation " \
                        "(empty, code/markup-like, or malformed envelope)"
-        print(f"Pollinations attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
+        print(f"Gemini attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
 
-    print(f"Pollinations still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
+    print(f"Gemini still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
     return None
 
 
 def run_script_writing(db: Session, topic_id: str):
-    """Generates a full video script in two parts (to avoid length cutoffs), using Pollinations.ai.
+    """Generates a full video script in two parts (to avoid length cutoffs), using Gemini.
     Prompts are structured around retention-driven storytelling: a hook-first open,
     a curiosity beat roughly every 45 seconds of narration, a midpoint re-hook,
     a mid-video explicit tease of the biggest upcoming turning point, stacked
@@ -154,17 +171,11 @@ def run_script_writing(db: Session, topic_id: str):
     Skips generation entirely if a script for this topic already exists, to avoid duplicates.
 
     FAILURE FIX (2026-08-08): on a failed generation, this used to still save a
-    Script row with a literal placeholder string as content ("Script generation
-    failed on part 1 — try running this task again." or a part-1-only script with
-    "[Part 2 generation failed — script is incomplete]" tacked onto the end).
-    That placeholder text isn't code/markup, so it sailed straight past
-    narration_agent's _looks_like_code_or_markup guard and got spoken aloud by
-    Chatterbox in the finished video. It also meant video_planning_agent would
-    happily shot-plan and video-generate a script that was never real content.
-    This now raises instead — matching the pattern video_planning_agent.py
-    already uses for exactly this failure mode — so a failed generation goes
-    through the normal Task/_failed_attempts retry path and no broken Script
-    row is ever created or allowed downstream."""
+    Script row with a literal placeholder string as content. This now raises
+    instead — matching the pattern video_planning_agent.py already uses for
+    exactly this failure mode — so a failed generation goes through the normal
+    Task/_failed_attempts retry path and no broken Script row is ever created
+    or allowed downstream."""
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
     if not topic:
@@ -300,7 +311,7 @@ def run_script_writing(db: Session, topic_id: str):
     if not part1:
         raise RuntimeError(
             f"Script generation failed on part 1 for topic {topic_id} "
-            f"(Pollinations returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
+            f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
             f"backoff-spaced attempts) - no Script row created, will be retried by "
             f"the supervisor up to MAX_RETRIES instead of saving a placeholder that "
             f"would end up spoken aloud in the final video."
@@ -338,7 +349,7 @@ def run_script_writing(db: Session, topic_id: str):
     if not part2:
         raise RuntimeError(
             f"Script generation failed on part 2 for topic {topic_id} "
-            f"(Pollinations returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
+            f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
             f"backoff-spaced attempts, part 1 succeeded). No Script row created — "
             f"will be retried by the supervisor up to MAX_RETRIES instead of "
             f"shipping a truncated script with a failure marker that would end up "
