@@ -24,7 +24,11 @@ MEDIA_ROOT = "/app/data/media"
 # and is the same engine already confirmed reliable on Marius. No built-in
 # rate/speed param is used here either; slowdown is applied once at the end
 # via ffmpeg atempo, same pattern the old gTTS/Chatterbox code already used.
-EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
+# FIX (2026-08-09, later same day): default voice was silently AriaNeural
+# (female) despite every brain doc documenting GuyNeural (male) as Nova's
+# voice since the original Edge TTS adoption. Corrected to match the
+# documented/intended voice.
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-GuyNeural")
 SLOWDOWN_FACTOR = "0.95"
 
 PAUSE_SECONDS_MIN = 1.0
