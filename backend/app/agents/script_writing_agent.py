@@ -1,3 +1,4 @@
+import time
 import uuid
 import re
 import requests
@@ -70,17 +71,74 @@ def _extract_script(raw: str) -> str | None:
     return None
 
 
+# RETRY-WITH-BACKOFF FIX (2026-08-09): same bug class already found and fixed
+# in Marius's call_llm() and TDP's generate_script.py - this loop retried 3
+# times but with ZERO backoff (retries fired back-to-back instantly, which
+# makes a transient 429/rate-limit or overloaded-server condition worse, not
+# better) and NEVER inspected response.status_code at all. A 429/500/502/503
+# from Pollinations just fell straight through to _extract_script(), silently
+# failed the code/markup check (or worse, sometimes an error body happened to
+# look enough like prose to slip past it), burned a retry attempt with no
+# logging of why, and offered the Pollinations backend zero recovery time
+# between hits. This now: (1) explicitly checks status_code against a
+# retryable set and backs off before retrying instead of hammering
+# immediately, (2) separates network-exceptions (timeout/connection-error)
+# from a bad response so each gets a clear log line, (3) still returns None
+# (not raises) after exhausting attempts, preserving run_script_writing()'s
+# existing "raise RuntimeError, no placeholder Script row" contract below -
+# only the retry behavior inside _generate_part changed.
+MAX_GENERATION_ATTEMPTS = 4
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_NETWORK_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
 def _generate_part(prompt: str, system_prompt: str) -> str | None:
     url = f"https://text.pollinations.ai/{quote(prompt)}"
-    for _ in range(3):
+    params = {"model": "openai", "system": system_prompt, "temperature": 0.9}
+    last_reason = None
+
+    for attempt in range(MAX_GENERATION_ATTEMPTS):
         try:
-            params = {"model": "openai", "system": system_prompt, "temperature": 0.9}
             response = requests.get(url, params=params, timeout=60)
-            extracted = _extract_script(response.text.strip())
-            if extracted:
-                return extracted
-        except Exception:
+        except RETRYABLE_NETWORK_EXCEPTIONS as e:
+            wait = (attempt + 1) * 10
+            last_reason = f"{e.__class__.__name__}: {e}"
+            print(f"Pollinations network error ({last_reason}), waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
             continue
+
+        if response.status_code in RETRYABLE_STATUS_CODES:
+            wait = (attempt + 1) * 10
+            last_reason = f"HTTP {response.status_code}"
+            print(f"Pollinations transient error ({last_reason}), waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}): {response.text[:200]}")
+            time.sleep(wait)
+            continue
+
+        if response.status_code != 200:
+            # Non-retryable HTTP error (4xx other than 429) - no point backing
+            # off and hammering the same bad request again, but still worth
+            # one more attempt in case it's an intermittent bad response body
+            # rather than a truly malformed request.
+            last_reason = f"HTTP {response.status_code} (non-retryable)"
+            print(f"Pollinations returned {last_reason}, attempt {attempt + 1}/"
+                  f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
+            continue
+
+        extracted = _extract_script(response.text.strip())
+        if extracted:
+            return extracted
+
+        last_reason = "200 OK but response failed narration-text validation " \
+                       "(empty, code/markup-like, or malformed envelope)"
+        print(f"Pollinations attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
+
+    print(f"Pollinations still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
     return None
 
 
@@ -234,7 +292,7 @@ def run_script_writing(db: Session, topic_id: str):
         f'not a generic "like and subscribe" ask. Write it to be spoken aloud by a human-'
         f'sounding narrator: vary sentence rhythm, use direct address and rhetorical '
         f'questions, favor concrete sensory detail over dry fact-listing. End this half at '
-        f'a natural cliffhanger, at or near what should feel like the story\'s lowest point '
+        f"a natural cliffhanger, at or near what should feel like the story's lowest point "
         f'or biggest reversal — do not conclude the video yet.'
     )
     part1 = _generate_part(part1_prompt, system_prompt)
@@ -242,9 +300,10 @@ def run_script_writing(db: Session, topic_id: str):
     if not part1:
         raise RuntimeError(
             f"Script generation failed on part 1 for topic {topic_id} "
-            f"(Pollinations returned nothing usable after 3 attempts) - no Script row "
-            f"created, will be retried by the supervisor up to MAX_RETRIES instead of "
-            f"saving a placeholder that would end up spoken aloud in the final video."
+            f"(Pollinations returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
+            f"backoff-spaced attempts) - no Script row created, will be retried by "
+            f"the supervisor up to MAX_RETRIES instead of saving a placeholder that "
+            f"would end up spoken aloud in the final video."
         )
 
     part2_prompt = (
@@ -259,7 +318,7 @@ def run_script_writing(db: Session, topic_id: str):
         f'again, exactly when viewers typically start to drift. Immediately after that '
         f'shift, add a short direct-address line explicitly teasing the single biggest '
         f'turning point still to come, and a second short direct-address line inviting '
-        f'the viewer\'s prediction or opinion on what happens next — both natural asides, '
+        f"the viewer's prediction or opinion on what happens next — both natural asides, "
         f'not ad breaks. Include one "false resolution" moment somewhere in this half '
         f'where something appears settled, then undercut it in the very next beat. Keep '
         f'the scale escalating — personal, then national, then civilizational stakes — '
@@ -279,10 +338,11 @@ def run_script_writing(db: Session, topic_id: str):
     if not part2:
         raise RuntimeError(
             f"Script generation failed on part 2 for topic {topic_id} "
-            f"(Pollinations returned nothing usable after 3 attempts, part 1 "
-            f"succeeded). No Script row created — will be retried by the supervisor "
-            f"up to MAX_RETRIES instead of shipping a truncated script with a "
-            f"failure marker that would end up spoken aloud in the final video."
+            f"(Pollinations returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
+            f"backoff-spaced attempts, part 1 succeeded). No Script row created — "
+            f"will be retried by the supervisor up to MAX_RETRIES instead of "
+            f"shipping a truncated script with a failure marker that would end up "
+            f"spoken aloud in the final video."
         )
 
     content = part1 + "\n\n" + part2
