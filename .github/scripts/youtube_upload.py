@@ -349,6 +349,7 @@ def main():
             print(f"Backend updated: topic {topic_id} marked status=used.")
     else:
         print("WARNING: video has no topic_id - cannot mark topic as used.")
+        
 
 def _print_failure_summary(exc):
     import traceback
