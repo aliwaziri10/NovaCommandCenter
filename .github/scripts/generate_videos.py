@@ -37,9 +37,9 @@ comparison: CONTENT-POLICY RETRY. Nova's channel covers WWII/historical-
 conflict topics (same territory that tripped Marius's content filter
 repeatedly - ethnicity/atrocity/war-crime terms in a shot description). Nova
 previously had no recovery path at all: a content_policy_violation just
-failed that shot permanently, no retry. Now mirrors Marius's fix: on a
-content_policy rejection, strips a fixed list of flagged terms from the shot
-description and retries once with the sanitized text before giving up.
+failed that shot permanently. Now mirrors Marius's fix: on a content_policy
+rejection, strips a fixed list of flagged terms from the shot description and
+retries once with the sanitized text before giving up.
 
 UPDATED (2026-08-10) - auto-select was observed silently returning "no videos
 need clips" for a video (424a809e) that had 13/15 clips filled and a
@@ -52,6 +52,18 @@ _find_next_video_needing_clips so the NEXT run's log shows exactly what type/
 value clip_urls and production_plan were for every non-assembled video, and
 exactly why each one was accepted or skipped - so this can be root-caused
 from real evidence instead of guessed at blind.
+
+UPDATED (2026-08-10, same day) - two shots on video 424a809e kept failing
+CONTENT POLICY REJECTED even after being reworded twice with completely
+different wording/subject matter (a marketplace scene, then a separate
+abstract desert-light scene). Since two unrelated prompts both failed the
+same way, the wording was never the actual trigger - the shared factor is
+that both were resumed mid-video and reusing the SAME reconstructed
+continuity-anchor image alongside an unrelated new scene description. Added
+a third fallback in `_submit_clip`: if a shot is still rejected after the
+text-sanitized retry, retry once more with the anchor image dropped
+(pure text-to-video) before giving up. Costs a small continuity hit on just
+the shot(s) that hit this path - better than a permanently stuck shot.
 """
 
 import os
@@ -432,8 +444,26 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized), num_frames, anchor_image_url
             )
+
+        # FIX (2026-08-10): text-only sanitization wasn't enough - two
+        # unrelated shots (different subjects, different wording) both kept
+        # failing content_policy after the sanitized retry. Since the shared
+        # factor was the reused continuity-anchor image, not the wording,
+        # fall back once more to pure text-to-video (no anchor image) before
+        # giving up entirely. Only attempted if an anchor was actually in use.
+        if was_content_policy and anchor_image_url:
+            print(
+                f"Shot {shot_index}: still content policy rejected with anchor image - "
+                f"retrying once more WITHOUT the continuity anchor (text-to-video only)."
+            )
+            agnes_video_id, error, was_content_policy = _submit_clip_raw(
+                _build_prompt(sanitized if sanitized and sanitized != description else description),
+                num_frames,
+                anchor_image_url=None,
+            )
+
         if was_content_policy:
-            return None, f"CONTENT POLICY REJECTED even after sanitized retry — reword this shot's description: {description!r}"
+            return None, f"CONTENT POLICY REJECTED even after sanitized retry and no-anchor retry — reword this shot's description: {description!r}"
 
     return agnes_video_id, error
 
