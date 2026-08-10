@@ -30,8 +30,14 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-GuyNeural")
 SLOWDOWN_FACTOR = "0.95"
 
+# FIX (2026-08-10): was alternating 1.0s/2.0s between sentences (average
+# ~1.5s, worst-case 2.0s - perceived as ~3s with slowdown/normalize stacked
+# on top). Flattened to a constant 1.0s. shot_durations is recomputed from
+# the real measured narration length AFTER this runs (see
+# _scale_shot_durations below), so shortening pauses here automatically
+# shortens the shots too - no separate video-sync fix needed.
 PAUSE_SECONDS_MIN = 1.0
-PAUSE_SECONDS_MAX = 2.0
+PAUSE_SECONDS_MAX = 1.0
 
 WORK_DIR = "/tmp/nova_narration"
 BACKEND_TIMEOUT = 120
