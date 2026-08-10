@@ -491,9 +491,6 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
             return None, f"CONTENT POLICY REJECTED even after sanitized, no-anchor, and generic-fallback retries — reword this shot's description: {description!r}"
 
     return agnes_video_id, error
-            return None, f"CONTENT POLICY REJECTED even after sanitized retry and no-anchor retry — reword this shot's description: {description!r}"
-
-    return agnes_video_id, error
 
 
 def _extract_video_url(data):
