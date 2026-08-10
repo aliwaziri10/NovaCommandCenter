@@ -40,6 +40,18 @@ previously had no recovery path at all: a content_policy_violation just
 failed that shot permanently, no retry. Now mirrors Marius's fix: on a
 content_policy rejection, strips a fixed list of flagged terms from the shot
 description and retries once with the sanitized text before giving up.
+
+UPDATED (2026-08-10) - auto-select was observed silently returning "no videos
+need clips" for a video (424a809e) that had 13/15 clips filled and a
+non-"assembled" status - i.e. it should have qualified under the existing
+filter but didn't get picked up in a real run. Root cause not yet confirmed
+(suspected: clip_urls arriving from the API in an unexpected shape, e.g. a
+JSON string instead of a parsed list, which would silently break the "how
+many are filled" count). Added per-video diagnostic logging to
+_find_next_video_needing_clips so the NEXT run's log shows exactly what type/
+value clip_urls and production_plan were for every non-assembled video, and
+exactly why each one was accepted or skipped - so this can be root-caused
+from real evidence instead of guessed at blind.
 """
 
 import os
@@ -198,25 +210,54 @@ def _find_next_video_needing_clips():
     resp.raise_for_status()
     videos = resp.json()
 
+    print(f"[auto-select] Backend returned {len(videos)} video(s) total. Evaluating each:")
+
     candidates = []
     for v in videos:
-        if v.get("status") == "assembled":
+        vid = v.get("id")
+        status = v.get("status")
+
+        if status == "assembled":
+            print(f"[auto-select] {vid} ({status}): SKIP - status is 'assembled'")
             continue
+
         production_plan = v.get("production_plan")
         if not production_plan:
+            print(f"[auto-select] {vid} ({status}): SKIP - no production_plan")
             continue
+
         shots = _parse_shots(production_plan)
         if not shots:
+            print(f"[auto-select] {vid} ({status}): SKIP - production_plan present but 0 shots parsed from it")
             continue
-        clip_urls = v.get("clip_urls") or []
+
+        clip_urls = v.get("clip_urls")
+        # DIAGNOSTIC: log the raw type of clip_urls as returned by the API,
+        # since a shape mismatch here (e.g. a JSON string instead of a list)
+        # would silently break the "how many are filled" count below without
+        # raising any error.
+        print(f"[auto-select] {vid} ({status}): clip_urls type={type(clip_urls).__name__}, raw={clip_urls!r}")
+
+        if not isinstance(clip_urls, list):
+            print(f"[auto-select] {vid} ({status}): SKIP - clip_urls is not a list (type={type(clip_urls).__name__}), treating as needing full regeneration is unsafe, flagging instead of guessing")
+            continue
+
         filled = sum(1 for u in clip_urls if u)
+        print(f"[auto-select] {vid} ({status}): {len(shots)} shots parsed, clip_urls length={len(clip_urls)}, filled={filled}")
+
         if filled < len(shots):
+            print(f"[auto-select] {vid} ({status}): CANDIDATE - {len(shots) - filled} shot(s) missing")
             candidates.append(v)
+        else:
+            print(f"[auto-select] {vid} ({status}): SKIP - all {len(shots)} shots already filled")
 
     if not candidates:
+        print("[auto-select] No candidates found after evaluating all videos.")
         return None
     candidates.sort(key=lambda v: v.get("created_at") or "")
-    return candidates[0]["id"]
+    chosen = candidates[0]["id"]
+    print(f"[auto-select] Chosen (earliest created_at among {len(candidates)} candidate(s)): {chosen}")
+    return chosen
 
 
 def build_character_reference_prompt(topic_title):
