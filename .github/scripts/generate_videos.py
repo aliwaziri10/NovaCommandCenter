@@ -441,6 +441,9 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
                 f"Shot {shot_index}: content policy rejected original description, "
                 f"retrying once with flagged terms stripped: {sanitized!r}"
             )
+            time.sleep(5)  # FIX (2026-08-10b): space out in-shot retries so a
+            # content-policy cascade doesn't burn Agnes's RPM budget and 429
+            # the NEXT shot in this same run (root cause of shot 11's 429).
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized), num_frames, anchor_image_url
             )
@@ -456,13 +459,38 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
                 f"Shot {shot_index}: still content policy rejected with anchor image - "
                 f"retrying once more WITHOUT the continuity anchor (text-to-video only)."
             )
+            time.sleep(5)  # FIX (2026-08-10b): same in-shot retry spacing
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized if sanitized and sanitized != description else description),
                 num_frames,
                 anchor_image_url=None,
             )
 
+        # FIX (2026-08-10b): shot 3 kept failing even after both prior retries,
+        # and its description contains none of the strip-list terms - the
+        # sanitized retry was a silent no-op. Since the real trigger is
+        # unknown without the raw Agnes rejection body, add one true
+        # last-resort attempt: drop the specific description entirely and
+        # submit only the generic camera/lighting/quality directives. This
+        # sacrifices scene specificity on just this one shot rather than
+        # leaving it permanently stuck.
         if was_content_policy:
+            print(
+                f"Shot {shot_index}: still content policy rejected - retrying once more "
+                f"with the specific description dropped entirely (generic fallback prompt)."
+            )
+            time.sleep(5)
+            generic_prompt = _build_prompt(
+                "a cinematic documentary establishing shot of the scene"
+            )
+            agnes_video_id, error, was_content_policy = _submit_clip_raw(
+                generic_prompt, num_frames, anchor_image_url=None
+            )
+
+        if was_content_policy:
+            return None, f"CONTENT POLICY REJECTED even after sanitized, no-anchor, and generic-fallback retries — reword this shot's description: {description!r}"
+
+    return agnes_video_id, error
             return None, f"CONTENT POLICY REJECTED even after sanitized retry and no-anchor retry — reword this shot's description: {description!r}"
 
     return agnes_video_id, error
