@@ -404,8 +404,9 @@ def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
     except requests.RequestException as e:
         return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}", False
 
-    if submit.status_code == 400 and "content_policy_violation" in submit.text:
-        return None, "content_policy_violation", True
+   if submit.status_code == 400 and "content_policy_violation" in submit.text:
+        print(f"[content-policy] Agnes rejection body: {submit.text[:500]}")
+        return None, f"content_policy_violation: {submit.text[:300]}", True
     if submit.status_code == 429:
         return None, "RATE LIMITED (429) — Agnes RPM exceeded, will retry next run", False
     if submit.status_code != 200:
