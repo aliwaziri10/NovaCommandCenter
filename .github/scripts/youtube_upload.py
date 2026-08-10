@@ -330,6 +330,7 @@ def main():
         json={"status": "uploaded", "youtube_video_id": youtube_video_id},
         timeout=60,
     )
+    
     if mark_resp.status_code >= 400:
         print(f"WARNING: upload succeeded but failed to mark backend as uploaded: {mark_resp.status_code} {mark_resp.text}")
     else:
