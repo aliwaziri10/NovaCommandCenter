@@ -404,7 +404,7 @@ def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
     except requests.RequestException as e:
         return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}", False
 
-  if submit.status_code == 400 and "content_policy_violation" in submit.text:
+    if submit.status_code == 400 and "content_policy_violation" in submit.text:
         print(f"[content-policy] Agnes rejection body: {submit.text[:500]}")
         return None, f"content_policy_violation: {submit.text[:300]}", True
     if submit.status_code == 429:
@@ -417,7 +417,6 @@ def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
     if not video_id:
         return None, f"no video_id/id/task_id in submit response: {data}", False
     return video_id, None, False
-
 
 def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
