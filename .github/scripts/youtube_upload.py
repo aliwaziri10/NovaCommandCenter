@@ -335,6 +335,19 @@ def main():
     else:
         print(f"Backend updated: video {video_id} marked status=uploaded, youtube_video_id={youtube_video_id}.")
 
+    topic_id = video.get("topic_id")
+    if topic_id:
+        topic_resp = requests.patch(
+            f"{RAILWAY_URL}/api/v1/topics/{topic_id}",
+            json={"status": "used"},
+            timeout=60,
+        )
+        if topic_resp.status_code >= 400:
+            print(f"WARNING: upload succeeded but failed to mark topic {topic_id} as used: {topic_resp.status_code} {topic_resp.text}")
+        else:
+            print(f"Backend updated: topic {topic_id} marked status=used.")
+    else:
+        print("WARNING: video has no topic_id - cannot mark topic as used.")
 
 def _print_failure_summary(exc):
     import traceback
