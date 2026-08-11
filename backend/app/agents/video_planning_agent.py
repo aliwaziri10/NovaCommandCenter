@@ -1,23 +1,22 @@
 import os
 import re
+import time
 import uuid
 import requests
-from urllib.parse import quote
 from sqlalchemy.orm import Session
 from app.models.script import Script
 from app.models.video import Video
 
-# FIX (2026-07-29): Pollinations retired the old standalone text.pollinations.ai
-# service and merged everything into one unified endpoint, gen.pollinations.ai.
-# The old URL was returning nothing usable on every call, which is why every
-# video-planning task for the last 6 days failed after 3 retries and no new
-# Video row ever got created. This was silent - the supervisor just kept
-# rescheduling the same doomed task forever instead of surfacing it as broken.
-# The new endpoint may also expect an API key (see POLLINATIONS_API_KEY below).
-# If a key turns out to be required, this will fail loudly with a clear error
-# instead of silently retrying forever like the old bug did.
-POLLINATIONS_TEXT_URL = "https://gen.pollinations.ai/text"
-POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")  # optional - free tier may not need one
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+
+MAX_GENERATION_ATTEMPTS = 4
+RETRYABLE_NETWORK_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
 
 
 def _strip_ad_footer(text: str) -> str:
@@ -49,14 +48,6 @@ def _is_refusal(text: str) -> bool:
 
 
 def _is_bad_response(raw: str) -> bool:
-    """Catches non-plan responses: broken JSON envelopes AND error/gateway
-    HTML pages (e.g. Cloudflare 502s from Pollinations' origin going down).
-    FIX (2026-07-24): previously only checked for JSON-shaped errors, so a
-    Cloudflare 502 HTML page (which is long and doesn't start with '{')
-    sailed past the len(raw) > 100 check and got saved into production_plan
-    as if it were a real shot plan. That HTML got repeated up to 6x across
-    the 3 query retries + 3 continuation attempts, exactly matching what
-    was found stored on video 77d9f6ee's production_plan field."""
     lowered = raw[:500].lower()
     if raw.startswith('{"role"') or '"reasoning"' in raw[:200] or raw.startswith('{"error"'):
         return True
@@ -68,13 +59,6 @@ def _is_bad_response(raw: str) -> bool:
     return False
 
 
-# Average narration pace and target clip length, used to scale the number of
-# shots requested to the actual length of the script section. Without this,
-# the model tended to produce roughly the same handful of shots regardless of
-# whether the section was 200 words or 2000 words. Assembly then froze the
-# last generated frame to stretch coverage across the full narration length,
-# which is why long scripts "felt" like they turned into a static image with
-# audio still playing underneath, even though nothing was technically cut off.
 NARRATION_WORDS_PER_SECOND = 2.5
 TARGET_SECONDS_PER_SHOT = 5
 
@@ -130,21 +114,70 @@ SYSTEM_PROMPT = (
 )
 
 
-def _query_pollinations(prompt: str) -> str | None:
-    url = f"{POLLINATIONS_TEXT_URL}/{quote(prompt)}"
-    params = {"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8}
-    if POLLINATIONS_API_KEY:
-        params["key"] = POLLINATIONS_API_KEY
-    for _ in range(3):
+def _call_gemini(prompt: str) -> str | None:
+    body_text = f"{SYSTEM_PROMPT}\n\n{prompt}"
+    last_reason = None
+
+    for attempt in range(MAX_GENERATION_ATTEMPTS):
         try:
-            response = requests.get(url, params=params, timeout=60)
-            raw = response.text.strip()
-            if _is_bad_response(raw):
-                continue
-            if len(raw) > 100:
-                return _strip_ad_footer(raw)
-        except Exception:
+            response = requests.post(
+                GEMINI_URL,
+                json={"contents": [{"parts": [{"text": body_text}]}]},
+                headers={"Content-Type": "application/json"},
+                timeout=90,
+            )
+        except RETRYABLE_NETWORK_EXCEPTIONS as e:
+            wait = (attempt + 1) * 15
+            last_reason = f"{e.__class__.__name__}: {e}"
+            print(f"Gemini network error ({last_reason}), waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
             continue
+
+        if response.status_code == 429:
+            wait = (attempt + 1) * 15
+            last_reason = "HTTP 429 rate limited"
+            print(f"Gemini rate limited, waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
+            continue
+
+        if response.status_code in (500, 502, 503, 504):
+            wait = (attempt + 1) * 15
+            last_reason = f"HTTP {response.status_code}"
+            print(f"Gemini transient error ({last_reason}), waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}): {response.text[:200]}")
+            time.sleep(wait)
+            continue
+
+        if response.status_code != 200:
+            last_reason = f"HTTP {response.status_code} (non-retryable)"
+            print(f"Gemini returned {last_reason}, attempt {attempt + 1}/"
+                  f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
+            continue
+
+        try:
+            raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except (requests.exceptions.JSONDecodeError, KeyError, IndexError) as e:
+            wait = (attempt + 1) * 15
+            last_reason = f"malformed response envelope ({e})"
+            print(f"Gemini {last_reason}, waiting {wait}s before retry "
+                  f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
+            time.sleep(wait)
+            continue
+
+        raw = raw_text.strip()
+        if _is_bad_response(raw):
+            last_reason = "200 OK but response looked like an error/markup envelope"
+            print(f"Gemini attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
+            continue
+        if len(raw) > 100:
+            return _strip_ad_footer(raw)
+
+        last_reason = "200 OK but response was too short to be a real plan"
+        print(f"Gemini attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
+
+    print(f"Gemini still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
     return None
 
 
@@ -160,76 +193,50 @@ def _continue_if_truncated(plan: str) -> str:
             f"line must start with the literal word 'Shot' followed by a number, "
             f"never 'Scene':\n\n{plan[-1500:]}"
         )
-        cont_url = f"{POLLINATIONS_TEXT_URL}/{quote(continuation_prompt)}"
-        cont_params = {"model": "openai", "system": SYSTEM_PROMPT, "temperature": 0.8}
-        if POLLINATIONS_API_KEY:
-            cont_params["key"] = POLLINATIONS_API_KEY
-        try:
-            cont_response = requests.get(cont_url, params=cont_params, timeout=60)
-            cont_raw = cont_response.text.strip()
-            if _is_bad_response(cont_raw):
-                break
-            cont_raw = _strip_ad_footer(cont_raw)
-            if _is_refusal(cont_raw):
-                break
-            if len(cont_raw) > 20:
-                plan = plan + "\n" + cont_raw
-            else:
-                break
-        except Exception:
+        cont_raw = _call_gemini(continuation_prompt)
+        if not cont_raw:
+            break
+        if _is_refusal(cont_raw):
+            break
+        if len(cont_raw) > 20:
+            plan = plan + "\n" + cont_raw
+        else:
             break
     return plan
 
 
 def run_video_planning(db: Session, script_id: str):
-    """Free version — generates a shot-by-shot breakdown from a script using Pollinations.ai.
-    Splits the script into two halves (matching how script_writing_agent generates it)
-    instead of truncating, so the full script gets shot-planned, not just the first ~6000 chars.
+    """Generates a shot-by-shot breakdown from a script using Gemini (see
+    PROVIDER SWITCH note - was Pollinations until 2026-08-11, switched for
+    the same reason and in the same way as script_writing_agent.py and
+    topic_research_agent.py: Pollinations' free text endpoint started failing
+    ('returned nothing usable' after 3 retries), matching the failure history
+    of every video_planning task back to 2026-07-24. Uses the same
+    GEMINI_API_KEY secret already set on Render for the other two agents.
 
     FAILURE FIX (2026-07-23): on a failed generation, this used to still create a
     Video row with the literal error string saved as production_plan. Since the
     supervisor's video_planning stage skips any script that already has a Video
     row - regardless of whether its plan is real - that permanently stranded the
-    script: no future retry ever ran, narration could still fire on it (it only
-    needs script content, not production_plan), but video_clips/assembly never
-    could (they require total_shots > 0, which a failure string parses to zero).
-    Now this raises instead, so the failure goes through the same Task/
+    script. Now this raises instead, so the failure goes through the same Task/
     _failed_attempts retry path every other agent already uses, and no broken
     Video row is ever created.
 
-    FAILURE FIX (2026-07-24): _query_pollinations previously only rejected
-    JSON-shaped error envelopes, not HTML error pages. A Cloudflare 502 page
-    from Pollinations' origin passed the len(raw) > 100 check and got saved
-    as production_plan verbatim. _is_bad_response() now also rejects HTML/
-    gateway-error pages, so this same failure mode raises and retries instead
-    of silently corrupting production_plan.
+    FAILURE FIX (2026-07-24): the bad-response check rejects HTML/gateway-error
+    pages as well as JSON-shaped error envelopes, so a malformed 200 OK response
+    can't get saved into production_plan verbatim. Still applied under Gemini as
+    a general malformed-output guard.
 
     FAILURE FIX (2026-07-25): if part 1 succeeded but part 2 failed, this used
-    to still ship a Video row with a broken "[Second half of shot plan failed
-    to generate — plan is incomplete]" marker tacked onto the end of a real
-    plan. That marker text isn't a parseable shot, so generate_videos.py just
-    silently produced clips for the (truncated) first half and the video came
-    out cut off — exactly what happened to the "Alexander" video's plan,
-    cutting off after 16 shots. Now a part-2 failure raises the same way a
-    part-1 failure does, so the whole thing retries via the supervisor's
-    normal retry path instead of quietly shipping a half-finished plan.
+    to still ship a Video row with a broken partial-plan marker. Now a part-2
+    failure raises the same way a part-1 failure does, so the whole thing
+    retries via the supervisor's normal retry path instead of quietly shipping
+    a half-finished plan.
 
-    FIX (2026-07-25): shot count is now explicitly scaled to the word count of
+    FIX (2026-07-25): shot count is explicitly scaled to the word count of
     each script half via _estimate_target_shots(), instead of being left
-    entirely up to the model's judgment. This addresses long scripts getting
-    the same small handful of shots as short ones, which forced assembly's
-    frozen-last-frame safety net to stretch a handful of real clips across
-    minutes of narration.
-
-    FIX (2026-07-29): switched from the retired text.pollinations.ai endpoint
-    to the current gen.pollinations.ai/text endpoint. The old endpoint was
-    silently dead - every call failed, every retry failed, and the supervisor
-    just kept rescheduling this task forever instead of surfacing it as
-    permanently broken. This is why no new video had been planned in 6 days
-    despite two scripts (cde377be, 1b31fbc5) sitting ready and waiting. Also
-    added optional POLLINATIONS_API_KEY support, since the new unified
-    endpoint's docs list a key parameter that the old free endpoint never
-    required."""
+    entirely up to the model's judgment.
+    """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
     if not script:
@@ -237,7 +244,6 @@ def run_video_planning(db: Session, script_id: str):
 
     full_content = script.content
     midpoint = len(full_content) // 2
-    # avoid splitting mid-sentence: snap to the nearest paragraph break near the midpoint
     split_at = full_content.rfind("\n\n", 0, midpoint + 200)
     if split_at == -1 or split_at < midpoint - 1000:
         split_at = midpoint
@@ -261,13 +267,14 @@ def run_video_planning(db: Session, script_id: str):
         f'Start directly with Shot 1. This is only the first half of the script — '
         f'end at a natural shot boundary, do not add a conclusion yet.'
     )
-    part1 = _query_pollinations(part1_prompt)
+    part1 = _call_gemini(part1_prompt)
 
     if not part1:
         raise RuntimeError(
             f"Video planning failed on part 1 for script {script_id} "
-            f"(Pollinations returned nothing usable after 3 attempts) - no Video row created, "
-            f"will be retried by the supervisor up to MAX_RETRIES."
+            f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
+            f"backoff-spaced attempts) - no Video row created, will be retried by "
+            f"the supervisor up to MAX_RETRIES."
         )
 
     part1 = _continue_if_truncated(part1)
@@ -287,14 +294,15 @@ def run_video_planning(db: Session, script_id: str):
         f'weather. Avoid close-ups of readable text or documents. Cover this '
         f'second half through to the end of the script.'
     )
-    part2 = _query_pollinations(part2_prompt)
+    part2 = _call_gemini(part2_prompt)
 
     if not part2:
         raise RuntimeError(
             f"Video planning failed on part 2 for script {script_id} "
-            f"(Pollinations returned nothing usable after 3 attempts, part 1 "
-            f"succeeded). No Video row created — will be retried by the "
-            f"supervisor up to MAX_RETRIES instead of shipping a truncated plan."
+            f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
+            f"backoff-spaced attempts, part 1 succeeded). No Video row created — "
+            f"will be retried by the supervisor up to MAX_RETRIES instead of "
+            f"shipping a truncated plan."
         )
 
     part2 = _continue_if_truncated(part2)
