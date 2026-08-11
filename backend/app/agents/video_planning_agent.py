@@ -62,12 +62,27 @@ def _is_bad_response(raw: str) -> bool:
 NARRATION_WORDS_PER_SECOND = 2.5
 TARGET_SECONDS_PER_SHOT = 5
 
+# CAP ADDED (2026-08-11): _estimate_target_shots previously had no ceiling, so
+# a long script (word count with no upper limit) could scale to an enormous
+# shot count - the first video run through this Gemini-switched pipeline came
+# out to 200 total shots (script ran long), versus every prior Nova video's
+# 13-16 shots. At generate_videos.py's BATCH_SIZE=20/hour, that alone is
+# roughly 10 hours of clip generation for ONE video before it can even reach
+# assembly - not sustainable for a channel that needs regular uploads. Capping
+# each half at MAX_SHOTS_PER_HALF keeps every future video's total shot count
+# in the same ballpark as the channel's historical videos, regardless of how
+# long the underlying script runs. This does NOT change how source shots are
+# written, only the ceiling passed to the model as its shot-count target -
+# a longer script will still just get proportionally longer individual shots
+# up to TARGET_SECONDS_PER_SHOT's pacing, rather than an unbounded shot count.
+MAX_SHOTS_PER_HALF = 25
+
 
 def _estimate_target_shots(script_text: str) -> int:
     word_count = len(script_text.split())
     narration_seconds = word_count / NARRATION_WORDS_PER_SECOND
     shots = round(narration_seconds / TARGET_SECONDS_PER_SHOT)
-    return max(3, shots)
+    return max(3, min(shots, MAX_SHOTS_PER_HALF))
 
 
 SYSTEM_PROMPT = (
@@ -83,11 +98,13 @@ SYSTEM_PROMPT = (
     "will silently drop any shot labeled 'Scene'.\n\n"
     "Shot count rule (critical):\n"
     "- The number of shots MUST scale with how much narration the section "
-    "contains. You will be told approximately how many shots to produce for "
-    "each section — treat that as a firm target, not a suggestion. Do not "
-    "collapse a long section into just a handful of shots; if there is a lot "
-    "of narration, there must be a correspondingly large number of shots "
-    "covering it, at roughly 5 seconds of story-content per shot.\n\n"
+    "contains, UP TO the target given to you. You will be told approximately "
+    "how many shots to produce for each section — treat that as a firm cap, "
+    "not just a floor. Do not collapse a long section into just a handful of "
+    "shots, but do NOT exceed the given target either — if there is a lot of "
+    "narration, let individual shots run longer (use the fuller end of the "
+    "5-8s duration range) rather than adding more shots than the target "
+    "allows.\n\n"
     "Duration rules:\n"
     "- Every shot MUST end with a line in the exact form 'Duration: Xs' with a "
     "specific number of seconds.\n"
@@ -236,6 +253,12 @@ def run_video_planning(db: Session, script_id: str):
     FIX (2026-07-25): shot count is explicitly scaled to the word count of
     each script half via _estimate_target_shots(), instead of being left
     entirely up to the model's judgment.
+
+    CAP ADDED (2026-08-11): _estimate_target_shots() now caps at
+    MAX_SHOTS_PER_HALF (25/half, 50 total) - see comment there. The first
+    video planned under the Gemini switch came out to 200 total shots with no
+    prior cap, which at generate_videos.py's clip-generation pace would have
+    taken roughly 10 hours for one video alone.
     """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
@@ -257,15 +280,18 @@ def run_video_planning(db: Session, script_id: str):
         f'Create a shot-by-shot video production plan for the FIRST HALF of this '
         f'script:\n\n{part1_script}\n\n'
         f'This first half is approximately {len(part1_script.split())} words of '
-        f'narration, so plan for approximately {part1_target_shots} shots to give '
-        f'it full visual coverage — do not underscope this to a small handful of '
-        f'shots. List each shot with camera direction, visual style, and estimated '
-        f'duration. Vary shot lengths naturally (short punchy cuts vs. longer '
-        f'holds) rather than using the same duration for every shot. Keep every '
-        f'shot brightly and clearly lit unless the script explicitly calls for '
-        f'night or bad weather. Avoid close-ups of readable text or documents. '
-        f'Start directly with Shot 1. This is only the first half of the script — '
-        f'end at a natural shot boundary, do not add a conclusion yet.'
+        f'narration. Plan for AT MOST {part1_target_shots} shots to give it full '
+        f'visual coverage — do not underscope this to a small handful of shots, '
+        f'but do not exceed {part1_target_shots} shots either; if there is a lot '
+        f'of narration, let individual shots run longer rather than adding more '
+        f'of them. List each shot with camera direction, visual style, and '
+        f'estimated duration. Vary shot lengths naturally (short punchy cuts vs. '
+        f'longer holds) rather than using the same duration for every shot. Keep '
+        f'every shot brightly and clearly lit unless the script explicitly calls '
+        f'for night or bad weather. Avoid close-ups of readable text or '
+        f'documents. Start directly with Shot 1. This is only the first half of '
+        f'the script — end at a natural shot boundary, do not add a conclusion '
+        f'yet.'
     )
     part1 = _call_gemini(part1_prompt)
 
@@ -283,10 +309,12 @@ def run_video_planning(db: Session, script_id: str):
         f'Continue the shot-by-shot production plan directly from where it left '
         f'off, for the SECOND HALF of the same script:\n\n{part2_script}\n\n'
         f'This second half is approximately {len(part2_script.split())} words of '
-        f'narration, so plan for approximately {part2_target_shots} shots to give '
-        f'it full visual coverage — do not underscope this to a small handful of '
-        f'shots. Here is the shot plan so far for context (do not repeat it, only '
-        f'continue numbering from the next shot number):\n\n{part1[-1500:]}\n\n'
+        f'narration. Plan for AT MOST {part2_target_shots} shots to give it full '
+        f'visual coverage — do not underscope this to a small handful of shots, '
+        f'but do not exceed {part2_target_shots} shots either; if there is a lot '
+        f'of narration, let individual shots run longer rather than adding more '
+        f'of them. Here is the shot plan so far for context (do not repeat it, '
+        f'only continue numbering from the next shot number):\n\n{part1[-1500:]}\n\n'
         f'Keep the same format: every shot starts with the literal word "Shot" '
         f'followed by a number (never "Scene"), and every shot ends with a '
         f'"Duration: Xs" line. Vary durations naturally. Keep every shot brightly '
