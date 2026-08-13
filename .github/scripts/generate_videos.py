@@ -64,6 +64,23 @@ a third fallback in `_submit_clip`: if a shot is still rejected after the
 text-sanitized retry, retry once more with the anchor image dropped
 (pure text-to-video) before giving up. Costs a small continuity hit on just
 the shot(s) that hit this path - better than a permanently stuck shot.
+
+UPDATED (2026-08-13) - ROOT CAUSE of videos 798b0d1a / eb26d018 getting
+permanently stuck at 83/95 and 70/80 clips: NOT actually a real Agnes RPM
+rate limit (despite the "RATE LIMITED (429)" label in the logs). Every
+content-policy retry chain (original+anchor -> sanitized -> no-anchor ->
+generic-fallback) was only spaced 5s apart, four Agnes calls in ~15-20s per
+shot. That rapid-fire retry burst was itself tripping a REAL 429 on the
+2nd or 3rd fallback attempt, before the shot ever reached the generic
+fallback prompt (which strips all shot-specific text and would almost
+certainly pass content policy). Result: the same 12 shots failed identically
+every single run, no matter how many times the supervisor retriggered it -
+there was no actual per-run rate-limit recovery happening, just a
+content-policy chain interrupted by a self-inflicted 429 every time.
+Fix: spaced retry attempts out to 20s (was 5s) and increased the
+base between-shot submit spacing (MIN_SECONDS_BETWEEN_SUBMITS) from 4s to
+10s, so the fallback chain has room to clear Agnes's RPM window before the
+generic-fallback attempt, which is the one actually likely to succeed.
 """
 
 import os
@@ -89,8 +106,9 @@ MAX_FRAMES = 169   # ~7s ceiling, matches Marius's MAX_CLIP_SECONDS
 DEFAULT_SHOT_SECONDS = 5.0  # only used if shot_durations is unavailable for this video
 MAX_WAIT_SECONDS = 240
 POLL_INTERVAL_SECONDS = 10
-MIN_SECONDS_BETWEEN_SUBMITS = 4
+MIN_SECONDS_BETWEEN_SUBMITS = 10  # FIX (2026-08-13): was 4 - too tight, let content-policy retry bursts trip real 429s
 AGNES_IMAGE_MAX_RETRIES = 3
+CONTENT_POLICY_RETRY_SPACING_SECONDS = 20  # FIX (2026-08-13): was 5 - too tight, see module docstring
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 
@@ -452,9 +470,12 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
                 f"Shot {shot_index}: content policy rejected original description, "
                 f"retrying once with flagged terms stripped: {sanitized!r}"
             )
-            time.sleep(5)  # FIX (2026-08-10b): space out in-shot retries so a
-            # content-policy cascade doesn't burn Agnes's RPM budget and 429
-            # the NEXT shot in this same run (root cause of shot 11's 429).
+            # FIX (2026-08-13): was 5s - too tight, letting the content-policy
+            # retry chain trip a REAL Agnes 429 before ever reaching the
+            # generic-fallback attempt below (which strips all shot-specific
+            # text and would almost certainly clear content policy). See
+            # module docstring for the full root-cause writeup.
+            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized), num_frames, anchor_image_url
             )
@@ -470,7 +491,7 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
                 f"Shot {shot_index}: still content policy rejected with anchor image - "
                 f"retrying once more WITHOUT the continuity anchor (text-to-video only)."
             )
-            time.sleep(5)  # FIX (2026-08-10b): same in-shot retry spacing
+            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)  # FIX (2026-08-13): was 5s, see above
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized if sanitized and sanitized != description else description),
                 num_frames,
@@ -490,7 +511,7 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
                 f"Shot {shot_index}: still content policy rejected - retrying once more "
                 f"with the specific description dropped entirely (generic fallback prompt)."
             )
-            time.sleep(5)
+            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)  # FIX (2026-08-13): was 5s, see above
             generic_prompt = _build_prompt(
                 "a cinematic documentary establishing shot of the scene"
             )
