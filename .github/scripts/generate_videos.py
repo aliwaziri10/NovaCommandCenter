@@ -229,8 +229,19 @@ def _find_next_video_needing_clips():
         vid = v.get("id")
         status = v.get("status")
 
-        if status == "assembled":
-            print(f"[auto-select] {vid} ({status}): SKIP - status is 'assembled'")
+        if status in ("assembled", "uploaded"):
+            # FIX (2026-08-13): previously only excluded 'assembled'. A video
+            # already published to YouTube ('uploaded') with a couple of
+            # permanently-failed clips (e.g. persistent content-policy
+            # rejection even after all fallback tiers) was the OLDEST
+            # candidate by created_at and kept getting auto-selected every
+            # single run, burning the whole run's batch on 2 unfixable shots
+            # of an already-live video - head-of-line-blocking every newer
+            # video behind it, identical to the bug pattern already found
+            # and fixed in Marius's video_generation.py. assemble.py already
+            # excludes both statuses correctly; this brings generate_videos.py
+            # in line with it.
+            print(f"[auto-select] {vid} ({status}): SKIP - status is '{status}' (already published or assembled, not worth generating further clips for)")
             continue
 
         production_plan = v.get("production_plan")
