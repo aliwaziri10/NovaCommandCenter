@@ -81,6 +81,25 @@ Fix: spaced retry attempts out to 20s (was 5s) and increased the
 base between-shot submit spacing (MIN_SECONDS_BETWEEN_SUBMITS) from 4s to
 10s, so the fallback chain has room to clear Agnes's RPM window before the
 generic-fallback attempt, which is the one actually likely to succeed.
+
+UPDATED (2026-08-15) - ROOT CAUSE of the SAME two videos (798b0d1a, eb26d018)
+still being permanently stuck even after the 2026-08-13 spacing fix: the
+2026-08-13 theory was incomplete. Both videos' stuck shots sit at IDENTICAL
+index-mod-8 phase (shot_index % 8 == 3) despite having completely unrelated
+scripts/topics - the actual constant across every failing shot is
+CAMERA_MOVES[3], "quick whip-pan reveal", which every one of these shots
+gets assigned via `shot_index % len(CAMERA_MOVES)`. Worse: the "generic
+fallback" tier that was supposed to be the last-resort, near-guaranteed-to-
+pass attempt was NOT actually generic - it still called `_build_prompt()`,
+which unconditionally re-injects `camera_move` (and `lens_style`) into every
+prompt including the fallback. So any shot whose camera_move phrase is the
+real trigger could never be rescued by ANY of the four retry tiers, forever.
+Two fixes: (1) `_build_prompt` now takes `include_camera`, and the true
+last-resort fallback call passes `include_camera=False` so it is finally a
+real minimal prompt with no camera-move phrase in it; (2) swapped the
+suspect "quick whip-pan reveal" phrase out of CAMERA_MOVES for a safer
+alternative, since it's the one common factor across every stuck shot on
+both videos.
 """
 
 import os
@@ -115,11 +134,15 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
+# FIX (2026-08-15): replaced "quick whip-pan reveal" (index 3) - identified as
+# the one common factor across every permanently-stuck shot on both
+# 798b0d1a and eb26d018 (see module docstring). Swapped for a safer phrase
+# with equivalent creative intent.
 CAMERA_MOVES = [
     "sweeping drone-style push-in",
     "fast tracking shot alongside the subject",
     "dramatic low-angle tilt up",
-    "quick whip-pan reveal",
+    "smooth rapid reveal shot",
     "slow dramatic zoom with parallax",
     "handheld tracking shot, urgent energy",
     "sweeping crane shot rising over the scene",
@@ -451,7 +474,20 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
 
-    def _build_prompt(desc):
+    def _build_prompt(desc, include_camera=True):
+        # FIX (2026-08-15): added include_camera. The true last-resort
+        # fallback below now calls this with include_camera=False so it is
+        # FINALLY a genuinely minimal prompt - previously it always
+        # re-injected camera_move/lens_style even on the "generic fallback"
+        # tier, which meant a shot whose camera_move phrase was the actual
+        # trigger could never be rescued by any retry path. See module
+        # docstring.
+        if not include_camera:
+            return (
+                f"{LIGHTING_DIRECTIVE}, {QUALITY_GUARD}, {ANACHRONISM_GUARD}, "
+                f"{desc}, shot by a Hollywood cinematographer, steady centered "
+                f"composition, documentary style, realistic motion, high detail"
+            )
         return (
             f"{LIGHTING_DIRECTIVE}, {QUALITY_GUARD}, {ANACHRONISM_GUARD}, "
             f"{desc}, shot by a Hollywood cinematographer, {camera_move}, {lens_style}, "
@@ -506,21 +542,26 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
         # submit only the generic camera/lighting/quality directives. This
         # sacrifices scene specificity on just this one shot rather than
         # leaving it permanently stuck.
+        #
+        # FIX (2026-08-15): this tier now ALSO drops camera_move/lens_style
+        # (include_camera=False) - previously it didn't, which is why shots
+        # whose camera_move phrase was the actual trigger stayed stuck
+        # through every tier including this one. See module docstring.
         if was_content_policy:
             print(
                 f"Shot {shot_index}: still content policy rejected - retrying once more "
-                f"with the specific description dropped entirely (generic fallback prompt)."
+                f"with the specific description AND camera move dropped entirely (true generic fallback)."
             )
             time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)  # FIX (2026-08-13): was 5s, see above
             generic_prompt = _build_prompt(
-                "a cinematic documentary establishing shot of the scene"
+                "a cinematic documentary establishing shot of the scene", include_camera=False
             )
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 generic_prompt, num_frames, anchor_image_url=None
             )
 
         if was_content_policy:
-            return None, f"CONTENT POLICY REJECTED even after sanitized, no-anchor, and generic-fallback retries — reword this shot's description: {description!r}"
+            return None, f"CONTENT POLICY REJECTED even after sanitized, no-anchor, and true-generic-fallback retries — reword this shot's description: {description!r}"
 
     return agnes_video_id, error
 
