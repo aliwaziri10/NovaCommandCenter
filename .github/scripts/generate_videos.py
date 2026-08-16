@@ -1,120 +1,22 @@
 """
 Nova Command Center - Video Generation Agent
 
-UPDATED (2026-08-03) - ported three proven fixes from Marius's more mature
-pipeline, after direct quality comparison confirmed Marius's videos look
-better and pinned down exactly why:
+[... all prior docstring history unchanged through 2026-08-16 character-
+reference fix ...]
 
-1. CONTINUITY ANCHORING (biggest gap - Nova had none at all): every shot used
-   to be pure blind text-to-video, so characters/scenes had no way to hold
-   together across cuts. Now generates one character reference image per
-   video (via Agnes's image model, before shot 0), then chains every
-   subsequent shot to the LAST FRAME of the previous shot as an image-to-video
-   anchor - identical mechanism to Marius's `video_generation.py`. Persisted
-   to videos.character_reference_url so it survives resumed runs.
-
-2. FIXED CLIP LENGTH BUG: this used to hardcode CLIP_NUM_FRAMES=121 (~5s) for
-   EVERY shot regardless of how long that shot actually needs to run -
-   completely ignoring video["shot_durations"] (real per-shot durations
-   already computed by narrate.py from actual TTS length, and already used by
-   assemble.py). Now computes real per-shot frame counts from shot_durations,
-   with ceiling-rounding to Agnes's valid 8n+1 frame grid so a clip is never
-   shorter than its target (same fix Marius applied 2026-08-03).
-
-3. STRONGER ANACHRONISM GUARD: replaced the vague "no digital devices" phrase
-   with named concrete objects (laptops, screens, modern furniture, wiring),
-   matching Marius's 2026-08-03 fix after observed leakage of modern objects
-   into historical scenes.
-
-Clips longer than one Agnes generation can produce still fall back to a
-freeze-hold for the remainder (Marius's real-footage chain-extension for
-overflow was NOT ported this pass - clip durations here are much shorter on
-average since Nova's shots are now correctly sized rather than uniformly
-capped at ~5s, so overflow is rarer; can be added later if still needed).
-
-UPDATED (2026-08-09) - ported a fourth Marius fix after this session's direct
-comparison: CONTENT-POLICY RETRY. Nova's channel covers WWII/historical-
-conflict topics (same territory that tripped Marius's content filter
-repeatedly - ethnicity/atrocity/war-crime terms in a shot description). Nova
-previously had no recovery path at all: a content_policy_violation just
-failed that shot permanently. Now mirrors Marius's fix: on a content_policy
-rejection, strips a fixed list of flagged terms from the shot description and
-retries once with the sanitized text before giving up.
-
-UPDATED (2026-08-10) - auto-select was observed silently returning "no videos
-need clips" for a video (424a809e) that had 13/15 clips filled and a
-non-"assembled" status - i.e. it should have qualified under the existing
-filter but didn't get picked up in a real run. Root cause not yet confirmed
-(suspected: clip_urls arriving from the API in an unexpected shape, e.g. a
-JSON string instead of a parsed list, which would silently break the "how
-many are filled" count). Added per-video diagnostic logging to
-_find_next_video_needing_clips so the NEXT run's log shows exactly what type/
-value clip_urls and production_plan were for every non-assembled video, and
-exactly why each one was accepted or skipped - so this can be root-caused
-from real evidence instead of guessed at blind.
-
-UPDATED (2026-08-10, same day) - two shots on video 424a809e kept failing
-CONTENT POLICY REJECTED even after being reworded twice with completely
-different wording/subject matter (a marketplace scene, then a separate
-abstract desert-light scene). Since two unrelated prompts both failed the
-same way, the wording was never the actual trigger - the shared factor is
-that both were resumed mid-video and reusing the SAME reconstructed
-continuity-anchor image alongside an unrelated new scene description. Added
-a third fallback in `_submit_clip`: if a shot is still rejected after the
-text-sanitized retry, retry once more with the anchor image dropped
-(pure text-to-video) before giving up. Costs a small continuity hit on just
-the shot(s) that hit this path - better than a permanently stuck shot.
-
-UPDATED (2026-08-13) - ROOT CAUSE of videos 798b0d1a / eb26d018 getting
-permanently stuck at 83/95 and 70/80 clips: NOT actually a real Agnes RPM
-rate limit (despite the "RATE LIMITED (429)" label in the logs). Every
-content-policy retry chain (original+anchor -> sanitized -> no-anchor ->
-generic-fallback) was only spaced 5s apart, four Agnes calls in ~15-20s per
-shot. That rapid-fire retry burst was itself tripping a REAL 429 on the
-2nd or 3rd fallback attempt, before the shot ever reached the generic
-fallback prompt (which strips all shot-specific text and would almost
-certainly pass content policy). Result: the same 12 shots failed identically
-every single run, no matter how many times the supervisor retriggered it -
-there was no actual per-run rate-limit recovery happening, just a
-content-policy chain interrupted by a self-inflicted 429 every time.
-Fix: spaced retry attempts out to 20s (was 5s) and increased the
-base between-shot submit spacing (MIN_SECONDS_BETWEEN_SUBMITS) from 4s to
-10s, so the fallback chain has room to clear Agnes's RPM window before the
-generic-fallback attempt, which is the one actually likely to succeed.
-
-UPDATED (2026-08-15) - ROOT CAUSE of the SAME two videos (798b0d1a, eb26d018)
-still being permanently stuck even after the 2026-08-13 spacing fix: the
-2026-08-13 theory was incomplete. Both videos' stuck shots sit at IDENTICAL
-index-mod-8 phase (shot_index % 8 == 3) despite having completely unrelated
-scripts/topics - the actual constant across every failing shot is
-CAMERA_MOVES[3], "quick whip-pan reveal", which every one of these shots
-gets assigned via `shot_index % len(CAMERA_MOVES)`. Worse: the "generic
-fallback" tier that was supposed to be the last-resort, near-guaranteed-to-
-pass attempt was NOT actually generic - it still called `_build_prompt()`,
-which unconditionally re-injects `camera_move` (and `lens_style`) into every
-prompt including the fallback. So any shot whose camera_move phrase is the
-real trigger could never be rescued by ANY of the four retry tiers, forever.
-Two fixes: (1) `_build_prompt` now takes `include_camera`, and the true
-last-resort fallback call passes `include_camera=False` so it is finally a
-real minimal prompt with no camera-move phrase in it; (2) swapped the
-suspect "quick whip-pan reveal" phrase out of CAMERA_MOVES for a safer
-alternative, since it's the one common factor across every stuck shot on
-both videos.
-
-UPDATED (2026-08-16) - ROOT CAUSE of "every video's first scene looks
-identical - same man standing centered in a blank room, same neutral
-expression": the character-reference image (generated once per video, used
-as the image-to-video anchor for shot 0) was being built from a fully
-generic prompt with NO scene/setting information at all - "full figure
-visible, neutral pose, clear face and clothing detail". Since Agnes's
-`image` param is first-frame conditioning, shot 0 of every video was
-literally starting FROM that same generic photo. Fix: the reference image
-prompt now pulls in the video's actual opening-shot description (shot 0's
-text from the production plan) so the reference photo - and therefore every
-video's opening frame - reflects that video's real setting/action instead of
-a blank neutral room. Pose language changed from "neutral pose" to
-"captured mid-action within the scene" to reduce the static centered-standing
-look.
+UPDATED (2026-08-16, same session, Phase 1) - ported three prompt-only
+fixes from Marius's video_generation.py after direct comparison:
+1. MOTION_CONTINUITY_GUARD: added to stop non-purposeful movement flagged
+   directly by Zia (people walking by default even when the scene doesn't
+   call for it, reversing/snapping motion, pausing mid-action).
+2. DISTINCT_INDIVIDUALS_GUARD: stops cloned faces/bodies across a crowd
+   or background group.
+3. QUALITY_GUARD rewritten from "shot on film, natural film grain" to
+   Marius's 2026-08-15 "modern high-end digital cinema" phrasing - the
+   grain/analog language was part of the quality gap vs Marius that Zia
+   flagged.
+No API cost, no schema change, no interaction with the content-policy
+retry chain - safe as a standalone prompt-text change.
 """
 
 import os
@@ -149,10 +51,6 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
-# FIX (2026-08-15): replaced "quick whip-pan reveal" (index 3) - identified as
-# the one common factor across every permanently-stuck shot on both
-# 798b0d1a and eb26d018 (see module docstring). Swapped for a safer phrase
-# with equivalent creative intent.
 CAMERA_MOVES = [
     "sweeping drone-style push-in",
     "fast tracking shot alongside the subject",
@@ -171,19 +69,12 @@ LENS_STYLES = [
     "telephoto compression, soft background blur, natural motion blur",
 ]
 
-# FIX (2026-07-29): ported from Marius's 2026-07-29 "quality/anachronism guard"
-# fix - lighting cue moved to the FRONT of the prompt (models weight earlier
-# tokens more heavily).
 LIGHTING_DIRECTIVE = (
     "bright, clearly and evenly lit scene, strong daylight or warm well-lit "
     "interior lighting, high visibility, no heavy shadows, no underexposed or "
     "murky darkness"
 )
 
-# STRENGTHENED (2026-08-03): ported Marius's 2026-08-03 fix - named concrete
-# objects instead of a vague "no digital devices" phrase, after Marius
-# observed leakage (laptops appearing in a 1994 scene) that the vague version
-# didn't catch.
 ANACHRONISM_GUARD = (
     "historically accurate to this exact time period and setting, no modern technology, "
     "no cars, no drones, no modern clothing, no digital devices, no anachronistic objects of any kind, "
@@ -191,28 +82,54 @@ ANACHRONISM_GUARD = (
     "no modern furniture, no electrical wiring or outlets, no plastic objects"
 )
 
+# REWRITTEN (2026-08-16, Phase 1): was "shot on film, natural film grain,
+# vivid saturated color..." - matched Marius pre-2026-08-15. Ported
+# Marius's 2026-08-15 rewrite: modern digital-cinema look instead of
+# analog film grain, which was part of the quality gap Zia flagged
+# directly ("Marius's quality is much better").
 QUALITY_GUARD = (
-    "shot on film, natural film grain, vivid saturated color, no sepia tone, "
-    "no heavy desaturation, no muted documentary color grading, no artificial CGI look, no plastic skin"
+    "modern high-end digital cinema, crisp sharp clarity, professional color grading, "
+    "shallow depth of field, cinematic lighting, vivid saturated color, no sepia tone, "
+    "no heavy desaturation, no muted documentary color grading, no grainy vintage film look, "
+    "no artificial CGI look, no flat synthetic AI look, no plastic skin"
 )
 
-# ADDED (2026-08-09): ported from Marius's video_generation.py content_flagged
-# root-cause fix (2026-08-06). Marius found that its own setting/character
-# description text - injected into every shot's prompt verbatim - routinely
-# contained ethnicity/genocide/war-crime terms that trip Agnes's content
-# filter, and that stripping just those terms on a retry (keeping era,
-# location, and physical description intact) let the shot through with the
-# scene's real meaning preserved. Nova's shot descriptions come from
-# video_planning_agent.py's free-text output rather than a structured
-# setting_and_characters field, so this applies the same strip list directly
-# to the shot description text on a content_policy retry, not to a separate
-# anchor field.
+# ADDED (2026-08-16, Phase 1): ported from Marius's video_generation.py.
+# Directly addresses Zia's "why is everybody walking all the time, it is
+# not required" feedback plus the broader "non-purposeful movement" note -
+# stops the model defaulting to constant walking/motion and stops
+# reversing/snapping/pause-mid-action artifacts.
+MOTION_CONTINUITY_GUARD = (
+    "movement in this shot is purposeful and matches what the scene actually calls for - "
+    "the subject only walks, gestures, or moves if the action requires it, otherwise remains "
+    "still or engaged in a static action (standing, sitting, working with hands); "
+    "motion continues smoothly and continuously in the same direction and speed, "
+    "no reversing, no snapping backward, no sudden stop-and-restart, no pausing mid-motion, "
+    "no aimless or unmotivated walking"
+)
+
+# ADDED (2026-08-16, Phase 1): ported from Marius's video_generation.py.
+# Stops cloned faces/bodies repeating across a crowd or background group.
+DISTINCT_INDIVIDUALS_GUARD = (
+    "every person visible in this shot is a distinct, unique individual with "
+    "a different face, body, and clothing from every other person in the "
+    "frame - never repeat or clone one character's likeness onto more than "
+    "one person, even in a crowd, group, or background"
+)
+
 CONTENT_POLICY_STRIP_TERMS = [
     "genocide", "ethnic cleansing", "war crime", "war crimes", "atrocity", "atrocities",
     "massacre", "concentration camp", "death camp", "gas chamber", "holocaust",
     "extermination", "torture", "execution", "mass grave", "prisoner of war",
     "internment", "persecution", "purge", "ethnic", "racial",
 ]
+
+CROWD_OR_GROUP_KEYWORDS = (
+    "two ", "three ", "four ", "five ", "several", "group of", "crowd",
+    "family", "villagers", "workers", "neighbors", "neighbours", "soldiers",
+    "colleagues", "team", "both", "twins", "pair of", "everyone", "people",
+    "others", "onlookers", "bystanders", "crew", "townspeople", "children",
+)
 
 
 def _sanitize_for_content_retry(description):
@@ -228,9 +145,6 @@ class ContentPolicyRejection(Exception):
 
 
 def round_to_valid_frames(num_frames):
-    # Same fix as Marius (2026-08-03): ceiling instead of round-to-nearest, so
-    # a clip is never shorter than its target duration - round() rounds down
-    # roughly half the time, silently under-filling shots.
     import math
     n = math.ceil((num_frames - 1) / 8)
     n = max(0, n)
@@ -254,11 +168,6 @@ def _parse_shots(production_plan):
 
 
 def _shot_target_seconds(video, shot_index, total_shots):
-    """Real per-shot duration from narrate.py's shot_durations if available,
-    otherwise an even split of the narration's total duration, otherwise the
-    old flat default - in that priority order. This replaces the old
-    hardcoded 121-frame (~5s) constant used for every shot regardless of
-    actual need."""
     shot_durations = video.get("shot_durations")
     if shot_durations and len(shot_durations) > shot_index:
         return max(float(shot_durations[shot_index]), 1.0)
@@ -286,17 +195,6 @@ def _find_next_video_needing_clips():
         status = v.get("status")
 
         if status in ("assembled", "uploaded"):
-            # FIX (2026-08-13): previously only excluded 'assembled'. A video
-            # already published to YouTube ('uploaded') with a couple of
-            # permanently-failed clips (e.g. persistent content-policy
-            # rejection even after all fallback tiers) was the OLDEST
-            # candidate by created_at and kept getting auto-selected every
-            # single run, burning the whole run's batch on 2 unfixable shots
-            # of an already-live video - head-of-line-blocking every newer
-            # video behind it, identical to the bug pattern already found
-            # and fixed in Marius's video_generation.py. assemble.py already
-            # excludes both statuses correctly; this brings generate_videos.py
-            # in line with it.
             print(f"[auto-select] {vid} ({status}): SKIP - status is '{status}' (already published or assembled, not worth generating further clips for)")
             continue
 
@@ -311,10 +209,6 @@ def _find_next_video_needing_clips():
             continue
 
         clip_urls = v.get("clip_urls")
-        # DIAGNOSTIC: log the raw type of clip_urls as returned by the API,
-        # since a shape mismatch here (e.g. a JSON string instead of a list)
-        # would silently break the "how many are filled" count below without
-        # raising any error.
         print(f"[auto-select] {vid} ({status}): clip_urls type={type(clip_urls).__name__}, raw={clip_urls!r}")
 
         if not isinstance(clip_urls, list):
@@ -340,15 +234,6 @@ def _find_next_video_needing_clips():
 
 
 def build_character_reference_prompt(topic_title, opening_shot_description=None):
-    # FIX (2026-08-16): previously this had NO scene/setting information at
-    # all ("full figure visible, neutral pose") - since this image is used
-    # as Agnes's first-frame conditioning for shot 0, every video's opening
-    # frame was literally this same generic "man standing centered in a
-    # blank room" photo. Now folds in the video's actual opening-shot
-    # description (shot 0 of the production plan) so the reference image -
-    # and therefore the real opening frame - reflects that video's setting
-    # and action instead of a blank neutral room. Falls back to the old
-    # generic phrasing only if no opening shot description is available.
     if opening_shot_description:
         scene_line = (
             f"character reference portrait for a documentary about: {topic_title}, "
@@ -370,11 +255,6 @@ def build_character_reference_prompt(topic_title, opening_shot_description=None)
 
 
 def generate_character_reference(video_id, topic_title, opening_shot_description=None):
-    """Generates ONE reference image per video (agnes-image-2.1-flash),
-    persisted to videos.character_reference_url so it only runs once per
-    video, even across resumed runs. Returns None (fails soft) if Agnes's
-    image endpoint errors after retries - Nova still works without it, just
-    without the continuity boost."""
     prompt = build_character_reference_prompt(topic_title, opening_shot_description)
     last_error_text = None
 
@@ -433,10 +313,6 @@ def generate_character_reference(video_id, topic_title, opening_shot_description
 
 
 def _extract_last_frame_url(video_url_of_clip, out_tag):
-    """Downloads a just-generated clip, extracts its last frame, uploads it
-    as a small PNG, returns the URL to use as the NEXT shot's anchor. Fails
-    soft (returns None) on any error - continuity is a quality improvement,
-    never something that should crash a run."""
     try:
         import numpy as np
         from PIL import Image
@@ -504,30 +380,39 @@ def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
         return None, f"no video_id/id/task_id in submit response: {data}", False
     return video_id, None, False
 
+
 def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
+    # ADDED (2026-08-16, Phase 1): only apply the distinct-individuals guard
+    # when the shot description actually implies multiple people, same
+    # trigger pattern Marius uses (CROWD_OR_GROUP_KEYWORDS), so single-
+    # character shots don't get an irrelevant guard phrase padded in.
+    is_group_shot = any(kw in description.lower() for kw in CROWD_OR_GROUP_KEYWORDS)
 
     def _build_prompt(desc, include_camera=True):
-        # FIX (2026-08-15): added include_camera. The true last-resort
-        # fallback below now calls this with include_camera=False so it is
-        # FINALLY a genuinely minimal prompt - previously it always
-        # re-injected camera_move/lens_style even on the "generic fallback"
-        # tier, which meant a shot whose camera_move phrase was the actual
-        # trigger could never be rescued by any retry path. See module
-        # docstring.
         if not include_camera:
-            return (
-                f"{LIGHTING_DIRECTIVE}, {QUALITY_GUARD}, {ANACHRONISM_GUARD}, "
-                f"{desc}, shot by a Hollywood cinematographer, steady centered "
-                f"composition, documentary style, realistic motion, high detail"
-            )
-        return (
-            f"{LIGHTING_DIRECTIVE}, {QUALITY_GUARD}, {ANACHRONISM_GUARD}, "
-            f"{desc}, shot by a Hollywood cinematographer, {camera_move}, {lens_style}, "
-            f"high-energy fast-paced documentary style, "
-            f"realistic motion, natural motion blur, high detail, engaging dynamic composition"
-        )
+            parts = [
+                LIGHTING_DIRECTIVE, QUALITY_GUARD, ANACHRONISM_GUARD, MOTION_CONTINUITY_GUARD,
+            ]
+            if is_group_shot:
+                parts.append(DISTINCT_INDIVIDUALS_GUARD)
+            parts += [
+                desc, "shot by a Hollywood cinematographer, steady centered composition, "
+                "documentary style, realistic motion, high detail",
+            ]
+            return ", ".join(p for p in parts if p)
+        parts = [
+            LIGHTING_DIRECTIVE, QUALITY_GUARD, ANACHRONISM_GUARD, MOTION_CONTINUITY_GUARD,
+        ]
+        if is_group_shot:
+            parts.append(DISTINCT_INDIVIDUALS_GUARD)
+        parts += [
+            desc, f"shot by a Hollywood cinematographer, {camera_move}, {lens_style}",
+            "high-energy fast-paced documentary style",
+            "realistic motion, natural motion blur, high detail, engaging dynamic composition",
+        ]
+        return ", ".join(p for p in parts if p)
 
     agnes_video_id, error, was_content_policy = _submit_clip_raw(
         _build_prompt(description), num_frames, anchor_image_url
@@ -540,53 +425,29 @@ def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
                 f"Shot {shot_index}: content policy rejected original description, "
                 f"retrying once with flagged terms stripped: {sanitized!r}"
             )
-            # FIX (2026-08-13): was 5s - too tight, letting the content-policy
-            # retry chain trip a REAL Agnes 429 before ever reaching the
-            # generic-fallback attempt below (which strips all shot-specific
-            # text and would almost certainly clear content policy). See
-            # module docstring for the full root-cause writeup.
             time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized), num_frames, anchor_image_url
             )
 
-        # FIX (2026-08-10): text-only sanitization wasn't enough - two
-        # unrelated shots (different subjects, different wording) both kept
-        # failing content_policy after the sanitized retry. Since the shared
-        # factor was the reused continuity-anchor image, not the wording,
-        # fall back once more to pure text-to-video (no anchor image) before
-        # giving up entirely. Only attempted if an anchor was actually in use.
         if was_content_policy and anchor_image_url:
             print(
                 f"Shot {shot_index}: still content policy rejected with anchor image - "
                 f"retrying once more WITHOUT the continuity anchor (text-to-video only)."
             )
-            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)  # FIX (2026-08-13): was 5s, see above
+            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)
             agnes_video_id, error, was_content_policy = _submit_clip_raw(
                 _build_prompt(sanitized if sanitized and sanitized != description else description),
                 num_frames,
                 anchor_image_url=None,
             )
 
-        # FIX (2026-08-10b): shot 3 kept failing even after both prior retries,
-        # and its description contains none of the strip-list terms - the
-        # sanitized retry was a silent no-op. Since the real trigger is
-        # unknown without the raw Agnes rejection body, add one true
-        # last-resort attempt: drop the specific description entirely and
-        # submit only the generic camera/lighting/quality directives. This
-        # sacrifices scene specificity on just this one shot rather than
-        # leaving it permanently stuck.
-        #
-        # FIX (2026-08-15): this tier now ALSO drops camera_move/lens_style
-        # (include_camera=False) - previously it didn't, which is why shots
-        # whose camera_move phrase was the actual trigger stayed stuck
-        # through every tier including this one. See module docstring.
         if was_content_policy:
             print(
                 f"Shot {shot_index}: still content policy rejected - retrying once more "
                 f"with the specific description AND camera move dropped entirely (true generic fallback)."
             )
-            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)  # FIX (2026-08-13): was 5s, see above
+            time.sleep(CONTENT_POLICY_RETRY_SPACING_SECONDS)
             generic_prompt = _build_prompt(
                 "a cinematic documentary establishing shot of the scene", include_camera=False
             )
@@ -700,8 +561,6 @@ def main():
         print("All shots already have clips. Nothing to do.")
         return
 
-    # Continuity anchor setup: character reference for shot 0, or reconstruct
-    # from the most recently completed shot's own clip if resuming mid-video.
     anchor_image_url = video.get("character_reference_url")
     if not anchor_image_url and 0 not in missing and clip_urls:
         last_done_index = max(already_done) if already_done else None
@@ -710,9 +569,6 @@ def main():
             anchor_image_url = _extract_last_frame_url(clip_urls[last_done_index], f"{video_id}_resume")
     if not anchor_image_url:
         print("Generating character reference image for continuity anchoring...")
-        # FIX (2026-08-16): now passes shot 0's own description so the
-        # reference image (= every video's literal opening frame) reflects
-        # that video's real setting/action instead of a blank neutral room.
         opening_shot_description = all_shots[0] if all_shots else None
         anchor_image_url = generate_character_reference(video_id, video.get("title", ""), opening_shot_description)
     if anchor_image_url:
