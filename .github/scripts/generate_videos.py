@@ -100,6 +100,21 @@ real minimal prompt with no camera-move phrase in it; (2) swapped the
 suspect "quick whip-pan reveal" phrase out of CAMERA_MOVES for a safer
 alternative, since it's the one common factor across every stuck shot on
 both videos.
+
+UPDATED (2026-08-16) - ROOT CAUSE of "every video's first scene looks
+identical - same man standing centered in a blank room, same neutral
+expression": the character-reference image (generated once per video, used
+as the image-to-video anchor for shot 0) was being built from a fully
+generic prompt with NO scene/setting information at all - "full figure
+visible, neutral pose, clear face and clothing detail". Since Agnes's
+`image` param is first-frame conditioning, shot 0 of every video was
+literally starting FROM that same generic photo. Fix: the reference image
+prompt now pulls in the video's actual opening-shot description (shot 0's
+text from the production plan) so the reference photo - and therefore every
+video's opening frame - reflects that video's real setting/action instead of
+a blank neutral room. Pose language changed from "neutral pose" to
+"captured mid-action within the scene" to reduce the static centered-standing
+look.
 """
 
 import os
@@ -324,10 +339,29 @@ def _find_next_video_needing_clips():
     return chosen
 
 
-def build_character_reference_prompt(topic_title):
+def build_character_reference_prompt(topic_title, opening_shot_description=None):
+    # FIX (2026-08-16): previously this had NO scene/setting information at
+    # all ("full figure visible, neutral pose") - since this image is used
+    # as Agnes's first-frame conditioning for shot 0, every video's opening
+    # frame was literally this same generic "man standing centered in a
+    # blank room" photo. Now folds in the video's actual opening-shot
+    # description (shot 0 of the production plan) so the reference image -
+    # and therefore the real opening frame - reflects that video's setting
+    # and action instead of a blank neutral room. Falls back to the old
+    # generic phrasing only if no opening shot description is available.
+    if opening_shot_description:
+        scene_line = (
+            f"character reference portrait for a documentary about: {topic_title}, "
+            f"positioned within this exact opening scene: {opening_shot_description}"
+        )
+        pose_line = "captured mid-action within the scene, natural candid moment, not posed, not centered, clear face and clothing detail"
+    else:
+        scene_line = f"character reference portrait for a documentary about: {topic_title}"
+        pose_line = "full figure visible, natural candid pose, clear face and clothing detail"
+
     parts = [
-        f"character reference portrait for a documentary about: {topic_title}",
-        "full figure visible, neutral pose, clear face and clothing detail",
+        scene_line,
+        pose_line,
         LIGHTING_DIRECTIVE,
         QUALITY_GUARD,
         ANACHRONISM_GUARD,
@@ -335,13 +369,13 @@ def build_character_reference_prompt(topic_title):
     return ", ".join(p for p in parts if p)
 
 
-def generate_character_reference(video_id, topic_title):
+def generate_character_reference(video_id, topic_title, opening_shot_description=None):
     """Generates ONE reference image per video (agnes-image-2.1-flash),
     persisted to videos.character_reference_url so it only runs once per
     video, even across resumed runs. Returns None (fails soft) if Agnes's
     image endpoint errors after retries - Nova still works without it, just
     without the continuity boost."""
-    prompt = build_character_reference_prompt(topic_title)
+    prompt = build_character_reference_prompt(topic_title, opening_shot_description)
     last_error_text = None
 
     for attempt in range(AGNES_IMAGE_MAX_RETRIES):
@@ -676,7 +710,11 @@ def main():
             anchor_image_url = _extract_last_frame_url(clip_urls[last_done_index], f"{video_id}_resume")
     if not anchor_image_url:
         print("Generating character reference image for continuity anchoring...")
-        anchor_image_url = generate_character_reference(video_id, video.get("title", ""))
+        # FIX (2026-08-16): now passes shot 0's own description so the
+        # reference image (= every video's literal opening frame) reflects
+        # that video's real setting/action instead of a blank neutral room.
+        opening_shot_description = all_shots[0] if all_shots else None
+        anchor_image_url = generate_character_reference(video_id, video.get("title", ""), opening_shot_description)
     if anchor_image_url:
         print(f"Using continuity anchor: {anchor_image_url}")
     else:
