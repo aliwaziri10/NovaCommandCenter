@@ -159,3 +159,231 @@ def wake_up_backend(max_attempts=4):
             )
             return resp
         except requests.exceptions.ReadTimeout:
+            print(f"Backend not awake yet (attempt {attempt}/{max_attempts}): read timeout after {BACKEND_TIMEOUT}s")
+        except requests.exceptions.ConnectionError as e:
+            print(f"Backend not reachable yet (attempt {attempt}/{max_attempts}): {e}")
+
+        if attempt < max_attempts:
+            wait = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            print(f"Waiting {wait}s before retry...")
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Backend at {RAILWAY_URL} did not respond after {max_attempts} attempts. "
+        "Check Render dashboard for deploy/crash status."
+    )
+
+
+def _get_youtube_access_token():
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": YOUTUBE_CLIENT_ID,
+            "client_secret": YOUTUBE_CLIENT_SECRET,
+            "refresh_token": YOUTUBE_REFRESH_TOKEN,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _get_authorized_channel(access_token):
+    """Asks YouTube which channel the current access token is actually
+    authorized for. This is how we tell Ali's two client_id/refresh_token
+    pairs apart without having to do a live upload to find out."""
+    resp = requests.get(
+        "https://www.googleapis.com/youtube/v3/channels",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"part": "snippet", "mine": "true"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+    if not items:
+        raise RuntimeError(
+            "YouTube API returned no channel for these credentials - the token "
+            "may be invalid, expired, or missing the youtube.upload/youtube.readonly scope."
+        )
+    channel = items[0]
+    return channel["id"], channel["snippet"]["title"]
+
+
+def _find_next_video_to_upload(videos):
+    candidates = [
+        v for v in videos
+        if v.get("status") == "assembled" and not v.get("youtube_video_id")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda v: v.get("created_at") or "")
+    return candidates[0]
+
+
+def _upload_to_youtube(video_bytes, title, description, access_token):
+    metadata = {
+        "snippet": {
+            "title": title[:100],
+            "description": description[:5000],
+            "categoryId": "27",  # Education
+        },
+        "status": {
+            "privacyStatus": UPLOAD_PRIVACY_STATUS,
+        },
+    }
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    init_resp = requests.post(
+        "https://www.googleapis.com/upload/youtube/v3/videos"
+        "?uploadType=resumable&part=snippet,status",
+        headers={**headers, "X-Upload-Content-Type": "video/mp4"},
+        json=metadata,
+        timeout=60,
+    )
+    init_resp.raise_for_status()
+    upload_url = init_resp.headers["Location"]
+
+    upload_resp = requests.put(
+        upload_url,
+        headers={"Content-Type": "video/mp4"},
+        data=video_bytes,
+        timeout=600,
+    )
+    upload_resp.raise_for_status()
+    return upload_resp.json()
+
+
+def main():
+    print("Getting YouTube access token and verifying which channel it's authorized for...")
+    access_token = _get_youtube_access_token()
+    channel_id, channel_title = _get_authorized_channel(access_token)
+    print(f"These credentials are authorized for channel: {channel_title!r} ({channel_id})")
+
+    if channel_title.strip().lower() != EXPECTED_CHANNEL_TITLE.lower():
+        raise RuntimeError(
+            f"REFUSING TO UPLOAD: these credentials authorize {channel_title!r}, not the "
+            f"expected {EXPECTED_CHANNEL_TITLE!r}. This is the wrong YT_CLIENT_ID/YT_REFRESH_TOKEN "
+            f"pair for Nova. Fix: on youtube.com signed in as ziawaziri@gmail.com, switch the active "
+            f"channel to {EXPECTED_CHANNEL_TITLE}, redo the OAuth consent flow to get a matching "
+            f"client_id/refresh_token pair, then update the YT_CLIENT_ID/YT_CLIENT_SECRET/"
+            f"YT_REFRESH_TOKEN secrets on this repo. No video was downloaded or uploaded."
+        )
+    print(f"Channel verified ({EXPECTED_CHANNEL_TITLE}) - proceeding.")
+
+    print(f"Uploads will be marked '{UPLOAD_PRIVACY_STATUS}' (Zia reviews and publishes manually).")
+
+    print("Waking backend and fetching video list...")
+    resp = wake_up_backend()
+    resp.raise_for_status()
+    videos = resp.json()
+
+    video_id = VIDEO_ID
+    if video_id:
+        video = next((v for v in videos if v.get("id") == video_id), None)
+        if not video:
+            print(f"ERROR: video_id {video_id} not found")
+            sys.exit(1)
+    else:
+        print("No VIDEO_ID provided - auto-selecting next assembled video ready for upload...")
+        video = _find_next_video_to_upload(videos)
+        if not video:
+            print("No assembled videos currently waiting for upload. Exiting cleanly.")
+            return
+        video_id = video["id"]
+        print(f"Auto-selected video_id: {video_id}")
+
+    title = video.get("title") or "Untitled"
+    description = video.get("description") or ""
+
+    print("Attempting to build chapter markers...")
+    shot_durations = video.get("shot_durations")
+    script_content = None
+    script_id = video.get("script_id")
+    if script_id:
+        try:
+            script_resp = requests.get(f"{RAILWAY_URL}/api/v1/scripts/{script_id}", timeout=BACKEND_TIMEOUT)
+            script_resp.raise_for_status()
+            script_content = script_resp.json().get("content")
+        except Exception as e:
+            print(f"Could not fetch script for chapter titles: {e}")
+
+    chapters_block = _build_chapters_block(shot_durations, script_content)
+    if chapters_block:
+        description = chapters_block + "\n\n" + description if description else chapters_block
+        print("Chapter markers added to description:")
+        print(chapters_block)
+    else:
+        print("Proceeding without chapter markers.")
+
+    print(f"Downloading final video file for {video_id}...")
+    file_resp = requests.get(
+        f"{RAILWAY_URL}/api/v1/download/videos/{video_id}",
+        timeout=300,
+    )
+    file_resp.raise_for_status()
+    video_bytes = file_resp.content
+    print(f"Downloaded {len(video_bytes)} bytes.")
+
+    print("Uploading to YouTube...")
+    result = _upload_to_youtube(video_bytes, title, description, access_token)
+    youtube_video_id = result.get("id")
+    print(f"SUCCESS: uploaded (privacyStatus={UPLOAD_PRIVACY_STATUS}) as https://youtube.com/watch?v={youtube_video_id}")
+
+    print("Marking video as uploaded in backend...")
+    # NOTE: there is no dedicated /mark-uploaded endpoint on this backend -
+    # that route was never built (confirmed by reading main.py's registered
+    # routers). The generic CRUD router DOES support PATCH on /videos/{id},
+    # so we use that instead.
+    mark_resp = requests.patch(
+        f"{RAILWAY_URL}/api/v1/videos/{video_id}",
+        json={"status": "uploaded", "youtube_video_id": youtube_video_id},
+        timeout=60,
+    )
+    
+    if mark_resp.status_code >= 400:
+        print(f"WARNING: upload succeeded but failed to mark backend as uploaded: {mark_resp.status_code} {mark_resp.text}")
+    else:
+        print(f"Backend updated: video {video_id} marked status=uploaded, youtube_video_id={youtube_video_id}.")
+
+    topic_id = video.get("topic_id")
+    if topic_id:
+        topic_resp = requests.patch(
+            f"{RAILWAY_URL}/api/v1/topics/{topic_id}",
+            json={"status": "used"},
+            timeout=60,
+        )
+        if topic_resp.status_code >= 400:
+            print(f"WARNING: upload succeeded but failed to mark topic {topic_id} as used: {topic_resp.status_code} {topic_resp.text}")
+        else:
+            print(f"Backend updated: topic {topic_id} marked status=used.")
+    else:
+        print("WARNING: video has no topic_id - cannot mark topic as used.")
+        
+
+def _print_failure_summary(exc):
+    import traceback
+    tb = traceback.extract_tb(exc.__traceback__)
+    location = "unknown"
+    for frame in tb:
+        if frame.filename.endswith("youtube_upload.py"):
+            location = f"{frame.name}() line {frame.lineno}"
+    print("\n" + "=" * 60)
+    print("FAILURE SUMMARY (read this first)")
+    print("=" * 60)
+    print("Script:        youtube_upload.py")
+    print(f"Failed in:     {location}")
+    print(f"Error type:    {type(exc).__name__}")
+    print(f"Error message: {str(exc)[:400]}")
+    print(f"RAILWAY_URL:   {RAILWAY_URL}")
+    print(f"VIDEO_ID:      {VIDEO_ID or '(auto-select)'}")
+    print("=" * 60)
+    print("Full traceback follows below for reference.\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        _print_failure_summary(e)
+        raise
