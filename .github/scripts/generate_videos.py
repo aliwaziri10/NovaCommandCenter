@@ -18,6 +18,19 @@ text description with no image anchor passed forward. Character-reference
 generation and last-frame extraction functions are left in this file
 unused (not deleted) in case a future single-protagonist format wants
 chaining back - cheap to revert, zero cost to leave dormant.
+
+UPDATED (2026-08-17): Fixed _parse_shots() returning 0 shots on production
+plans where each shot's description is on the line(s) AFTER "Shot N:"
+instead of inline on the same line. Confirmed live on video 446872f6
+(The Catholic Crown): every one of its 100 shots used the header-then-
+description-on-next-line format, so the old logic (which only ever read
+text remaining on the "Shot N:" line itself) stripped the header and was
+left with an empty string for every shot, parsed 0 shots, and crashed the
+whole run in <20s, 3 times in a row (see KNOWN_BUGS.md - this exact drift
+risk was flagged and predicted before it happened). Rewritten to
+accumulate all lines belonging to a shot - inline text on the header line
+AND any following lines - until the next "Shot N:" marker or a blank
+line. Backward-compatible with the old single-line inline format.
 """
 
 import os
@@ -140,19 +153,52 @@ def round_to_valid_frames(num_frames):
     return 8 * n + 1
 
 
+def _clean_shot_text(text):
+    text = re.split(r"\*{0,2}Duration\*{0,2}\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = re.split(r"\bCamera\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = text.replace("**", "").replace("*", "").strip().rstrip(".").strip()
+    return text
+
+
 def _parse_shots(production_plan):
+    # FIX (2026-08-17): previously only ever read text remaining on the
+    # "Shot N:" line itself. Some production plans (confirmed live on
+    # 446872f6 / The Catholic Crown) put the description on the line(s)
+    # AFTER the "Shot N:" header instead of inline - that format silently
+    # produced 0 parsed shots every time. Now accumulates every line
+    # belonging to a shot (inline text on the header line, plus any
+    # following lines) until the next "Shot N:" marker or a blank line.
     shots = []
-    for line in production_plan.splitlines():
-        line = line.strip()
-        if not SHOT_START.match(line):
+    current_parts = []
+
+    def flush():
+        if not current_parts:
+            return
+        text = _clean_shot_text(" ".join(current_parts))
+        if text:
+            shots.append(text)
+        current_parts.clear()
+
+    for raw_line in production_plan.splitlines():
+        line = raw_line.strip()
+
+        if SHOT_START.match(line):
+            flush()
+            remainder = SHOT_START.sub("", line, count=1).strip()
+            remainder = re.sub(r"^[\s:\-–\*]+", "", remainder)
+            if remainder:
+                current_parts.append(remainder)
             continue
-        remainder = SHOT_START.sub("", line).strip()
-        remainder = re.sub(r"^[\s:\-–\*]+", "", remainder)
-        remainder = re.split(r"\*{0,2}Duration\*{0,2}\s*:", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
-        remainder = re.split(r"\bCamera\s*:", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
-        remainder = remainder.replace("**", "").replace("*", "").strip().rstrip(".").strip()
-        if remainder:
-            shots.append(remainder)
+
+        if not line:
+            # blank line ends the current shot's description block
+            flush()
+            continue
+
+        if current_parts:
+            current_parts.append(line)
+
+    flush()
     return shots
 
 
