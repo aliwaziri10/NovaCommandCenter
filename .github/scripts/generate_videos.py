@@ -1,22 +1,23 @@
 """
 Nova Command Center - Video Generation Agent
 
-[... all prior docstring history unchanged through 2026-08-16 character-
-reference fix ...]
+[... all prior docstring history unchanged through 2026-08-16 Phase 1 ...]
 
-UPDATED (2026-08-16, same session, Phase 1) - ported three prompt-only
-fixes from Marius's video_generation.py after direct comparison:
-1. MOTION_CONTINUITY_GUARD: added to stop non-purposeful movement flagged
-   directly by Zia (people walking by default even when the scene doesn't
-   call for it, reversing/snapping motion, pausing mid-action).
-2. DISTINCT_INDIVIDUALS_GUARD: stops cloned faces/bodies across a crowd
-   or background group.
-3. QUALITY_GUARD rewritten from "shot on film, natural film grain" to
-   Marius's 2026-08-15 "modern high-end digital cinema" phrasing - the
-   grain/analog language was part of the quality gap vs Marius that Zia
-   flagged.
-No API cost, no schema change, no interaction with the content-policy
-retry chain - safe as a standalone prompt-text change.
+UPDATED (2026-08-16, same session): REMOVED last-frame-to-next-shot image
+anchoring entirely. Root cause diagnosis: Nova's production plans are
+documentary-style, jumping between dozens of distinct unrelated figures
+shot to shot (e.g. Leonov, Korolev, Nixon, unnamed generals, "the host")
+- not a single continuous protagonist. Last-frame chaining is a mechanism
+built for content that follows one character continuously; applied to
+this content it caused whatever face Agnes generated blind for shot 1 to
+propagate and bleed into unrelated shots for the rest of the video
+(confirmed directly against a live published video's production_plan and
+clip data - the same face appeared across shots about entirely different,
+unrelated people). Every shot now generates independently from its own
+text description with no image anchor passed forward. Character-reference
+generation and last-frame extraction functions are left in this file
+unused (not deleted) in case a future single-protagonist format wants
+chaining back - cheap to revert, zero cost to leave dormant.
 """
 
 import os
@@ -82,11 +83,6 @@ ANACHRONISM_GUARD = (
     "no modern furniture, no electrical wiring or outlets, no plastic objects"
 )
 
-# REWRITTEN (2026-08-16, Phase 1): was "shot on film, natural film grain,
-# vivid saturated color..." - matched Marius pre-2026-08-15. Ported
-# Marius's 2026-08-15 rewrite: modern digital-cinema look instead of
-# analog film grain, which was part of the quality gap Zia flagged
-# directly ("Marius's quality is much better").
 QUALITY_GUARD = (
     "modern high-end digital cinema, crisp sharp clarity, professional color grading, "
     "shallow depth of field, cinematic lighting, vivid saturated color, no sepia tone, "
@@ -94,11 +90,6 @@ QUALITY_GUARD = (
     "no artificial CGI look, no flat synthetic AI look, no plastic skin"
 )
 
-# ADDED (2026-08-16, Phase 1): ported from Marius's video_generation.py.
-# Directly addresses Zia's "why is everybody walking all the time, it is
-# not required" feedback plus the broader "non-purposeful movement" note -
-# stops the model defaulting to constant walking/motion and stops
-# reversing/snapping/pause-mid-action artifacts.
 MOTION_CONTINUITY_GUARD = (
     "movement in this shot is purposeful and matches what the scene actually calls for - "
     "the subject only walks, gestures, or moves if the action requires it, otherwise remains "
@@ -108,8 +99,6 @@ MOTION_CONTINUITY_GUARD = (
     "no aimless or unmotivated walking"
 )
 
-# ADDED (2026-08-16, Phase 1): ported from Marius's video_generation.py.
-# Stops cloned faces/bodies repeating across a crowd or background group.
 DISTINCT_INDIVIDUALS_GUARD = (
     "every person visible in this shot is a distinct, unique individual with "
     "a different face, body, and clothing from every other person in the "
@@ -234,6 +223,8 @@ def _find_next_video_needing_clips():
 
 
 def build_character_reference_prompt(topic_title, opening_shot_description=None):
+    # UNUSED as of 2026-08-16 (chaining removed) - left in place, dormant,
+    # in case a future single-protagonist format wants chaining back.
     if opening_shot_description:
         scene_line = (
             f"character reference portrait for a documentary about: {topic_title}, "
@@ -255,6 +246,7 @@ def build_character_reference_prompt(topic_title, opening_shot_description=None)
 
 
 def generate_character_reference(video_id, topic_title, opening_shot_description=None):
+    # UNUSED as of 2026-08-16 (chaining removed) - left in place, dormant.
     prompt = build_character_reference_prompt(topic_title, opening_shot_description)
     last_error_text = None
 
@@ -313,6 +305,7 @@ def generate_character_reference(video_id, topic_title, opening_shot_description
 
 
 def _extract_last_frame_url(video_url_of_clip, out_tag):
+    # UNUSED as of 2026-08-16 (chaining removed) - left in place, dormant.
     try:
         import numpy as np
         from PIL import Image
@@ -384,10 +377,6 @@ def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
 def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
     camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
-    # ADDED (2026-08-16, Phase 1): only apply the distinct-individuals guard
-    # when the shot description actually implies multiple people, same
-    # trigger pattern Marius uses (CROWD_OR_GROUP_KEYWORDS), so single-
-    # character shots don't get an irrelevant guard phrase padded in.
     is_group_shot = any(kw in description.lower() for kw in CROWD_OR_GROUP_KEYWORDS)
 
     def _build_prompt(desc, include_camera=True):
@@ -561,20 +550,11 @@ def main():
         print("All shots already have clips. Nothing to do.")
         return
 
-    anchor_image_url = video.get("character_reference_url")
-    if not anchor_image_url and 0 not in missing and clip_urls:
-        last_done_index = max(already_done) if already_done else None
-        if last_done_index is not None and clip_urls[last_done_index]:
-            print(f"Resuming mid-video - reconstructing continuity anchor from shot {last_done_index + 1}'s clip...")
-            anchor_image_url = _extract_last_frame_url(clip_urls[last_done_index], f"{video_id}_resume")
-    if not anchor_image_url:
-        print("Generating character reference image for continuity anchoring...")
-        opening_shot_description = all_shots[0] if all_shots else None
-        anchor_image_url = generate_character_reference(video_id, video.get("title", ""), opening_shot_description)
-    if anchor_image_url:
-        print(f"Using continuity anchor: {anchor_image_url}")
-    else:
-        print("No continuity anchor available - shots will generate blind (text-to-video only) this run.")
+    # CHANGED (2026-08-16): chaining removed entirely - every shot generates
+    # independently from its own text description. No character reference
+    # image, no last-frame anchor extraction/propagation. See module
+    # docstring for the diagnosis behind this.
+    print("Chaining is disabled - every shot will generate independently from text only.")
 
     batch = missing[:BATCH_SIZE]
     print(f"This run will process {len(batch)} shot(s): {batch}")
@@ -598,7 +578,7 @@ def main():
 
         last_submit_time = time.monotonic()
         print(f"Shot {index+1}/{total}: target {target_seconds:.1f}s ({num_frames} frames)")
-        agnes_video_id, error = _submit_clip(description, index, num_frames, anchor_image_url=anchor_image_url)
+        agnes_video_id, error = _submit_clip(description, index, num_frames, anchor_image_url=None)
 
         if not agnes_video_id:
             failure_reasons.append(f"shot {index}: {error}")
@@ -611,8 +591,6 @@ def main():
             if url:
                 clip_urls[index] = url
                 print(f"Shot {index+1}/{total}: OK -> {url}")
-                next_anchor = _extract_last_frame_url(url, f"{video_id}_shot{index:03d}")
-                anchor_image_url = next_anchor or anchor_image_url
             else:
                 failure_reasons.append(f"shot {index}: {error}")
                 print(f"Shot {index+1}/{total}: FAILED ({error})")
