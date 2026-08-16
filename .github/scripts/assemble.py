@@ -58,6 +58,12 @@ FFMPEG_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
+# DIAGNOSTIC (2026-08-16): accumulates every shot's (target, actual, pad)
+# across the whole run so we can print a summary at the end confirming or
+# ruling out "Agnes systematically returns clips shorter than requested" as
+# the cause of near-universal freeze-hold padding at scene ends.
+_FREEZE_PAD_LOG = []
+
 
 def _parse_shots_count(production_plan):
     count = 0
@@ -150,7 +156,7 @@ def _still_image_clip(image_path, duration):
     return framed
 
 
-def _fit_clip_to_duration(clip, target_duration, fps=24):
+def _fit_clip_to_duration(clip, target_duration, fps=24, shot_index=None):
     """FIX (2026-08-03): the old version of this file did
     `clip.set_duration(clip.duration)` when a downloaded clip was SHORTER
     than the shot's target duration - a no-op that silently left the shot
@@ -159,7 +165,23 @@ def _fit_clip_to_duration(clip, target_duration, fps=24):
     never actually being honored. Now holds the final frame for the missing
     remainder, same mechanism Marius uses (`fit_clip_to_duration` in
     Marius's `video_generation.py`), so every shot always reaches its real
-    target duration."""
+    target duration.
+
+    DIAGNOSTIC (2026-08-16): Zia flagged a 0.5-0.8s freeze-hold on nearly
+    EVERY scene, not occasionally - which points at Agnes systematically
+    returning clips a bit shorter than the requested frame count, rather
+    than a rare edge case. Logging every shot's (target, actual, pad) here
+    so the next real run's output confirms or rules that out with real
+    numbers instead of a guess.
+    """
+    pad = max(target_duration - clip.duration, 0.0)
+    _FREEZE_PAD_LOG.append((shot_index, target_duration, clip.duration, pad))
+    if pad > 0:
+        print(
+            f"  [freeze-pad] shot {shot_index}: target={target_duration:.2f}s, "
+            f"actual clip duration={clip.duration:.2f}s, freeze-hold pad={pad:.2f}s"
+        )
+
     if clip.duration >= target_duration:
         return clip.subclip(0, target_duration)
 
@@ -169,7 +191,7 @@ def _fit_clip_to_duration(clip, target_duration, fps=24):
     return concatenate_videoclips([clip, freeze_frame])
 
 
-def _video_clip(video_path, duration):
+def _video_clip(video_path, duration, shot_index=None):
     target_w, target_h = RESOLUTION
     base_clip = VideoFileClip(video_path)
     src_w, src_h = base_clip.size
@@ -185,7 +207,7 @@ def _video_clip(video_path, duration):
     # FIX (2026-08-03): was `clip.set_duration(clip.duration)` here (a no-op)
     # when the clip came back shorter than needed - see _fit_clip_to_duration
     # docstring above for why this matters.
-    clip = _fit_clip_to_duration(clip, duration)
+    clip = _fit_clip_to_duration(clip, duration, shot_index=shot_index)
 
     clip = clip.crossfadein(min(CROSSFADE, clip.duration / 2))
     return clip
@@ -221,7 +243,7 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
                 continue
         try:
             if use_clips:
-                clip = _video_clip(media_path, dur)
+                clip = _video_clip(media_path, dur, shot_index=i)
             else:
                 clip = _still_image_clip(media_path, dur)
             clips.append(clip)
@@ -452,6 +474,18 @@ def main():
     if not block_paths:
         print("ERROR: all shots failed: " + str(all_errors))
         sys.exit(1)
+
+    # DIAGNOSTIC (2026-08-16): summarize freeze-pad across the whole run so
+    # this is visible without scrolling through per-shot logs.
+    if _FREEZE_PAD_LOG:
+        padded = [x for x in _FREEZE_PAD_LOG if x[3] > 0]
+        total = len(_FREEZE_PAD_LOG)
+        avg_pad = (sum(x[3] for x in padded) / len(padded)) if padded else 0.0
+        print(
+            f"[freeze-pad SUMMARY] {len(padded)}/{total} shots this run needed a freeze-hold pad "
+            f"(avg pad where padded: {avg_pad:.2f}s). If this is most/all shots, Agnes is "
+            f"systematically returning clips shorter than the requested frame count."
+        )
 
     with open(concat_list_path, "w") as f:
         for p in block_paths:
