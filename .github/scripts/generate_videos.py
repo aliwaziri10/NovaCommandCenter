@@ -56,6 +56,34 @@ every CAMERA_VARIATION_INTERVAL_SECONDS regardless of how many shots (or
 how few) land inside that window. lens_style stays shot_index-keyed for
 intra-bucket variety. main() now tracks cumulative elapsed target-seconds
 across the batch loop and passes it into _submit_clip.
+
+UPDATED (2026-08-19, later same session): FREEZE-PAD FIX (Phase 2b).
+MAX_FRAMES was 169 (~7.04s ceiling, matching Marius's single-generation
+cap). Marius compensates any shot that exceeds that cap with real
+chain-extension footage (see MAX_CHAIN_SEGMENTS in Marius's
+video_generation.py) - Nova has no equivalent mechanism yet. Any Nova
+shot with a target duration over ~7.04s was silently capped at 169
+frames by this constant, then freeze-held for the shortfall in
+assemble.py's _fit_clip_to_duration. This is the confirmed mechanism
+behind Zia's 2026-08-16 report of a small (0.5-0.8s) freeze-hold on
+nearly every scene - narration-driven shot target durations landing just
+past the old 7.04s cap, which is common since shot_durations are derived
+from real narration length, not chosen to fit Agnes's per-call ceiling.
+Raised to 241 frames (~10.04s, still a valid 8n+1 Agnes frame count) to
+cover the realistic range of narration-driven shot durations without a
+freeze. Shots still needing more than ~10.04s will still freeze-pad the
+remainder in assemble.py until real chain-extension (matching Marius's
+mechanism - downloading each Agnes segment, extracting its last frame as
+the next segment's anchor, and concatenating them into one clip before
+upload) is ported to this file. That port is deferred, not yet built: it
+requires this file to gain local video download/moviepy/re-upload
+capability it does not currently have (today it only calls Agnes and
+stores the URL Agnes returns - it never touches the video bytes
+locally), plus confirming the backend has (or adding) a clip-upload
+endpoint equivalent to the existing /api/v1/upload/reference/{tag} used
+by the dormant character-reference functions below. Raising MAX_FRAMES
+is the safe, self-contained fix for the common case reported so far;
+true chain-extension is the follow-up for shots that still exceed it.
 """
 
 import os
@@ -77,7 +105,11 @@ CLIP_HEIGHT = 768
 CLIP_WIDTH = 1152
 CLIP_FRAME_RATE = 24
 MIN_FRAMES = 49    # ~2s floor, matches Marius
-MAX_FRAMES = 169   # ~7s ceiling, matches Marius's MAX_CLIP_SECONDS
+# FREEZE-PAD FIX (2026-08-19, Phase 2b - see module docstring): was 169
+# (~7.04s ceiling). Raised to 241 (~10.04s, still a valid 8n+1 frame
+# count) so narration-driven shot durations landing just past the old
+# cap no longer get silently truncated and freeze-padded at assembly.
+MAX_FRAMES = 241   # ~10s ceiling (was 169/~7s) - see FREEZE-PAD FIX note above
 DEFAULT_SHOT_SECONDS = 5.0  # only used if shot_durations is unavailable for this video
 MAX_WAIT_SECONDS = 240
 POLL_INTERVAL_SECONDS = 10
