@@ -209,6 +209,14 @@ def run_script_writing(db: Session, topic_id: str):
     (also appended, not replacing existing instructions) so the cold
     open + chapter markers actually land in generated output, not just
     in the unused-at-inference system_prompt description.
+
+    UPDATED (2026-08-19, item #9): added new Rule 8 (specific numbers/
+    facts at a steady rate throughout the ENTIRE script, not just the
+    opening) to system_prompt, appended after Rule 7 — none of the
+    other rules were touched or renumbered. part1_prompt and
+    part2_prompt each got a matching instruction so the pacing actually
+    lands in generated output in both halves, not just the unused-at-
+    inference system_prompt description.
     """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -362,7 +370,16 @@ def run_script_writing(db: Session, topic_id: str):
         "use 'in summary', 'to sum up', 'to wrap up', 'in conclusion', or any similar "
         "explicit summary-language framing anywhere in the script, especially the ending — "
         "the callback twist itself must do the work of closing the story; it must never be "
-        "announced as a summary."
+        "announced as a summary.\n\n"
+        "8. SPECIFIC NUMBERS AND FACTS AT A STEADY RATE (do not front-load then go "
+        "abstract): throughout the ENTIRE script — not just the opening — include a "
+        "concrete, specific number, date, quantity, distance, percentage, or verifiable "
+        "fact roughly every 100-150 words. These must be real and verifiable, never "
+        "invented for dramatic effect. Never let a long stretch run on vague language "
+        "('a huge amount', 'many years', 'a massive army') when a specific figure is "
+        "available and would land harder. Specificity is what makes the story feel real "
+        "and researched, not vague scene-setting — spread it evenly across the whole "
+        "runtime, including the back half, not just the hook."
     )
 
     strategy_notes = _latest_strategy_notes(db)
@@ -406,7 +423,11 @@ def run_script_writing(db: Session, topic_id: str):
         f'stake — then into (3) RISING DELIVERY, the escalating turning points described '
         f'above. The cold-open moment must be a real turning point that recurs again, in '
         f'its proper chronological place, later in the full script — not an invented '
-        f'one-off.'
+        f'one-off. '
+        f'Throughout this half, ground the story with a specific number, date, quantity, '
+        f'distance, percentage, or verifiable fact roughly every 100-150 words — real '
+        f'and verifiable only, never invented, and never left vague when a real figure '
+        f'exists.'
     )
     part1 = _generate_part(part1_prompt, system_prompt)
 
@@ -458,7 +479,11 @@ def run_script_writing(db: Session, topic_id: str):
         f'understand that opening moment meant something different than it first '
         f'appeared, now that the full story, including how that moment actually resolved '
         f'chronologically, is known. Do not repeat the first half — only write the new '
-        f'continuation, starting with [CHAPTER: ...] then [SCENE 4].'
+        f'continuation, starting with [CHAPTER: ...] then [SCENE 4]. '
+        f'Keep grounding the story with a specific number, date, quantity, distance, '
+        f'percentage, or verifiable fact roughly every 100-150 words throughout this '
+        f'half too — spread evenly across the back half, not just clustered near the '
+        f'start, and only ever real, verifiable figures.'
     )
     part2 = _generate_part(part2_prompt, system_prompt)
 
