@@ -190,6 +190,13 @@ def run_script_writing(db: Session, topic_id: str):
       (rhetorical questions, "imagine...", "picture this...") the prompt
       already relies on for its engagement/emotional-arc rules — those are
       unaffected and remain in place.
+
+    UPDATED (2026-08-19, item #12): Rule 7 now explicitly forbids
+    "in summary" / "to wrap up" / "in conclusion" style closing language.
+    Same handoff, next item in sequence. part2_prompt's ending instruction
+    (which is what actually drives the generated closing beat) gets the
+    matching instruction so the ban isn't just in the unused-at-inference
+    system_prompt description but in the part that shapes the real output.
     """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -295,7 +302,11 @@ def run_script_writing(db: Session, topic_id: str):
         "Reconnect explicitly to the concrete image or claim from the opening hook (rule 1) "
         "and reveal that it meant something different than it first appeared, now that the "
         "full story is known. End with a one-line tease of a related next-episode angle so "
-        "the video sets up series continuity, without over-promising a specific title."
+        "the video sets up series continuity, without over-promising a specific title. NEVER "
+        "use 'in summary', 'to sum up', 'to wrap up', 'in conclusion', or any similar "
+        "explicit summary-language framing anywhere in the script, especially the ending — "
+        "the callback twist itself must do the work of closing the story; it must never be "
+        "announced as a summary."
     )
 
     strategy_notes = _latest_strategy_notes(db)
@@ -364,8 +375,11 @@ def run_script_writing(db: Session, topic_id: str):
         f'opening hook by explicitly returning to that opening image or claim and '
         f'revealing it means something different now that the full story is known — '
         f'end with a surprise or lingering implication, then one closing line teasing a '
-        f'related next-episode angle. Do not repeat the first half — only write the new '
-        f'continuation, starting with [SCENE 4].'
+        f'related next-episode angle. Do NOT use "in summary", "to sum up", "to wrap '
+        f'up", "in conclusion", or any similar summary-announcing language anywhere in '
+        f'this half, especially the ending — the callback twist itself must close the '
+        f'story, never a stated summary. Do not repeat the first half — only write the '
+        f'new continuation, starting with [SCENE 4].'
     )
     part2 = _generate_part(part2_prompt, system_prompt)
 
