@@ -84,6 +84,26 @@ endpoint equivalent to the existing /api/v1/upload/reference/{tag} used
 by the dormant character-reference functions below. Raising MAX_FRAMES
 is the safe, self-contained fix for the common case reported so far;
 true chain-extension is the follow-up for shots that still exceed it.
+
+UPDATED (2026-08-20): SHOT-PARSING FIX PART 2. The 2026-08-17 fix above
+was incomplete: it accumulates lines into a shot ONLY once current_parts
+is already non-empty, using "if current_parts:" as a proxy for "we are
+inside a shot block". That proxy breaks whenever a shot header line has
+NO inline text after it at all (e.g. a bare "Shot 1:" on its own line,
+description starting on the line after) - confirmed live against videos
+5ca6e41d (Lincoln) and 446872f6 (Armada), both of which use exactly this
+bare-header format. Because current_parts starts empty and the header
+line itself contributes nothing when its remainder is blank, the very
+next content line is silently dropped by the "if current_parts:" guard -
+and every subsequent line for that shot is dropped the same way, forever
+- so total parsed shots = 0 for the whole plan, main() hits "ERROR: no
+shots parsed from production_plan" and exits immediately. This is why
+both videos generated zero clips across 3 automatic retries each. Fixed
+by tracking an explicit in_shot boolean (set True on any "Shot N:" match,
+cleared on flush) instead of relying on current_parts' truthiness, so
+lines are captured correctly regardless of whether the header line had
+inline text or not. Backward-compatible with both previously-supported
+formats.
 """
 
 import os
@@ -226,29 +246,40 @@ def _clean_shot_text(text):
 
 
 def _parse_shots(production_plan):
-    # FIX (2026-08-17): previously only ever read text remaining on the
-    # "Shot N:" line itself. Some production plans (confirmed live on
-    # 446872f6 / The Catholic Crown) put the description on the line(s)
-    # AFTER the "Shot N:" header instead of inline - that format silently
-    # produced 0 parsed shots every time. Now accumulates every line
-    # belonging to a shot (inline text on the header line, plus any
-    # following lines) until the next "Shot N:" marker or a blank line.
+    # FIX PART 1 (2026-08-17): accumulate every line belonging to a shot
+    # (inline text on the header line, plus any following lines) until
+    # the next "Shot N:" marker or a blank line, instead of only ever
+    # reading text on the header line itself.
+    #
+    # FIX PART 2 (2026-08-20): part 1 used "if current_parts:" as a proxy
+    # for "we are currently inside a shot block", which breaks whenever a
+    # header line has NO inline text (e.g. a bare "Shot 1:" alone, with
+    # the description starting on the next line) - current_parts starts
+    # empty in that case, so the very next content line (and every line
+    # after it) was silently dropped, producing 0 parsed shots for the
+    # entire plan. Confirmed live on videos 5ca6e41d and 446872f6, both
+    # of which use exactly this bare-header format. Now tracks an
+    # explicit in_shot boolean instead, so lines are captured correctly
+    # whether or not the header line itself had inline text.
     shots = []
     current_parts = []
+    in_shot = False
 
     def flush():
-        if not current_parts:
-            return
-        text = _clean_shot_text(" ".join(current_parts))
-        if text:
-            shots.append(text)
-        current_parts.clear()
+        nonlocal in_shot
+        if current_parts:
+            text = _clean_shot_text(" ".join(current_parts))
+            if text:
+                shots.append(text)
+            current_parts.clear()
+        in_shot = False
 
     for raw_line in production_plan.splitlines():
         line = raw_line.strip()
 
         if SHOT_START.match(line):
             flush()
+            in_shot = True
             remainder = SHOT_START.sub("", line, count=1).strip()
             remainder = re.sub(r"^[\s:\-–\*]+", "", remainder)
             if remainder:
@@ -260,7 +291,7 @@ def _parse_shots(production_plan):
             flush()
             continue
 
-        if current_parts:
+        if in_shot:
             current_parts.append(line)
 
     flush()
