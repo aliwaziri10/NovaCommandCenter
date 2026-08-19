@@ -31,6 +31,18 @@ risk was flagged and predicted before it happened). Rewritten to
 accumulate all lines belonging to a shot - inline text on the header line
 AND any following lines - until the next "Shot N:" marker or a blank
 line. Backward-compatible with the old single-line inline format.
+
+UPDATED (2026-08-19): Style overhaul, phase 1 of the Nova rebuild ("full-
+motion black & white" per the new format spec). QUALITY_GUARD previously
+enforced "vivid saturated color" and explicitly banned desaturation -
+the exact opposite of the new direction. Replaced with a black & white
+directive (full-motion grayscale cinematography, real movement - not a
+sepia/vintage-film look, not static B&W stills). ANACHRONISM_GUARD,
+MOTION_CONTINUITY_GUARD, and the rest of the prompt-building pipeline are
+unchanged; this only touches color treatment. Next phase (separate
+session, see brain/NOVA_REBUILD_HANDOFF.md): script_writing.py rewrite
+for Curiosity Loop structure, cold-open extraction, chapter markers, and
+the front-loaded-value/no-intro rule.
 """
 
 import os
@@ -96,11 +108,18 @@ ANACHRONISM_GUARD = (
     "no modern furniture, no electrical wiring or outlets, no plastic objects"
 )
 
+# CHANGED (2026-08-19): style overhaul phase 1. Full-motion black & white
+# is now the enforced look. Deliberately NOT "sepia" or "vintage film" -
+# real full-motion grayscale cinematography with genuine walking, weather,
+# fire, hands - not static pans, not a stylized old-film filter.
 QUALITY_GUARD = (
-    "modern high-end digital cinema, crisp sharp clarity, professional color grading, "
-    "shallow depth of field, cinematic lighting, vivid saturated color, no sepia tone, "
-    "no heavy desaturation, no muted documentary color grading, no grainy vintage film look, "
-    "no artificial CGI look, no flat synthetic AI look, no plastic skin"
+    "full black and white cinematography, rich grayscale tonal range, deep blacks "
+    "and clean whites, high contrast monochrome, modern high-end digital cinema "
+    "shot in black and white, crisp sharp clarity, professional monochrome color "
+    "grading, shallow depth of field, cinematic lighting, no color of any kind, "
+    "not sepia toned, not a vintage film filter, not a static photograph - full "
+    "natural motion within the frame, no grainy degraded film look, no artificial "
+    "CGI look, no flat synthetic AI look, no plastic skin"
 )
 
 MOTION_CONTINUITY_GUARD = (
