@@ -217,6 +217,16 @@ def run_script_writing(db: Session, topic_id: str):
     part2_prompt each got a matching instruction so the pacing actually
     lands in generated output in both halves, not just the unused-at-
     inference system_prompt description.
+
+    UPDATED (2026-08-19, item #5): added new Rule 9 (single biggest "wow"
+    moment of the story should land at roughly the 70% mark, inside the
+    CLIMAX beat, rather than being held back for the very end) to
+    system_prompt, appended after Rule 8 — none of the other rules were
+    touched or renumbered. part2_prompt (the half that contains both
+    CLIMAX and PAYOFF) got a matching instruction placing the peak moment
+    inside the CLIMAX chapter specifically, distinct from the PAYOFF
+    chapter's resolution/recontextualization job, so the two don't get
+    collapsed into one beat at generation time.
     """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -257,7 +267,9 @@ def run_script_writing(db: Session, topic_id: str):
         "- Beat 4 — MIDPOINT TWIST / RE-HOOK (roughly the halfway mark): the deliberate "
         "tone/stakes shift described in Rule 3 below.\n"
         "- Beat 5 — DELIVERY CONTINUES TO CLIMAX (from just past the midpoint to roughly "
-        "the 85% mark): the story's turning points keep escalating toward their peak.\n"
+        "the 85% mark): the story's turning points keep escalating toward their peak, "
+        "reaching the single biggest moment of the story at roughly the 70% mark (see "
+        "Rule 9).\n"
         "- Beat 6 — PAYOFF (the final ~15%): resolution that answers the macro open loop "
         "(Rule 1B) and explicitly recontextualizes the cold open from Beat 1 (see Rule 0B "
         "and Rule 7).\n"
@@ -379,7 +391,18 @@ def run_script_writing(db: Session, topic_id: str):
         "('a huge amount', 'many years', 'a massive army') when a specific figure is "
         "available and would land harder. Specificity is what makes the story feel real "
         "and researched, not vague scene-setting — spread it evenly across the whole "
-        "runtime, including the back half, not just the hook."
+        "runtime, including the back half, not just the hook.\n\n"
+        "9. PEAK MOMENT AT ~70% MARK (do not save the biggest moment for the very end): "
+        "the single most exciting, impactful, or surprising moment of the ENTIRE story — "
+        "the biggest 'wow' beat — should land at roughly the 70% mark of the full runtime, "
+        "inside the CLIMAX beat (Beat 5 of Rule 0), not held back for the PAYOFF (Beat 6) "
+        "at the very end. The PAYOFF should still resolve the macro open loop and "
+        "recontextualize the cold open (Rule 7) — but it should feel like a satisfying, "
+        "meaningful landing after the peak, not the biggest spike of excitement in the "
+        "video itself. Saving the true peak for the last few seconds asks viewers to sit "
+        "through a full stretch of falling energy waiting for a payoff that never actually "
+        "out-excites what came before it; placing it at ~70% keeps energy and retention "
+        "high through the back stretch instead."
     )
 
     strategy_notes = _latest_strategy_notes(db)
@@ -472,14 +495,19 @@ def run_script_writing(db: Session, topic_id: str):
         f'its own `[CHAPTER: <curiosity-driven title>]` marker before its `[SCENE]` '
         f'marker: (4) MIDPOINT TWIST — align this chapter with the midpoint re-hook '
         f'above; (5) CLIMAX — the delivery keeps escalating toward its highest point, '
-        f'roughly up to the 85% mark of the full script; (6) PAYOFF — the final stretch, '
-        f'roughly the last 15%, where the central "what if" question is answered. In the '
-        f'PAYOFF chapter specifically, make sure the ending explicitly recontextualizes '
-        f'the cold-open moment from the very start of part one — the viewer should now '
-        f'understand that opening moment meant something different than it first '
-        f'appeared, now that the full story, including how that moment actually resolved '
-        f'chronologically, is known. Do not repeat the first half — only write the new '
-        f'continuation, starting with [CHAPTER: ...] then [SCENE 4]. '
+        f'roughly up to the 85% mark of the full script, and the single most exciting or '
+        f'impactful moment of the ENTIRE story must land inside THIS chapter, at roughly '
+        f'the 70% mark of the full script — not held back for the PAYOFF chapter; (6) '
+        f'PAYOFF — the final stretch, roughly the last 15%, where the central "what if" '
+        f'question is answered. In the PAYOFF chapter specifically, make sure the ending '
+        f'explicitly recontextualizes the cold-open moment from the very start of part '
+        f'one — the viewer should now understand that opening moment meant something '
+        f'different than it first appeared, now that the full story, including how that '
+        f'moment actually resolved chronologically, is known. PAYOFF should feel like a '
+        f'satisfying, meaningful landing that resolves things — it is not where the '
+        f"story's biggest excitement spike happens; that already happened in CLIMAX. Do "
+        f'not repeat the first half — only write the new continuation, starting with '
+        f'[CHAPTER: ...] then [SCENE 4]. '
         f'Keep grounding the story with a specific number, date, quantity, distance, '
         f'percentage, or verifiable fact roughly every 100-150 words throughout this '
         f'half too — spread evenly across the back half, not just clustered near the '
