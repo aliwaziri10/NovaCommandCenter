@@ -197,6 +197,18 @@ def run_script_writing(db: Session, topic_id: str):
     (which is what actually drives the generated closing beat) gets the
     matching instruction so the ban isn't just in the unused-at-inference
     system_prompt description but in the part that shapes the real output.
+
+    UPDATED (2026-08-19, items #1/#2/#3/#10, done together as one
+    structural session per the handoff): added new Rule 0 (Curiosity Loop
+    six-beat master structure + Hook-Problem-Solution-Payoff timing spine),
+    Rule 0B (Cold Open at the most dramatic moment, then cut back), and
+    Rule 0C (chapter markers baked in from generation) to system_prompt,
+    all as pure additions ahead of the existing Rule 1 — none of the
+    previously-verified rules 1/1B/2/2B/3/4/5/6/7 were touched or
+    renumbered. part1_prompt and part2_prompt got matching additions
+    (also appended, not replacing existing instructions) so the cold
+    open + chapter markers actually land in generated output, not just
+    in the unused-at-inference system_prompt description.
     """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -222,6 +234,50 @@ def run_script_writing(db: Session, topic_id: str):
         "script text. Do not show your reasoning, do not explain your process, do not use "
         "JSON — just write the script directly.\n\n"
         "Follow these storytelling rules on every script:\n\n"
+        "0. CURIOSITY LOOP MASTER STRUCTURE (video-wide shape — every script follows this, "
+        "in addition to the more detailed rules below): the whole script is built as a "
+        "fixed six-beat Curiosity Loop that resolves gradually across the full runtime, "
+        "never answering the core question early:\n"
+        "- Beat 1 — COLD OPEN (roughly the first 0-30 seconds of narration): the single "
+        "most dramatic, highest-stakes moment of the ENTIRE story, shown first, out of "
+        "chronological order (see Rule 0B).\n"
+        "- Beat 2 — PROBLEM / STAKES SETUP (from the end of the cold open to roughly the "
+        "25% mark): cut back from the cold open to establish who/what/why and what's "
+        "genuinely at stake.\n"
+        "- Beat 3 — RISING DELIVERY (roughly 25% to the midpoint): escalating turning "
+        "points, each with its own twist (see Rules 2 and 2B).\n"
+        "- Beat 4 — MIDPOINT TWIST / RE-HOOK (roughly the halfway mark): the deliberate "
+        "tone/stakes shift described in Rule 3 below.\n"
+        "- Beat 5 — DELIVERY CONTINUES TO CLIMAX (from just past the midpoint to roughly "
+        "the 85% mark): the story's turning points keep escalating toward their peak.\n"
+        "- Beat 6 — PAYOFF (the final ~15%): resolution that answers the macro open loop "
+        "(Rule 1B) and explicitly recontextualizes the cold open from Beat 1 (see Rule 0B "
+        "and Rule 7).\n"
+        "This six-beat loop maps directly onto a HOOK -> PROBLEM -> SOLUTION -> PAYOFF "
+        "spine: HOOK = 0-30s (Beat 1), PROBLEM/STAKES = 30s to ~25% (Beat 2), SOLUTION/"
+        "DELIVERY = ~25% to ~85% (Beats 3-5, including the midpoint twist), PAYOFF = final "
+        "~15% (Beat 6). Never let two beats blur into one flat, undifferentiated stretch — "
+        "each beat should feel like a distinct movement of the story.\n\n"
+        "0B. COLD OPEN (do not skip): the very first thing spoken must be the single most "
+        "dramatic, highest-stakes moment from LATER in the story, presented as if it's "
+        "happening right now, out of chronological order — this is Beat 1 of Rule 0 above, "
+        "and it doubles as the concrete opening image required by Rule 1's HOOK. "
+        "Immediately after this cold-open moment, the narration must explicitly cut back "
+        "with a real bridge line (for example 'Rewind.' or 'But to understand how we got "
+        "here...' or an equivalent) to begin the true chronological Problem/Stakes setup "
+        "(Beat 2). The cold-open moment must be a genuine turning point that recurs again, "
+        "in its proper chronological place, later in the script — never an invented "
+        "one-off moment that doesn't actually happen in the story. This works together "
+        "with, not instead of, Rule 1's HOOK and Rule 1B's macro open loop below.\n\n"
+        "0C. CHAPTER MARKERS (bake in from generation, every script, no exceptions): "
+        "insert a `[CHAPTER: <short curiosity-driven title>]` marker at the start of each "
+        "of the six Curiosity Loop beats from Rule 0 — six chapter markers total per "
+        "script (Cold Open, Problem/Stakes, Rising Delivery, Midpoint Twist, Climax, "
+        "Payoff). Write each title specific to the actual topic and phrased to create "
+        "curiosity on its own, the way a real YouTube chapter title would — never a flat "
+        "generic label like 'Background' or 'Part 2'; something like 'The Warning No One "
+        "Believed' instead. These `[CHAPTER: ...]` markers are in addition to, and "
+        "separate from, the existing `[SCENE]` markers — use both.\n\n"
         "1. HOOK (first 2-3 sentences): open with mystery, conflict, or consequence — "
         "never slow scene-setting or background exposition. The viewer must feel a "
         "question forming immediately. Favor a bold claim, a striking 'what if', or a "
@@ -338,7 +394,19 @@ def run_script_writing(db: Session, topic_id: str):
         f'sounding narrator: vary sentence rhythm, use direct address and rhetorical '
         f'questions, favor concrete sensory detail over dry fact-listing. End this half at '
         f"a natural cliffhanger, at or near what should feel like the story's lowest point "
-        f'or biggest reversal — do not conclude the video yet.'
+        f'or biggest reversal — do not conclude the video yet. '
+        f'STRUCTURE THIS HALF AS THE FIRST THREE CURIOSITY LOOP BEATS, each opening with '
+        f'its own `[CHAPTER: <curiosity-driven title>]` marker before its `[SCENE]` '
+        f'marker: (1) COLD OPEN — open with the single most dramatic, highest-stakes '
+        f'moment from LATER in the story, told as if it is happening right now, out of '
+        f'chronological order; this doubles as the opening hook image above. Immediately '
+        f'after it, cut back explicitly with a real bridge line (e.g. "Rewind." or "But '
+        f'to understand how we got here...") into (2) PROBLEM/STAKES SETUP — the true '
+        f'chronological beginning, establishing who/what/why and what is genuinely at '
+        f'stake — then into (3) RISING DELIVERY, the escalating turning points described '
+        f'above. The cold-open moment must be a real turning point that recurs again, in '
+        f'its proper chronological place, later in the full script — not an invented '
+        f'one-off.'
     )
     part1 = _generate_part(part1_prompt, system_prompt)
 
@@ -378,8 +446,19 @@ def run_script_writing(db: Session, topic_id: str):
         f'related next-episode angle. Do NOT use "in summary", "to sum up", "to wrap '
         f'up", "in conclusion", or any similar summary-announcing language anywhere in '
         f'this half, especially the ending — the callback twist itself must close the '
-        f'story, never a stated summary. Do not repeat the first half — only write the '
-        f'new continuation, starting with [SCENE 4].'
+        f'story, never a stated summary. '
+        f'STRUCTURE THIS HALF AS THE FINAL THREE CURIOSITY LOOP BEATS, each opening with '
+        f'its own `[CHAPTER: <curiosity-driven title>]` marker before its `[SCENE]` '
+        f'marker: (4) MIDPOINT TWIST — align this chapter with the midpoint re-hook '
+        f'above; (5) CLIMAX — the delivery keeps escalating toward its highest point, '
+        f'roughly up to the 85% mark of the full script; (6) PAYOFF — the final stretch, '
+        f'roughly the last 15%, where the central "what if" question is answered. In the '
+        f'PAYOFF chapter specifically, make sure the ending explicitly recontextualizes '
+        f'the cold-open moment from the very start of part one — the viewer should now '
+        f'understand that opening moment meant something different than it first '
+        f'appeared, now that the full story, including how that moment actually resolved '
+        f'chronologically, is known. Do not repeat the first half — only write the new '
+        f'continuation, starting with [CHAPTER: ...] then [SCENE 4].'
     )
     part2 = _generate_part(part2_prompt, system_prompt)
 
