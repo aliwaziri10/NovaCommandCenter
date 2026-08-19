@@ -1,0 +1,22 @@
+{
+  "_comment": "Checked by .github/workflows/constraint_gate.yml on every push. See HARD_CONSTRAINTS.md for the human-readable version. banned_if_added: fail the push if the diff ADDS a line matching this pattern (case-insensitive). protected_files: these files can only change color/style-guard lines in a way that keeps monochrome enforced - reintroducing color language fails.",
+  "banned_if_added": [
+    "vivid saturated color",
+    "no heavy desaturation",
+    "no sepia tone(?!.*black and white)",
+    "full color cinematography",
+    "shorts_mode",
+    "vertical_export",
+    "SHORT_FORM = True",
+    "higgsfield",
+    "capcut"
+  ],
+  "protected_files": [
+    ".github/scripts/generate_videos.py",
+    "backend/app/agents/script_writing_agent.py"
+  ],
+  "required_if_protected_file_touched": [
+    "black and white",
+    "monochrome"
+  ]
+}
