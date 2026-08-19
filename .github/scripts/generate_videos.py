@@ -43,6 +43,19 @@ unchanged; this only touches color treatment. Next phase (separate
 session, see brain/NOVA_REBUILD_HANDOFF.md): script_writing.py rewrite
 for Curiosity Loop structure, cold-open extraction, chapter markers, and
 the front-loaded-value/no-intro rule.
+
+UPDATED (2026-08-19, same day): Style overhaul item #8 (visual/camera-
+angle variation at least every 40 seconds). Previous camera_move rotated
+by shot_index, which loosely varies but isn't tied to actual elapsed
+runtime - back-to-back short shots could reuse the same move well inside
+one 40s window, and a single long shot could sit on one move for much
+longer than 40s without ever being flagged. Replaced with a time-bucketed
+selection: camera move is chosen from cumulative elapsed seconds in the
+video's timeline, so a genuinely different move is guaranteed at least
+every CAMERA_VARIATION_INTERVAL_SECONDS regardless of how many shots (or
+how few) land inside that window. lens_style stays shot_index-keyed for
+intra-bucket variety. main() now tracks cumulative elapsed target-seconds
+across the batch loop and passes it into _submit_clip.
 """
 
 import os
@@ -71,6 +84,7 @@ POLL_INTERVAL_SECONDS = 10
 MIN_SECONDS_BETWEEN_SUBMITS = 10  # FIX (2026-08-13): was 4 - too tight, let content-policy retry bursts trip real 429s
 AGNES_IMAGE_MAX_RETRIES = 3
 CONTENT_POLICY_RETRY_SPACING_SECONDS = 20  # FIX (2026-08-13): was 5 - too tight, see module docstring
+CAMERA_VARIATION_INTERVAL_SECONDS = 40  # item #8: guarantee a genuinely different camera move at least this often, keyed to real elapsed runtime
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 
@@ -439,8 +453,13 @@ def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
     return video_id, None, False
 
 
-def _submit_clip(description, shot_index, num_frames, anchor_image_url=None):
-    camera_move = CAMERA_MOVES[shot_index % len(CAMERA_MOVES)]
+def _submit_clip(description, shot_index, num_frames, elapsed_seconds_before_shot=0.0, anchor_image_url=None):
+    # item #8: camera move is bucketed by real elapsed runtime, not shot
+    # index, so it's guaranteed to change at least every
+    # CAMERA_VARIATION_INTERVAL_SECONDS regardless of shot count/length in
+    # that window. lens_style stays index-keyed for intra-bucket variety.
+    camera_bucket = int(elapsed_seconds_before_shot // CAMERA_VARIATION_INTERVAL_SECONDS)
+    camera_move = CAMERA_MOVES[camera_bucket % len(CAMERA_MOVES)]
     lens_style = LENS_STYLES[shot_index % len(LENS_STYLES)]
     is_group_shot = any(kw in description.lower() for kw in CROWD_OR_GROUP_KEYWORDS)
 
@@ -627,6 +646,18 @@ def main():
     failure_reasons = []
     last_submit_time = 0.0
 
+    # item #8: precompute true cumulative elapsed seconds at the start of
+    # each shot in the video's full timeline (not just this batch), so
+    # camera-move bucketing stays correct even when a run resumes partway
+    # through a video across multiple workflow invocations. Done vs.
+    # missing doesn't matter here - it's about story position, not
+    # generation status.
+    cumulative_by_index = [0.0] * total
+    running = 0.0
+    for i in range(total):
+        cumulative_by_index[i] = running
+        running += _shot_target_seconds(video, i, total)
+
     for index in batch:
         description = all_shots[index]
         target_seconds = _shot_target_seconds(video, index, total)
@@ -643,7 +674,11 @@ def main():
 
         last_submit_time = time.monotonic()
         print(f"Shot {index+1}/{total}: target {target_seconds:.1f}s ({num_frames} frames)")
-        agnes_video_id, error = _submit_clip(description, index, num_frames, anchor_image_url=None)
+        agnes_video_id, error = _submit_clip(
+            description, index, num_frames,
+            elapsed_seconds_before_shot=cumulative_by_index[index],
+            anchor_image_url=None,
+        )
 
         if not agnes_video_id:
             failure_reasons.append(f"shot {index}: {error}")
