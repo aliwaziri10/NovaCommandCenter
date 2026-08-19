@@ -60,7 +60,7 @@ HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
 # DIAGNOSTIC (2026-08-16): accumulates every shot's (target, actual, pad)
 # across the whole run so we can print a summary at the end confirming or
-# ruling out "Agnes systematically returns clips shorter than requested" as
+# ruling out "Agnes systematically returns clips shorter than requested"
 # the cause of near-universal freeze-hold padding at scene ends.
 _FREEZE_PAD_LOG = []
 
@@ -226,13 +226,46 @@ def _run_ffmpeg(args, allow_fail=False):
 
 
 def _render_block(shot_indices, urls, durations, media_dir, block_output_path, use_clips):
+    """
+    CROSSFADE-LOSS FIX (2026-08-19): concatenate_videoclips() below uses
+    padding=-CROSSFADE to create the crossfade transition between
+    consecutive clips in this block - which OVERLAPS (and therefore trims)
+    CROSSFADE seconds off the tail of every clip except the last one in
+    the block. That overlap was never compensated for, so a block's
+    assembled duration came out (num_shots_in_block - 1) * CROSSFADE
+    seconds SHORTER than the sum of its shots' real target durations -
+    invisible per-shot (each clip still reports its own correct duration
+    going in) but compounding across every shot boundary in the video.
+    This is the confirmed root cause of the 30-50s freeze at the end of
+    assembled videos Zia flagged 2026-08-16: for an 80-shot video that's
+    79 transitions * 0.5s = ~39.5s of duration lost to crossfade overlap
+    - invisible until main()'s narration-vs-video length check at the
+    very end pads the whole accumulated shortfall onto one giant frozen
+    last frame (matches Red Moon Rising's ~40s freeze and Golden Horde's
+    Tide's ~50s freeze almost exactly: 79 * 0.5 = 39.5s and 94 * 0.5 =
+    47s respectively).
+
+    Fix: every clip except the last one in its block now targets
+    dur + CROSSFADE instead of dur, so after concatenate_videoclips()
+    trims CROSSFADE off its tail via the negative-padding overlap, the
+    VISIBLE on-screen duration lands back on the shot's real target - no
+    accumulated loss, no oversized end-of-video freeze. This is separate
+    from the small per-shot freeze-pad issue (see MAX_FRAMES fix in
+    generate_videos.py) and does not affect it - the freeze-pad diagnostic
+    log below still reflects genuine Agnes-clip-came-back-short cases.
+    """
     clips = []
     skipped = []
     errors = []
+    last_index_in_block = shot_indices[-1] if shot_indices else None
 
     for i in shot_indices:
         url = urls[i]
         dur = durations[i]
+        # See CROSSFADE-LOSS FIX docstring above: compensate every
+        # non-last-in-block clip for the overlap trim it's about to take
+        # during concatenate_videoclips() below.
+        effective_dur = dur if i == last_index_in_block else dur + CROSSFADE
         ext = "mp4" if use_clips else "jpg"
         media_path = os.path.join(media_dir, "shot_%03d.%s" % (i, ext))
         if not os.path.exists(media_path):
@@ -243,9 +276,9 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
                 continue
         try:
             if use_clips:
-                clip = _video_clip(media_path, dur, shot_index=i)
+                clip = _video_clip(media_path, effective_dur, shot_index=i)
             else:
-                clip = _still_image_clip(media_path, dur)
+                clip = _still_image_clip(media_path, effective_dur)
             clips.append(clip)
         except Exception as e:
             skipped.append(i)
