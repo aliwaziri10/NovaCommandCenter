@@ -1,0 +1,53 @@
+name: Constraint Gate
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check_constraints:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check diff against locked constraints
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'EOF'
+          import json, subprocess, re, sys, os
+
+          with open("constraints.json") as f:
+              rules = json.load(f)
+
+          diff = subprocess.run(
+              ["git", "diff", "HEAD~1", "HEAD"],
+              capture_output=True, text=True
+          ).stdout
+
+          added_lines = [
+              line[1:] for line in diff.splitlines()
+              if line.startswith("+") and not line.startswith("+++")
+          ]
+          added_text = "\n".join(added_lines).lower()
+
+          violations = []
+          for pattern in rules["banned_if_added"]:
+              if re.search(pattern, added_text, re.IGNORECASE):
+                  violations.append(pattern)
+
+          if violations:
+              msg = "Constraint Gate FAILED. Banned pattern(s) added:\n" + "\n".join(f"- {v}" for v in violations)
+              print(msg)
+              subprocess.run([
+                  "gh", "issue", "create",
+                  "--title", "Constraint Gate violation on push to main",
+                  "--body", msg
+              ], env=os.environ)
+              sys.exit(1)
+          else:
+              print("Constraint Gate passed — no banned patterns added.")
+          EOF
