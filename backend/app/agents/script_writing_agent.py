@@ -175,7 +175,22 @@ def run_script_writing(db: Session, topic_id: str):
     instead — matching the pattern video_planning_agent.py already uses for
     exactly this failure mode — so a failed generation goes through the normal
     Task/_failed_attempts retry path and no broken Script row is ever created
-    or allowed downstream."""
+    or allowed downstream.
+
+    UPDATED (2026-08-19): Style overhaul phase 2 of the Nova rebuild (see
+    brain/NOVA_REBUILD_HANDOFF.md items #4 and #14). Two additions to
+    system_prompt below:
+    - Rule 1 now explicitly forbids any channel greeting/branded intro
+      ("hey guys", "welcome back to the channel", etc.) before the value/
+      hook line — previously only implied by "never slow scene-setting",
+      which wasn't a strong enough guard on its own.
+    - Rule 4 now explicitly forbids the "you are standing in..." / "you
+      find yourself..." you-are-there narration pattern (a well-known AI
+      narration tell), while still keeping the other direct-address forms
+      (rhetorical questions, "imagine...", "picture this...") the prompt
+      already relies on for its engagement/emotional-arc rules — those are
+      unaffected and remain in place.
+    """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
     if not topic:
@@ -204,7 +219,10 @@ def run_script_writing(db: Session, topic_id: str):
         "never slow scene-setting or background exposition. The viewer must feel a "
         "question forming immediately. Favor a bold claim, a striking 'what if', or a "
         "vivid single moment over any kind of introduction. This opening image or claim "
-        "must be concrete enough to return to later (rule 7, callback twist).\n\n"
+        "must be concrete enough to return to later (rule 7, callback twist). NEVER open "
+        "with a channel greeting, branded intro, or any variation of 'hey guys', 'welcome "
+        "back', 'what's up everyone', or similar — the very first words spoken must be "
+        "the hook itself, with zero preamble of any kind before it.\n\n"
         "1B. MACRO OPEN LOOP (critical): the hook must state or clearly imply ONE central "
         "'what if' question for the entire video — the big unresolved stakes the whole "
         "story hangs on. Do NOT fully answer it until the ending. Every scene should feel "
@@ -238,8 +256,13 @@ def run_script_writing(db: Session, topic_id: str):
         "- Write in a spoken cadence: vary sentence length constantly — short, punchy "
         "sentences for tension, longer flowing ones for immersion. Never a run of "
         "same-length sentences in a row, which is what makes narration sound robotic.\n"
-        "- Use rhetorical questions, direct address to the viewer ('imagine...', 'picture "
-        "this...'), and moments of genuine wonder or unease, not flat statements of fact.\n"
+        "- Use rhetorical questions and warm direct address to the viewer as the narrator's "
+        "own voice ('here's the thing...', 'and this is where it gets strange...'), and "
+        "moments of genuine wonder or unease, not flat statements of fact. Do NOT use the "
+        "second-person 'you are standing in...', 'you find yourself...', or 'picture "
+        "yourself in [place]...' you-are-there device — this is a well-known overused AI "
+        "narration tell and must never appear. The narrator tells the story; the narrator "
+        "does not place the viewer inside the scene as a character.\n"
         "- Favor concrete sensory and emotional detail over abstract summary — a specific "
         "image, sound, or feeling beats a general description every time.\n"
         "- Build real tension and charm: let stakes escalate, plant a small mystery early "
