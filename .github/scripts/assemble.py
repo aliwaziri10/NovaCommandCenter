@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import numpy as np
 import requests
@@ -65,6 +66,38 @@ HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 _FREEZE_PAD_LOG = []
 
 
+def _resilient_get(url, max_attempts=5, **kwargs):
+    """COLD-START FIX (2026-08-21): Render's free-tier backend spins down
+    after ~15 min idle and cold-starts on the next request. This script
+    runs on a GitHub Actions cron, so its very first request to the
+    backend can land during that cold-start window and get a connection
+    error or a 502/503 from Render's edge before the app is ready. With
+    no retry, that killed the ENTIRE run before any real work started -
+    confirmed live: assemble workflow run #301 failed within seconds of
+    the backend container even finishing its boot
+    (2026-08-21T02:54:41Z fail vs 02:54:49-02:55:07Z container startup
+    in Render's own logs). Retrying with backoff means a cold start no
+    longer aborts the whole job.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, **kwargs)
+            if resp.status_code in (502, 503, 504):
+                raise requests.RequestException(
+                    f"backend not ready yet (HTTP {resp.status_code})"
+                )
+            return resp
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt == max_attempts:
+                break
+            wait = min(10 * attempt, 45)
+            print(f"Backend not ready (attempt {attempt}/{max_attempts}): {e}. Retrying in {wait}s...")
+            time.sleep(wait)
+    raise last_exc
+
+
 def _parse_shots_count(production_plan):
     count = 0
     for line in production_plan.splitlines():
@@ -104,7 +137,7 @@ def _resolve_durations(video, production_plan, total_shots):
 
 
 def _find_next_video_to_assemble():
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos", timeout=90)
+    resp = _resilient_get(f"{RAILWAY_URL}/api/v1/videos", timeout=90)
     resp.raise_for_status()
     videos = resp.json()
 
@@ -428,7 +461,7 @@ def main():
         print(f"Auto-selected video_id: {video_id}")
 
     print("Fetching video data from Railway...")
-    resp = requests.get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
+    resp = _resilient_get(f"{RAILWAY_URL}/api/v1/videos/{video_id}", timeout=90)
     resp.raise_for_status()
     video = resp.json()
 
@@ -464,7 +497,7 @@ def main():
 
     print("Downloading narration audio from Railway...")
     audio_path = os.path.join(WORK_DIR, "narration.mp3")
-    audio_resp = requests.get(
+    audio_resp = _resilient_get(
         f"{RAILWAY_URL}/api/v1/download/narration/{video_id}",
         headers=HEADERS,
         timeout=60,
