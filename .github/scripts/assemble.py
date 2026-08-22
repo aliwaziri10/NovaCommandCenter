@@ -98,6 +98,43 @@ def _resilient_get(url, max_attempts=5, **kwargs):
     raise last_exc
 
 
+def _resilient_post(url, max_attempts=5, **kwargs):
+    """UPLOAD COLD-START FIX (2026-08-22): confirmed live on run #309 -
+    the upload POST at the very end of main() (after ~18 minutes of
+    rendering with no backend calls in between) hit a 502 Bad Gateway
+    because Render's free-tier backend had spun back down from idling
+    during the render, and this POST had no retry, so 18 minutes of
+    completed work was thrown away on a single transient gateway error.
+    `files={"file": (...)}` opens the file handle fresh on each retry
+    attempt by re-opening from the caller, so this wrapper takes a
+    path instead of an open file handle to avoid resending an
+    already-consumed/closed stream on retry.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            file_path = kwargs.pop("_file_path")
+            file_field_name = kwargs.pop("_file_field_name")
+            with open(file_path, "rb") as f:
+                files = {file_field_name: ("final.mp4", f, "video/mp4")}
+                resp = requests.post(url, files=files, **kwargs)
+            if resp.status_code in (502, 503, 504):
+                raise requests.RequestException(
+                    f"backend not ready yet (HTTP {resp.status_code})"
+                )
+            return resp
+        except requests.RequestException as e:
+            last_exc = e
+            kwargs["_file_path"] = file_path
+            kwargs["_file_field_name"] = file_field_name
+            if attempt == max_attempts:
+                break
+            wait = min(15 * attempt, 60)
+            print(f"Upload backend not ready (attempt {attempt}/{max_attempts}): {e}. Retrying in {wait}s...")
+            time.sleep(wait)
+    raise last_exc
+
+
 def _parse_shots_count(production_plan):
     count = 0
     for line in production_plan.splitlines():
@@ -607,13 +644,13 @@ def main():
     print(f"Final file size: {final_size_mb:.1f}MB (budget was {TARGET_UPLOAD_MB}MB)")
 
     print("Uploading finished video back to Railway...")
-    with open(final_path, "rb") as f:
-        upload_resp = requests.post(
-            f"{RAILWAY_URL}/api/v1/upload/video/{video_id}",
-            headers=HEADERS,
-            files={"file": ("final.mp4", f, "video/mp4")},
-            timeout=300,
-        )
+    upload_resp = _resilient_post(
+        f"{RAILWAY_URL}/api/v1/upload/video/{video_id}",
+        headers=HEADERS,
+        timeout=300,
+        _file_path=final_path,
+        _file_field_name="file",
+    )
     upload_resp.raise_for_status()
 
     print("SUCCESS:", upload_resp.json())
