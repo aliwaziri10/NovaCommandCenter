@@ -99,3 +99,24 @@ async def upload_reference_frame(tag: str, file: UploadFile = File(...)):
         "url": image_url,
         "file_size_bytes": len(contents),
     }
+
+
+# ADDED (2026-08-20): FREEZE-FRAME FIX support. generate_videos.py's
+# chain-extension mechanism generates a shot as multiple real Agnes
+# segments (for shots whose target duration exceeds the ~10s single-call
+# ceiling), stitches them locally into one continuous clip, and needs
+# somewhere durable to store that stitched result before handing its URL
+# back to clip_urls - same durability reasoning as /video/{video_id}
+# (Render's local disk is wiped on restart). No assembly secret required,
+# matching the existing /reference/{tag} endpoint's permissiveness - this
+# endpoint doesn't touch the videos table either, purely stores a file and
+# returns a public URL for the caller to save into clip_urls itself.
+@router.post("/clip/{tag}")
+async def upload_clip(tag: str, file: UploadFile = File(...)):
+    contents = await file.read()
+    clip_url = upload_to_storage(f"clips/{tag}.mp4", contents, "video/mp4")
+    return {
+        "tag": tag,
+        "url": clip_url,
+        "file_size_bytes": len(contents),
+    }
