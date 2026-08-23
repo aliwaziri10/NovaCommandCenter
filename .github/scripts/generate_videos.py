@@ -1,109 +1,50 @@
 """
 Nova Command Center - Video Generation Agent
 
-[... all prior docstring history unchanged through 2026-08-16 Phase 1 ...]
+[... all prior docstring history unchanged through 2026-08-20 shot-parsing
+fix part 2 ...]
 
-UPDATED (2026-08-16, same session): REMOVED last-frame-to-next-shot image
-anchoring entirely. Root cause diagnosis: Nova's production plans are
-documentary-style, jumping between dozens of distinct unrelated figures
-shot to shot (e.g. Leonov, Korolev, Nixon, unnamed generals, "the host")
-- not a single continuous protagonist. Last-frame chaining is a mechanism
-built for content that follows one character continuously; applied to
-this content it caused whatever face Agnes generated blind for shot 1 to
-propagate and bleed into unrelated shots for the rest of the video
-(confirmed directly against a live published video's production_plan and
-clip data - the same face appeared across shots about entirely different,
-unrelated people). Every shot now generates independently from its own
-text description with no image anchor passed forward. Character-reference
-generation and last-frame extraction functions are left in this file
-unused (not deleted) in case a future single-protagonist format wants
-chaining back - cheap to revert, zero cost to leave dormant.
+UPDATED (2026-08-23): FREEZE-FRAME FIX (Phase 3 - real chain-extension).
+The 2026-08-19 MAX_FRAMES raise (169 -> 241 frames, ~7.04s -> ~10.04s)
+fixed the common case where a shot's target duration landed JUST past the
+old cap. It did not fix shots whose target duration is well beyond ~10s,
+which - per Zia's 2026-08-23 report that the freeze is still showing up
+on nearly every video - is most shots, since shot_durations are derived
+from real narration length (typically 20-90s per shot on Nova's
+documentary-style content, matching what Marius sees on equivalent
+narration-driven shots). Every one of those still got silently capped at
+MAX_FRAMES and froze on the leftover duration in assemble.py, exactly as
+the 2026-08-19 docstring predicted ("true chain-extension is the
+follow-up for shots that still exceed it").
 
-UPDATED (2026-08-17): Fixed _parse_shots() returning 0 shots on production
-plans where each shot's description is on the line(s) AFTER "Shot N:"
-instead of inline on the same line. Confirmed live on video 446872f6
-(The Catholic Crown): every one of its 100 shots used the header-then-
-description-on-next-line format, so the old logic (which only ever read
-text remaining on the "Shot N:" line itself) stripped the header and was
-left with an empty string for every shot, parsed 0 shots, and crashed the
-whole run in <20s, 3 times in a row (see KNOWN_BUGS.md - this exact drift
-risk was flagged and predicted before it happened). Rewritten to
-accumulate all lines belonging to a shot - inline text on the header line
-AND any following lines - until the next "Shot N:" marker or a blank
-line. Backward-compatible with the old single-line inline format.
+This adds that follow-up: shots whose target duration exceeds
+MAX_FRAMES/CLIP_FRAME_RATE now generate as multiple real Agnes segments
+(up to MAX_CHAIN_SEGMENTS), each anchored on the previous segment's last
+frame via the existing (previously dormant) _extract_last_frame_url()
+mechanism, downloaded and stitched locally into one continuous clip via
+moviepy, then uploaded to the new /api/v1/upload/clip/{tag} backend
+endpoint and that stitched URL is what gets saved into clip_urls -
+instead of a single short segment that assemble.py would have had to
+freeze-pad.
 
-UPDATED (2026-08-19): Style overhaul, phase 1 of the Nova rebuild ("full-
-motion black & white" per the new format spec). QUALITY_GUARD previously
-enforced "vivid saturated color" and explicitly banned desaturation -
-the exact opposite of the new direction. Replaced with a black & white
-directive (full-motion grayscale cinematography, real movement - not a
-sepia/vintage-film look, not static B&W stills). ANACHRONISM_GUARD,
-MOTION_CONTINUITY_GUARD, and the rest of the prompt-building pipeline are
-unchanged; this only touches color treatment. Next phase (separate
-session, see brain/NOVA_REBUILD_HANDOFF.md): script_writing.py rewrite
-for Curiosity Loop structure, cold-open extraction, chapter markers, and
-the front-loaded-value/no-intro rule.
+This chains segments WITHIN one shot only (same scene, same continuous
+action) - it does not resurrect the cross-shot last-frame anchoring that
+was removed 2026-08-16 for causing character identity bleed across
+unrelated shots. Each shot still starts its first segment from text only,
+with no anchor carried over from the previous shot.
 
-UPDATED (2026-08-19, same day): Style overhaul item #8 (visual/camera-
-angle variation at least every 40 seconds). Previous camera_move rotated
-by shot_index, which loosely varies but isn't tied to actual elapsed
-runtime - back-to-back short shots could reuse the same move well inside
-one 40s window, and a single long shot could sit on one move for much
-longer than 40s without ever being flagged. Replaced with a time-bucketed
-selection: camera move is chosen from cumulative elapsed seconds in the
-video's timeline, so a genuinely different move is guaranteed at least
-every CAMERA_VARIATION_INTERVAL_SECONDS regardless of how many shots (or
-how few) land inside that window. lens_style stays shot_index-keyed for
-intra-bucket variety. main() now tracks cumulative elapsed target-seconds
-across the batch loop and passes it into _submit_clip.
+Shots needing more than MAX_CHAIN_SEGMENTS * ~10.04s will still freeze-
+pad whatever remains uncovered in assemble.py - this raises the ceiling,
+it does not remove it. MAX_CHAIN_SEGMENTS=4 covers up to ~40s of real
+generated footage per shot, chosen to match the bulk of the shot-duration
+range seen on equivalent narration-driven content without excessively
+multiplying Agnes API calls (and therefore cost/rate-limit exposure) for
+outlier long shots.
 
-UPDATED (2026-08-19, later same session): FREEZE-PAD FIX (Phase 2b).
-MAX_FRAMES was 169 (~7.04s ceiling, matching Marius's single-generation
-cap). Marius compensates any shot that exceeds that cap with real
-chain-extension footage (see MAX_CHAIN_SEGMENTS in Marius's
-video_generation.py) - Nova has no equivalent mechanism yet. Any Nova
-shot with a target duration over ~7.04s was silently capped at 169
-frames by this constant, then freeze-held for the shortfall in
-assemble.py's _fit_clip_to_duration. This is the confirmed mechanism
-behind Zia's 2026-08-16 report of a small (0.5-0.8s) freeze-hold on
-nearly every scene - narration-driven shot target durations landing just
-past the old 7.04s cap, which is common since shot_durations are derived
-from real narration length, not chosen to fit Agnes's per-call ceiling.
-Raised to 241 frames (~10.04s, still a valid 8n+1 Agnes frame count) to
-cover the realistic range of narration-driven shot durations without a
-freeze. Shots still needing more than ~10.04s will still freeze-pad the
-remainder in assemble.py until real chain-extension (matching Marius's
-mechanism - downloading each Agnes segment, extracting its last frame as
-the next segment's anchor, and concatenating them into one clip before
-upload) is ported to this file. That port is deferred, not yet built: it
-requires this file to gain local video download/moviepy/re-upload
-capability it does not currently have (today it only calls Agnes and
-stores the URL Agnes returns - it never touches the video bytes
-locally), plus confirming the backend has (or adding) a clip-upload
-endpoint equivalent to the existing /api/v1/upload/reference/{tag} used
-by the dormant character-reference functions below. Raising MAX_FRAMES
-is the safe, self-contained fix for the common case reported so far;
-true chain-extension is the follow-up for shots that still exceed it.
-
-UPDATED (2026-08-20): SHOT-PARSING FIX PART 2. The 2026-08-17 fix above
-was incomplete: it accumulates lines into a shot ONLY once current_parts
-is already non-empty, using "if current_parts:" as a proxy for "we are
-inside a shot block". That proxy breaks whenever a shot header line has
-NO inline text after it at all (e.g. a bare "Shot 1:" on its own line,
-description starting on the line after) - confirmed live against videos
-5ca6e41d (Lincoln) and 446872f6 (Armada), both of which use exactly this
-bare-header format. Because current_parts starts empty and the header
-line itself contributes nothing when its remainder is blank, the very
-next content line is silently dropped by the "if current_parts:" guard -
-and every subsequent line for that shot is dropped the same way, forever
-- so total parsed shots = 0 for the whole plan, main() hits "ERROR: no
-shots parsed from production_plan" and exits immediately. This is why
-both videos generated zero clips across 3 automatic retries each. Fixed
-by tracking an explicit in_shot boolean (set True on any "Shot N:" match,
-cleared on flush) instead of relying on current_parts' truthiness, so
-lines are captured correctly regardless of whether the header line had
-inline text or not. Backward-compatible with both previously-supported
-formats.
+Requires generate_videos.yml to install moviepy/Pillow/imageio-ffmpeg
+(same versions as assemble.yml) - this script did not need them before
+this fix, since it only ever called Agnes and saved the URL it returned
+without ever touching video bytes locally.
 """
 
 import os
@@ -130,6 +71,10 @@ MIN_FRAMES = 49    # ~2s floor, matches Marius
 # count) so narration-driven shot durations landing just past the old
 # cap no longer get silently truncated and freeze-padded at assembly.
 MAX_FRAMES = 241   # ~10s ceiling (was 169/~7s) - see FREEZE-PAD FIX note above
+# CHAIN-EXTENSION FIX (2026-08-23, Phase 3 - see module docstring):
+# shots needing more than MAX_FRAMES now chain up to this many real
+# Agnes segments instead of freeze-padding everything past the first one.
+MAX_CHAIN_SEGMENTS = 4
 DEFAULT_SHOT_SECONDS = 5.0  # only used if shot_durations is unavailable for this video
 MAX_WAIT_SECONDS = 240
 POLL_INTERVAL_SECONDS = 10
@@ -446,8 +391,25 @@ def generate_character_reference(video_id, topic_title, opening_shot_description
     return None
 
 
+def _download_file(url, dest_path):
+    # ADDED (2026-08-23): chain-extension needs local copies of each
+    # segment to stitch them together - see _generate_shot_clip().
+    try:
+        resp = requests.get(url, timeout=120)
+        if resp.status_code == 200 and len(resp.content) > 0:
+            with open(dest_path, "wb") as f:
+                f.write(resp.content)
+            return True
+    except requests.RequestException:
+        pass
+    return False
+
+
 def _extract_last_frame_url(video_url_of_clip, out_tag):
-    # UNUSED as of 2026-08-16 (chaining removed) - left in place, dormant.
+    # Was UNUSED as of 2026-08-16 (cross-shot chaining removed). Reused
+    # as of 2026-08-23 for WITHIN-shot chain-extension (see module
+    # docstring) - this does not reintroduce cross-shot anchoring, it
+    # only links segments belonging to the same shot together.
     try:
         import numpy as np
         from PIL import Image
@@ -481,6 +443,50 @@ def _extract_last_frame_url(video_url_of_clip, out_tag):
         return upload_resp.json().get("url")
     except Exception as e:
         print(f"Could not extract/upload last frame for continuity anchor, continuing without it: {e}")
+        return None
+
+
+def _concat_segments(segment_paths, out_path):
+    # ADDED (2026-08-23): stitches chain-extended segments (same shot,
+    # continuous action, each anchored on the previous segment's last
+    # frame) into one continuous clip. Straight concat (no crossfade) -
+    # anchoring already makes the cut point visually continuous, unlike
+    # assemble.py's cross-SHOT blocks which need a crossfade to hide a
+    # hard scene change.
+    try:
+        from moviepy.editor import VideoFileClip, concatenate_videoclips
+        clips = [VideoFileClip(p) for p in segment_paths]
+        combined = concatenate_videoclips(clips, method="compose")
+        combined.write_videofile(
+            out_path, fps=CLIP_FRAME_RATE, codec="libx264", audio=True,
+            audio_codec="aac", threads=2, preset="medium", verbose=False, logger=None,
+        )
+        combined.close()
+        for c in clips:
+            c.close()
+        return True
+    except Exception as e:
+        print(f"Failed to concatenate chain segments: {type(e).__name__}: {e}")
+        return False
+
+
+def _upload_clip(tag, local_path):
+    # ADDED (2026-08-23): uploads a stitched chain-extended clip to the
+    # new /api/v1/upload/clip/{tag} backend endpoint (durable Supabase
+    # Storage), returns the public URL to save into clip_urls.
+    try:
+        with open(local_path, "rb") as f:
+            resp = requests.post(
+                f"{RAILWAY_URL}/api/v1/upload/clip/{tag}",
+                files={"file": (f"{tag}.mp4", f, "video/mp4")},
+                timeout=180,
+            )
+        if resp.status_code >= 400:
+            print(f"Chain-extended clip upload failed - status {resp.status_code}: {resp.text}")
+            return None
+        return resp.json().get("url")
+    except Exception as e:
+        print(f"Chain-extended clip upload raised an exception: {type(e).__name__}: {e}")
         return None
 
 
@@ -642,6 +648,107 @@ def _poll_clip(video_id):
     return None, f"timed out waiting for clip. Last poll response: {last_data}"
 
 
+def _generate_shot_clip(video_id, description, shot_index, target_seconds, elapsed_seconds_before_shot):
+    # ADDED (2026-08-23): FREEZE-FRAME FIX Phase 3 - see module docstring.
+    # Shots that fit within a single Agnes call keep the exact previous
+    # behavior. Shots that don't now chain multiple real segments instead
+    # of generating one short clip that assemble.py would freeze-pad.
+    raw_frames_needed = int(target_seconds * CLIP_FRAME_RATE)
+
+    if raw_frames_needed <= MAX_FRAMES:
+        frames = round_to_valid_frames(max(MIN_FRAMES, min(MAX_FRAMES, raw_frames_needed)))
+        agnes_id, error = _submit_clip(
+            description, shot_index, frames, elapsed_seconds_before_shot, anchor_image_url=None
+        )
+        if not agnes_id:
+            return None, error
+        return _poll_clip(agnes_id)
+
+    print(
+        f"Shot {shot_index}: target {target_seconds:.1f}s exceeds single-generation cap "
+        f"(~{MAX_FRAMES / CLIP_FRAME_RATE:.1f}s) - chain-extending up to {MAX_CHAIN_SEGMENTS} segments."
+    )
+
+    segment_paths = []
+    remaining = target_seconds
+    anchor_url = None
+    seg_index = 0
+    last_error = None
+
+    while remaining > 0.5 and seg_index < MAX_CHAIN_SEGMENTS:
+        seg_raw_frames = int(remaining * CLIP_FRAME_RATE)
+        seg_frames = round_to_valid_frames(max(MIN_FRAMES, min(MAX_FRAMES, seg_raw_frames)))
+
+        agnes_id, error = _submit_clip(
+            description, shot_index, seg_frames, elapsed_seconds_before_shot, anchor_image_url=anchor_url
+        )
+        if not agnes_id:
+            last_error = error
+            break
+
+        seg_url, error = _poll_clip(agnes_id)
+        if not seg_url:
+            last_error = error
+            break
+
+        local_path = f"/tmp/_chain_{video_id}_shot{shot_index}_seg{seg_index}.mp4"
+        if not _download_file(seg_url, local_path):
+            last_error = f"failed to download chain segment {seg_index}"
+            break
+
+        segment_paths.append(local_path)
+        remaining -= seg_frames / CLIP_FRAME_RATE
+        seg_index += 1
+
+        if remaining > 0.5 and seg_index < MAX_CHAIN_SEGMENTS:
+            anchor_url = _extract_last_frame_url(seg_url, f"{video_id}_shot{shot_index}_seg{seg_index}")
+
+    if not segment_paths:
+        return None, last_error or "chain extension produced no segments"
+
+    if len(segment_paths) == 1:
+        stitched_path = segment_paths[0]
+    else:
+        stitched_path = f"/tmp/_chain_{video_id}_shot{shot_index}_stitched.mp4"
+        if not _concat_segments(segment_paths, stitched_path):
+            for p in segment_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            return None, "failed to concatenate chain segments"
+
+    clip_url = _upload_clip(f"{video_id}_shot{shot_index:03d}", stitched_path)
+
+    for p in segment_paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    if stitched_path not in segment_paths:
+        try:
+            os.remove(stitched_path)
+        except OSError:
+            pass
+
+    if not clip_url:
+        return None, "chain-extended clip generated but upload to backend failed"
+
+    covered = target_seconds - max(remaining, 0.0)
+    if remaining > 0.5:
+        print(
+            f"Shot {shot_index}: chain-extension covered {covered:.1f}s of {target_seconds:.1f}s "
+            f"target after {seg_index} real segment(s) (cap reached) - assemble.py will still "
+            f"freeze-pad the remaining {remaining:.1f}s."
+        )
+    else:
+        print(
+            f"Shot {shot_index}: chain-extension fully covered {target_seconds:.1f}s target with "
+            f"{seg_index} real segment(s), no freeze-pad needed."
+        )
+    return clip_url, None
+
+
 def _save_progress(video_id, clip_urls):
     try:
         patch_resp = requests.patch(
@@ -697,11 +804,13 @@ def main():
         print("All shots already have clips. Nothing to do.")
         return
 
-    # CHANGED (2026-08-16): chaining removed entirely - every shot generates
-    # independently from its own text description. No character reference
-    # image, no last-frame anchor extraction/propagation. See module
-    # docstring for the diagnosis behind this.
-    print("Chaining is disabled - every shot will generate independently from text only.")
+    # CHANGED (2026-08-16): cross-shot chaining removed entirely - every
+    # shot's FIRST segment still generates independently from its own text
+    # description, no character reference image, no anchor carried over
+    # from a previous shot. WITHIN-shot chain-extension (2026-08-23, see
+    # module docstring) is separate and does not change this.
+    print("Cross-shot chaining is disabled - each shot starts fresh from text only. "
+          "Shots longer than the single-generation cap chain-extend internally (see below).")
 
     batch = missing[:BATCH_SIZE]
     print(f"This run will process {len(batch)} shot(s): {batch}")
@@ -724,10 +833,6 @@ def main():
     for index in batch:
         description = all_shots[index]
         target_seconds = _shot_target_seconds(video, index, total)
-        raw_frames = int(target_seconds * CLIP_FRAME_RATE)
-        raw_frames = max(MIN_FRAMES, min(MAX_FRAMES, raw_frames))
-        num_frames = round_to_valid_frames(raw_frames)
-        num_frames = max(MIN_FRAMES, min(MAX_FRAMES, num_frames))
 
         elapsed = time.monotonic() - last_submit_time
         if elapsed < MIN_SECONDS_BETWEEN_SUBMITS and last_submit_time > 0:
@@ -736,27 +841,21 @@ def main():
             time.sleep(wait_for)
 
         last_submit_time = time.monotonic()
-        print(f"Shot {index+1}/{total}: target {target_seconds:.1f}s ({num_frames} frames)")
-        agnes_video_id, error = _submit_clip(
-            description, index, num_frames,
-            elapsed_seconds_before_shot=cumulative_by_index[index],
-            anchor_image_url=None,
+        print(f"Shot {index+1}/{total}: target {target_seconds:.1f}s")
+
+        url, error = _generate_shot_clip(
+            video_id, description, index, target_seconds, cumulative_by_index[index]
         )
 
-        if not agnes_video_id:
+        if url:
+            clip_urls[index] = url
+            print(f"Shot {index+1}/{total}: OK -> {url}")
+        else:
             failure_reasons.append(f"shot {index}: {error}")
             print(f"Shot {index+1}/{total}: FAILED ({error})")
             if error and "RATE LIMITED" in error:
                 print("Backing off 60s after a 429 before continuing this run...")
                 time.sleep(60)
-        else:
-            url, error = _poll_clip(agnes_video_id)
-            if url:
-                clip_urls[index] = url
-                print(f"Shot {index+1}/{total}: OK -> {url}")
-            else:
-                failure_reasons.append(f"shot {index}: {error}")
-                print(f"Shot {index+1}/{total}: FAILED ({error})")
 
         _save_progress(video_id, clip_urls)
         good_so_far = len([u for u in clip_urls if u])
