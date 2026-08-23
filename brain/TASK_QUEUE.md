@@ -4,6 +4,35 @@
 - None currently blocking. `6dc13529` (Silk Road video) is fully ready for assembly (101/101 clips, 101/101 shot_durations, real 4.5MB narration audio confirmed) - waiting on the assemble stage to run. NEXT SESSION: confirm it actually reached status=assembled and check final video quality (lighting, sync, no truncation).
 
 ## Next
+- **UNVERIFIED - freeze-frame fix, priority.** Zia reported on 2026-08-23
+  that "The Catholic Crown: What If the Spanish Armada Successfully
+  Invaded England?" (video `446872f6`, ~12m24s) freezes at ~1m12-16s in -
+  narration keeps playing but the picture stops entirely for the rest of
+  the video. Zia confirms picture QUALITY itself is excellent, this is
+  purely the freeze. Two things to check before doing anything else:
+  1. `446872f6` was created 2026-08-16 - BEFORE the chain-extension
+     freeze-frame fix landed (commit `e5effeef`, 2026-08-23). This video
+     was generated under the old code, so it is not evidence the fix
+     doesn't work - it may simply predate it. Do not treat this report as
+     a failure of the new fix without checking a video actually
+     generated/assembled AFTER `e5effeef`.
+  2. `generate_videos.yml` still needs its pip install line updated
+     (moviepy/Pillow/imageio-ffmpeg, matching assemble.yml's pinned
+     versions) - GitHub's API blocks writes to `.github/workflows/*.yml`
+     files (403, workflows scope), so this edit could only be handed to
+     Zia as manual copy-paste, not confirmed done as of 2026-08-23.
+     Confirm this landed first - without it, chain-extension crashes with
+     ModuleNotFoundError on the very first shot that needs it, which
+     would produce exactly this symptom (video generation dies partway,
+     no clips past that point, but narration - generated separately -
+     plays in full).
+  Action: confirm both of the above, then check a video generated fresh
+  after both are true. If the freeze still happens on a genuinely
+  post-fix video, treat this as a live bug in the chain-extension code
+  itself (concat/upload failure silently leaving clip_urls short?) and
+  investigate with real Supabase data (clip_urls length vs total shots,
+  actual video duration vs narration duration) before touching code -
+  don't guess.
 - Confirm .env.example — it does not exist in this repo at all (not just uncommitted). Create it with the Supabase DATABASE_URL, replacing config.py's stale SQLite default.
 - Investigate HOW bf465973 and 6dc13529 ended up with byte-identical production_plan content — see KNOWN_BUGS.md.
 - Confirm the new supervisor.yml workflow's first live runs behave as expected (force-triggers, auto-closes, escalation) — not yet observed in a real run.
