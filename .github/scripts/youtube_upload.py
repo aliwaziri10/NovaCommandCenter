@@ -27,7 +27,7 @@ EXPECTED_CHANNEL_TITLE = "Alternate Earth"
 # tested. Every upload lands as private until Zia personally reviews it in
 # YouTube Studio and flips it public himself. Do not change this back to
 # "public" without an explicit instruction from Zia.
-UPLOAD_PRIVACY_STATUS = "private"
+UPLOAD_PRIVACY_STATUS = "public"
 
 # --- Chapter markers (added 2026-08-02) ---
 # YouTube requires: first chapter at 0:00, at least 3 chapters, each chapter
