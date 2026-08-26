@@ -45,6 +45,30 @@ Requires generate_videos.yml to install moviepy/Pillow/imageio-ffmpeg
 (same versions as assemble.yml) - this script did not need them before
 this fix, since it only ever called Agnes and saved the URL it returned
 without ever touching video bytes locally.
+
+UPDATED (2026-08-26): CAMERA MOVEMENT REBALANCE + PROMPT-CONFLICT FIX.
+Per Zia's report that videos read as too fast/rapid/sweeping/urgent/
+dramatic throughout, with zero slow motion:
+1. CAMERA_VARIATION_INTERVAL_SECONDS raised 40 -> 48 (less frequent
+   camera-move shuffling = less perceived movement).
+2. CAMERA_MOVES rebalanced from mostly-high-intensity to mostly calm/
+   steady, with slow motion added as its own category and only a
+   smaller share (3 of 12) kept as fast/dramatic/urgent, instead of
+   deleting that energy entirely.
+3. Found and fixed two same-prompt self-contradictions likely causing
+   anachronistic drones/laptops on screen: the "drone-style" camera-move
+   wording was renamed to "aerial" (it was a literal visual noun sitting
+   next to ANACHRONISM_GUARD's "no drones" in the same prompt), and the
+   word "modern" was removed from QUALITY_GUARD (it described camera/
+   production quality but collided with ANACHRONISM_GUARD's "no modern
+   technology... no modern furniture" in the same prompt).
+4. Softened the per-clip prompt's fixed descriptor text ("high-energy
+   fast-paced" -> "steady, composed"; "engaging dynamic composition" ->
+   "controlled cinematic framing") to match the calmer camera-move
+   rebalance instead of overriding it.
+Narration impact (separate from camera movement) and any Voicebox
+integration are NOT part of this change - narration lives in
+narrate.py, a separate file, not reviewed here.
 """
 
 import os
@@ -81,7 +105,7 @@ POLL_INTERVAL_SECONDS = 10
 MIN_SECONDS_BETWEEN_SUBMITS = 10  # FIX (2026-08-13): was 4 - too tight, let content-policy retry bursts trip real 429s
 AGNES_IMAGE_MAX_RETRIES = 3
 CONTENT_POLICY_RETRY_SPACING_SECONDS = 20  # FIX (2026-08-13): was 5 - too tight, see module docstring
-CAMERA_VARIATION_INTERVAL_SECONDS = 40  # item #8: guarantee a genuinely different camera move at least this often, keyed to real elapsed runtime
+CAMERA_VARIATION_INTERVAL_SECONDS = 48  # item #8: guarantee a genuinely different camera move at least this often, keyed to real elapsed runtime
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 
@@ -89,14 +113,25 @@ SHOT_START = re.compile(r"^[\-\*\s]*\**shot\s*[\d.]+\**", re.IGNORECASE)
 HEADERS = {"Authorization": f"Bearer {AGNES_API_KEY}", "Content-Type": "application/json"}
 
 CAMERA_MOVES = [
-    "sweeping drone-style push-in",
-    "fast tracking shot alongside the subject",
-    "dramatic low-angle tilt up",
-    "smooth rapid reveal shot",
+    # CHANGED (2026-08-26): rebalanced away from constant fast/rapid/sweeping/
+    # urgent/dramatic energy - most entries now calm and steady, slow motion
+    # added as its own category, only a few dynamic entries kept (not
+    # deleted, just a smaller share of the rotation). Also renamed the
+    # "drone-style" entry to "aerial" - the literal word "drone" was
+    # contradicting ANACHRONISM_GUARD's "no drones" in the same prompt and
+    # was the likely cause of drones appearing on-screen.
+    "gentle aerial push-in",
+    "smooth tracking shot alongside the subject",
+    "subtle low-angle tilt up",
+    "slow motion, gentle drift, dreamlike weight to the movement",
     "slow dramatic zoom with parallax",
-    "handheld tracking shot, urgent energy",
+    "steady tracking shot, calm and grounded",
+    "gentle crane shot rising over the scene",
+    "tight composed close-up with shallow depth of field",
+    "slow motion tracking shot, weighty and deliberate",
     "sweeping crane shot rising over the scene",
-    "tight dynamic close-up with shallow depth of field",
+    "fast tracking shot alongside the subject, urgent energy",
+    "dramatic low-angle tilt up",
 ]
 
 LENS_STYLES = [
@@ -125,7 +160,7 @@ ANACHRONISM_GUARD = (
 # fire, hands - not static pans, not a stylized old-film filter.
 QUALITY_GUARD = (
     "full black and white cinematography, rich grayscale tonal range, deep blacks "
-    "and clean whites, high contrast monochrome, modern high-end digital cinema "
+    "and clean whites, high contrast monochrome, high-end digital cinema "
     "shot in black and white, crisp sharp clarity, professional monochrome color "
     "grading, shallow depth of field, cinematic lighting, no color of any kind, "
     "not sepia toned, not a vintage film filter, not a static photograph - full "
@@ -551,8 +586,8 @@ def _submit_clip(description, shot_index, num_frames, elapsed_seconds_before_sho
             parts.append(DISTINCT_INDIVIDUALS_GUARD)
         parts += [
             desc, f"shot by a Hollywood cinematographer, {camera_move}, {lens_style}",
-            "high-energy fast-paced documentary style",
-            "realistic motion, natural motion blur, high detail, engaging dynamic composition",
+            "steady, composed documentary style",
+            "realistic motion, natural motion blur, high detail, controlled cinematic framing",
         ]
         return ", ".join(p for p in parts if p)
 
