@@ -62,19 +62,6 @@ def _is_bad_response(raw: str) -> bool:
 NARRATION_WORDS_PER_SECOND = 2.5
 TARGET_SECONDS_PER_SHOT = 5
 
-# CAP ADDED (2026-08-11): _estimate_target_shots previously had no ceiling, so
-# a long script (word count with no upper limit) could scale to an enormous
-# shot count - the first video run through this Gemini-switched pipeline came
-# out to 200 total shots (script ran long), versus every prior Nova video's
-# 13-16 shots. At generate_videos.py's BATCH_SIZE=20/hour, that alone is
-# roughly 10 hours of clip generation for ONE video before it can even reach
-# assembly - not sustainable for a channel that needs regular uploads. Capping
-# each half at MAX_SHOTS_PER_HALF keeps every future video's total shot count
-# in the same ballpark as the channel's historical videos, regardless of how
-# long the underlying script runs. This does NOT change how source shots are
-# written, only the ceiling passed to the model as its shot-count target -
-# a longer script will still just get proportionally longer individual shots
-# up to TARGET_SECONDS_PER_SHOT's pacing, rather than an unbounded shot count.
 MAX_SHOTS_PER_HALF = 25
 
 
@@ -127,7 +114,27 @@ SYSTEM_PROMPT = (
     "legible text and it will come out as garbled nonsense letters, which looks "
     "broken. If a document or paper needs to appear, either keep it out of focus "
     "in the background of a wider shot, or describe the person/object interacting "
-    "with it rather than the text itself."
+    "with it rather than the text itself.\n\n"
+    "Protagonist visibility rule (critical):\n"
+    "- Do NOT put the protagonist on-screen in every shot, and do NOT default "
+    "to opening and closing every shot on the protagonist. Across the full "
+    "plan, only roughly 35% of shots should feature the protagonist directly "
+    "on-screen. The remaining ~65% should be shots that don't need the "
+    "protagonist visible at all: wide establishing shots, environment and "
+    "setting details, objects, hands, other people, POV shots, and reaction "
+    "or cutaway shots that still carry the narration forward. Constant "
+    "protagonist presence reads as repetitive and staged - vary who and what "
+    "is actually on screen.\n\n"
+    "Ambient sound rule (critical):\n"
+    "- Every shot's description must include one concrete, audible sound "
+    "source woven naturally into the sentence itself (not a separate line) - "
+    "e.g. 'the blacksmith's hammer rings against the anvil' or 'wind rattles "
+    "the shutters' rather than a purely silent visual description. The video "
+    "generation model has nothing to render as sound unless the shot text "
+    "itself describes something making noise, and generated clips are "
+    "currently coming out silent - give every shot a real audible source: "
+    "footsteps, wind, fire, tools, crowd murmur, hooves, waves, machinery, "
+    "etc., whatever actually fits the scene."
 )
 
 
@@ -259,6 +266,18 @@ def run_video_planning(db: Session, script_id: str):
     video planned under the Gemini switch came out to 200 total shots with no
     prior cap, which at generate_videos.py's clip-generation pace would have
     taken roughly 10 hours for one video alone.
+
+    UPDATED (2026-08-26): Zia flagged the protagonist appearing in nearly
+    every shot (opening and closing on them by default) and generated clips
+    coming out with no audible sound effects at all (music-only). Added two
+    rules to SYSTEM_PROMPT (applies to both part1 and part2 calls, since
+    SYSTEM_PROMPT is prepended to every _call_gemini() call): a protagonist
+    visibility cap (~35% of shots) so most shots read as cutaways/environment/
+    other people instead of constant protagonist presence, and an ambient
+    sound rule requiring each shot's own description to name something
+    audible happening in-frame - Agnes has nothing to render as sound unless
+    the shot text itself describes a sound source, so this is upstream of
+    assemble.py's native-audio extraction, not a replacement for it.
     """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
