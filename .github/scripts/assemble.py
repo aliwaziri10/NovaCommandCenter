@@ -198,15 +198,46 @@ def _find_next_video_to_assemble():
     return candidates[0]["id"]
 
 
-def _download_file(url, dest_path):
-    try:
-        resp = requests.get(url, timeout=120)
-        if resp.status_code == 200 and len(resp.content) > 0:
-            with open(dest_path, "wb") as f:
-                f.write(resp.content)
-            return True
-    except requests.RequestException:
-        pass
+def _download_file(url, dest_path, max_attempts=4):
+    """FIX (2026-08-26): this was the only network call in the whole file
+    with zero retry logic - every backend call already got retries on
+    Aug 21-22 (see _resilient_get/_resilient_post), but this one didn't.
+    One transient network hiccup pulling a clip from Supabase storage and
+    the shot got silently dropped into `all_skipped` with no explanation
+    printed anywhere. Confirmed live on "The Autumn of Fire": a handful of
+    clip downloads failed silently this way, the assembled video track ran
+    out after ~3-5 minutes of real footage, and the narration-vs-video
+    freeze-hold mechanism at the end of main() (built for small
+    end-of-video gaps) stretched to cover the rest of a 30-40 minute
+    narration track - which is why it played as picture-frozen narration
+    for the remainder. Supabase itself was NOT missing any data (all shots
+    were filled) - this was purely a transient download failure during
+    that one assembly run.
+
+    Fix: retry with backoff (same pattern as _resilient_get/_resilient_post
+    above), plus print a line on every failed attempt and a final failure
+    line, so a real failure is visible in the run log instead of vanishing
+    into all_skipped with zero explanation.
+    """
+    last_reason = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, timeout=120)
+            if resp.status_code == 200 and len(resp.content) > 0:
+                with open(dest_path, "wb") as f:
+                    f.write(resp.content)
+                return True
+            last_reason = f"HTTP {resp.status_code}, {len(resp.content)} bytes"
+        except requests.RequestException as e:
+            last_reason = str(e)
+
+        if attempt == max_attempts:
+            break
+        wait = min(5 * attempt, 20)
+        print(f"  [download] attempt {attempt}/{max_attempts} failed for {url}: {last_reason}. Retrying in {wait}s...")
+        time.sleep(wait)
+
+    print(f"  [download] GAVE UP after {max_attempts} attempts on {url}: {last_reason}")
     return False
 
 
