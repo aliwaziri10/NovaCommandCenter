@@ -32,6 +32,11 @@ CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
 KEN_BURNS_ZOOM = 0.08
+# ADDED (2026-08-26): small fixed freeze-hold tacked onto the very end of
+# the finished video (after narration ends), per Zia's request - without
+# this, the video cuts the instant the last shot/narration finishes,
+# which reads as an abrupt stop rather than a settled ending.
+END_FREEZE_SECONDS = 0.75
 
 TARGET_UPLOAD_MB = 45
 AUDIO_BITRATE_KBPS = 128
@@ -636,21 +641,30 @@ def main():
     total_duration = _build_mixed_audio(audio_path, extracted_sfx, mixed_audio_path)
 
     video_duration = _get_video_duration(silent_path)
-    pad_seconds = total_duration - video_duration
+    # END-FREEZE FIX (2026-08-26): the target held-through duration now
+    # includes END_FREEZE_SECONDS, so the finished video always settles
+    # on the last frame for a beat after narration ends instead of
+    # cutting the instant the last word/shot finishes. This is separate
+    # from the CROSSFADE=0.5s scene-to-scene transitions above - it only
+    # affects the single tail-end of the fully assembled video, not any
+    # point between shots.
+    target_duration = total_duration + END_FREEZE_SECONDS
+    pad_seconds = target_duration - video_duration
     if pad_seconds > 0.5:
         print(
-            f"Video track ({video_duration:.1f}s) is shorter than narration "
-            f"({total_duration:.1f}s) - freezing the last frame for an extra "
-            f"{pad_seconds:.1f}s so no narration gets cut off."
+            f"Video track ({video_duration:.1f}s) is shorter than narration + "
+            f"end-freeze ({target_duration:.1f}s) - freezing the last frame for "
+            f"an extra {pad_seconds:.1f}s (includes {END_FREEZE_SECONDS}s end-hold) "
+            f"so no narration gets cut off and the video settles before ending."
         )
         cinematic_vf = f"tpad=stop_mode=clone:stop_duration={pad_seconds:.2f}," + CINEMATIC_VF_BASE
     else:
         cinematic_vf = CINEMATIC_VF_BASE
 
-    video_kbps = _compute_target_video_kbps(total_duration)
+    video_kbps = _compute_target_video_kbps(target_duration)
     print(
         f"Applying cinematic grade and merging mixed audio "
-        f"(duration={total_duration:.1f}s, target video bitrate={video_kbps}kbps, "
+        f"(duration={target_duration:.1f}s, target video bitrate={video_kbps}kbps, "
         f"budget={TARGET_UPLOAD_MB}MB)..."
     )
     _run_ffmpeg([
@@ -667,9 +681,18 @@ def main():
         "-bufsize", f"{int(video_kbps * 2)}k",
         "-c:a", "aac",
         "-b:a", f"{AUDIO_BITRATE_KBPS}k",
-        "-shortest",
+        # CHANGED (2026-08-26): was "-shortest", which capped the final
+        # output at narration length and silently discarded the new
+        # end-freeze extension (video track ran longer than audio, so
+        # "-shortest" cut it right back down to audio length - the freeze
+        # would have been added and then immediately thrown away). "-t"
+        # with the explicit target duration keeps the added hold; audio
+        # simply ends in silence for the last END_FREEZE_SECONDS, which is
+        # correct for a freeze-frame with no dialogue happening over it.
+        "-t", f"{target_duration:.2f}",
         final_path,
     ])
+
 
     final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
     print(f"Final file size: {final_size_mb:.1f}MB (budget was {TARGET_UPLOAD_MB}MB)")
