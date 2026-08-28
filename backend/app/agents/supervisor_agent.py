@@ -8,7 +8,7 @@ from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
 from app.agents.asset_generation_agent import _parse_shots
-from app.agents.github_actions_client import trigger_workflow
+from app.agents.github_actions_client import trigger_workflow, open_issue
 from app.agents.strategy_research_agent import run_strategy_research
 
 MAX_RETRIES = 2
@@ -70,6 +70,22 @@ def _has_recent_task(db, agent_name, id_key, id_value, minutes):
         if str(payload.get(id_key)) == str(id_value):
             return True
     return False
+
+
+# ADDED (2026-08-28): the id_key used for each agent's payload, so the
+# generic abandonment-alert code below can look up the right identifier
+# without a big if/elif chain duplicated from _find_next_task. Keys must
+# match exactly what _execute()/each return statement in _find_next_task
+# already puts in payload for that agent_name.
+AGENT_ID_KEY = {
+    "assembly": "video_id",
+    "video_clips": "video_id",
+    "narration": "video_id",
+    "video_planning": "script_id",
+    "script_writing": "topic_id",
+    "topic_research": "category",
+    "strategy_research": "scope",
+}
 
 
 def _find_next_task(db):
@@ -203,6 +219,60 @@ def _write_log(entry):
         pass
 
 
+def _maybe_alert_permanent_abandonment(db, agent_name, payload, error_text):
+    """ADDED (2026-08-28): fires exactly once, at the moment a given
+    (agent_name, id) combination's failure count reaches MAX_RETRIES -
+    i.e. the exact cycle where _find_next_task will start silently
+    skipping it forever. Before this, that skip was permanent and
+    invisible: no issue, no log line anyone would see, nothing. A topic
+    could sit half-finished for weeks and nobody would know without
+    manually querying failed tasks (this is exactly what happened to
+    topic aac24763 on 2026-08-26/27).
+
+    Fires "exactly once" because this only runs from the except-block of
+    run_supervisor_cycle right after a failure is recorded, and
+    _find_next_task never selects a (agent_name, id) again once its
+    failure count >= MAX_RETRIES - so the count can never be observed
+    equal to MAX_RETRIES a second time for the same id.
+
+    id_key/id_value are looked up generically via AGENT_ID_KEY rather
+    than a per-agent if/elif chain, so adding a new agent to the
+    supervisor later can't accidentally skip wiring this up.
+
+    Never raises - a broken alert must not break the supervisor cycle
+    itself (same reasoning as open_issue()'s own internal try/except).
+    """
+    try:
+        id_key = AGENT_ID_KEY.get(agent_name)
+        if not id_key:
+            return
+        id_value = payload.get(id_key)
+        if id_value is None:
+            return
+
+        attempts = _failed_attempts(db, agent_name, id_key, id_value)
+        if attempts != MAX_RETRIES:
+            return
+
+        title = f"Supervisor gave up: {agent_name} permanently stuck for {id_key}={id_value}"
+        body = (
+            f"The supervisor has hit MAX_RETRIES ({MAX_RETRIES}) for this "
+            f"(agent, id) pair and will now silently skip it forever - "
+            f"`_find_next_task` excludes anything at or above MAX_RETRIES "
+            f"failed attempts.\n\n"
+            f"**Agent:** {agent_name}\n"
+            f"**{id_key}:** {id_value}\n"
+            f"**Last error:**\n```\n{str(error_text)[:1500]}\n```\n\n"
+            f"This will NOT be retried automatically. To unstick it, clear "
+            f"the failed `tasks` rows for this {id_key} in Supabase (resets "
+            f"the attempt count to 0) once the underlying cause is "
+            f"addressed, or investigate why it's failing first."
+        )
+        open_issue(title, body, labels=["supervisor-abandoned"])
+    except Exception as e:
+        print(f"WARNING: _maybe_alert_permanent_abandonment itself failed (non-fatal): {type(e).__name__}: {e}")
+
+
 def run_supervisor_cycle(db):
     started_at = datetime.utcnow()
 
@@ -252,6 +322,7 @@ def run_supervisor_cycle(db):
         merged["error"] = str(e)
         task.payload = merged
         db.commit()
+        _maybe_alert_permanent_abandonment(db, next_action["agent_name"], next_action["payload"], str(e))
         result = {
             "timestamp": str(started_at),
             "action": "failed",
