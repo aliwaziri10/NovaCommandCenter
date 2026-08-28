@@ -11,12 +11,6 @@ on:
     - cron: "30 * * * *"
 
 concurrency:
-  # FIX (2026-08-03): the previous fix grouped by video_id, but Agnes's rate
-  # limit is account-wide, not per-video - so two DIFFERENT videos generating
-  # clips at the same time could still collide and cause 429s. Using one
-  # fixed group name for every run (regardless of which video_id) makes any
-  # new trigger wait for whichever run is currently using the Agnes account
-  # to finish first, no matter which video it's for.
   group: generate-videos-agnes-account
   cancel-in-progress: false
 
@@ -35,7 +29,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests==2.32.3 numpy
+          pip install requests==2.32.3 numpy==1.24.4 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9
 
       - name: Run video clip generation
         env:
@@ -43,3 +37,4 @@ jobs:
           AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
           VIDEO_ID: ${{ inputs.video_id }}
         run: python .github/scripts/generate_videos.py
+      
