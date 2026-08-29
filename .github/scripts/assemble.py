@@ -38,7 +38,16 @@ KEN_BURNS_ZOOM = 0.08
 # which reads as an abrupt stop rather than a settled ending.
 END_FREEZE_SECONDS = 0.75
 
-TARGET_UPLOAD_MB = 45
+# LOWERED (2026-08-29): was 45. Upload to Supabase Storage was failing
+# (400, then surfaced as an unhandled 500 from the backend) because the
+# actual rendered file size regularly overshoots this "budget" - ffmpeg's
+# -b:v/-maxrate/-bufsize only bound the *average* bitrate, not the final
+# file size, and confirmed live this was landing at 53.9MB against a
+# 45MB budget. The Supabase bucket's file_size_limit has separately been
+# raised (200MB) so overshoot alone won't block uploads going forward,
+# but tightening this budget's margin keeps files smaller/faster to
+# upload and stops the bitrate calc from being so close to any limit.
+TARGET_UPLOAD_MB = 35
 AUDIO_BITRATE_KBPS = 128
 MIN_VIDEO_KBPS = 400
 # RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
@@ -120,6 +129,16 @@ def _resilient_post(url, max_attempts=5, **kwargs):
     attempt by re-opening from the caller, so this wrapper takes a
     path instead of an open file handle to avoid resending an
     already-consumed/closed stream on retry.
+
+    NOTE (2026-08-29): this wrapper only retries on 502/503/504 (Render
+    gateway/cold-start symptoms). A 500 from the backend (e.g. the
+    Supabase Storage upload inside upload_router.py failing and being
+    surfaced as an unhandled 500) is NOT retried here on purpose - it's
+    a real application-level failure, not a transient gateway issue, and
+    retrying it blindly would just repeat the same failure 5 times. See
+    TARGET_UPLOAD_MB comment above and the raised Supabase bucket
+    file_size_limit for the actual fix to the 500 seen on video
+    4fc244de-5e0d-4c36-91ab-825df9036085.
     """
     last_exc = None
     for attempt in range(1, max_attempts + 1):
