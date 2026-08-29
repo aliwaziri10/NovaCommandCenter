@@ -41,7 +41,13 @@ END_FREEZE_SECONDS = 0.75
 TARGET_UPLOAD_MB = 45
 AUDIO_BITRATE_KBPS = 128
 MIN_VIDEO_KBPS = 400
-OUTPUT_RESOLUTION_VF = "scale=1280:720"
+# RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
+# is already rendered/assembled at full 1920x1080 (see RESOLUTION above),
+# but the final cinematic-grade ffmpeg pass was silently downscaling it
+# back down to 720p on every single export for no technical reason. Fixed
+# to match RESOLUTION so the 1080p Nova already renders internally is
+# actually what reaches the uploaded file, instead of being thrown away.
+OUTPUT_RESOLUTION_VF = "scale=1920:1080"
 
 CINEMATIC_VF_BASE = (
     f"{OUTPUT_RESOLUTION_VF},"
