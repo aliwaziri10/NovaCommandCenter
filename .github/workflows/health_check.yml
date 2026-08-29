@@ -28,4 +28,5 @@ jobs:
         env:
           RAILWAY_URL: ${{ secrets.RAILWAY_URL }}
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: python .github/scripts/health_check.py
