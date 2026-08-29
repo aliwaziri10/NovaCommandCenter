@@ -43,6 +43,9 @@ text.pollinations.ai retired in favor of gen.pollinations.ai/text.
 ### YouTube channel authorization confirmed correct (resolved 2026-07-19, structurally reconfirmed 2026-08-04)
 Root cause was never credentials — it was OAuth Playground defaulting to the wrong Google identity (personal "Zia Waziri" instead of the "Awesome Amazing Unbelievable" Brand Account that owns Alternate Earth) during token generation. Fixed by explicitly selecting the Brand Account when authorizing. Reconfirmed structurally 2026-08-04: youtube_upload.py verifies the authorized channel title is "Alternate Earth" BEFORE any upload and hard-refuses otherwise — so any successful upload structurally proves the token is correct, no separate OAuth check needed.
 
+### narrate.py abbreviation-split bug — mid-sentence pause on "Dr.", "U.S.", etc. (fixed 2026-08-29, confirmed committed)
+`split_into_segments()` split on ANY `.`/`!`/`?` + whitespace, wrongly treating abbreviations/initials as sentence ends and inserting a full inter-sentence silence gap mid-sentence. Fixed with an `_ABBREVIATIONS` set + single-letter-initial guard. CONFIRMED via direct GitHub read this session: identical fix (same regex, same abbreviation list, same fallback logic) is also live in Marius's `scripts/narration.py` — both pipelines fixed in parallel. **Not yet listen-test-verified** on a real post-fix render for either pipeline.
+
 ## Unresolved / needs verification
 
 - **.env.example does not exist in this repo at all** (not just uncommitted — never created). config.py's `database_url` still defaults to `sqlite:///./data/nova.db`. Harmless as long as Render's real DATABASE_URL env var is always set, but a silent landmine if that var is ever missing/misspelled.
@@ -53,6 +56,9 @@ Root cause was never credentials — it was OAuth Playground defaulting to the w
 - **ACE_MUSIC_API_KEY** is declared as a secret in assemble.yml's env but is not referenced anywhere in assemble.py — looks like a dead/unused secret or a planned feature that was never built.
 - **Long-video audio/video length mismatch risk**: appears to already be handled in assemble.py via a `tpad` freeze-frame pad when the video track is shorter than narration — not yet confirmed on a real end-to-end run, worth watching once 6dc13529 assembles.
 - **Supervisor workflow (supervisor.yml) not yet observed in a real run** — added 2026-08-09, logic not yet battle-tested against a genuine stuck video or a genuinely stale issue.
+- **`_fit_clip_to_duration` freeze-frame fix (2026-08-29)** — plays short clips at real length instead of padding. Zia reports this fixed live, but not independently verified against real video data this session.
+- **`/api/v1/videos` on the Render backend (novacommandcenter.onrender.com) cannot be reached from this environment** — confirmed 2026-08-29: the site's robots.txt disallows automated fetches, so this isn't a missing-URL problem, it's a hard block for any tool that respects robots.txt. Standing workaround: Zia pastes the relevant video's real JSON directly into chat when live status/shot-duration data is needed. Same constraint will apply to 1080p output verification (Marius and Nova both) — real video data has to come from Zia, not a live pull, until/unless a different access path (Zia's own terminal, an authenticated API key passed some other way) is set up.
+- **1080p resolution fixes not yet verified against a real completed video** — Marius (`223a62c8`) and Nova (`b5db18ad`) both changed output resolution this session; neither has been confirmed against an actual rendered file yet, and both real-data paths (Render endpoint above, Marius paused until end of September) are currently blocked.
 
 ## Rule
 Every new bug (and its fix, once resolved) gets logged here immediately — including changes pushed directly by Ali outside a Claude session.
