@@ -219,6 +219,34 @@ def get_status_issue_number():
     return None
 
 
+def ensure_label_exists():
+    """Creates the 'pipeline-status' label if it doesn't exist yet. gh issue
+    create fails hard on an unknown label, so this is checked once up front
+    instead of assuming the label was ever manually created in the repo."""
+    result = subprocess.run(
+        ["gh", "label", "list", "--search", "pipeline-status", "--json", "name"],
+        capture_output=True, text=True,
+    )
+    existing_names = []
+    if result.returncode == 0:
+        try:
+            existing_names = [l["name"] for l in json.loads(result.stdout)]
+        except json.JSONDecodeError:
+            pass
+    if "pipeline-status" in existing_names:
+        return True
+    create_result = subprocess.run(
+        ["gh", "label", "create", "pipeline-status",
+         "--description", "Auto-generated Nova pipeline status report",
+         "--color", "0E8A16"],
+        capture_output=True, text=True,
+    )
+    if create_result.returncode != 0:
+        print(f"Warning: could not create 'pipeline-status' label: {create_result.stderr}")
+        return False
+    return True
+
+
 def write_status_issue(body):
     existing = get_status_issue_number()
     if existing:
@@ -227,13 +255,16 @@ def write_status_issue(body):
             check=True,
         )
         print(f"Updated pipeline status issue #{existing}.")
-    else:
-        subprocess.run(
-            ["gh", "issue", "create", "--title", STATUS_ISSUE_TITLE, "--body", body,
-             "--label", "pipeline-status"],
-            check=True,
-        )
-        print("Created pipeline status issue.")
+        return
+
+    label_args = []
+    if ensure_label_exists():
+        label_args = ["--label", "pipeline-status"]
+    subprocess.run(
+        ["gh", "issue", "create", "--title", STATUS_ISSUE_TITLE, "--body", body] + label_args,
+        check=True,
+    )
+    print("Created pipeline status issue.")
 
 
 def main():
