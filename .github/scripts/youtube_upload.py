@@ -21,13 +21,33 @@ YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 # pair fails loudly and immediately instead of silently posting to Erased.
 EXPECTED_CHANNEL_TITLE = "Alternate Earth"
 
-# UPDATED (2026-08-16): uploads are now PRIVATE, not public. Zia flagged real
+# UPDATED (2026-08-16): uploads are private, not public. Zia flagged real
 # quality problems (generic opening frame, per-scene freeze-holds, a 30-40s
 # end-of-video freeze, character age drift) that are still being fixed and
 # tested. Every upload lands as private until Zia personally reviews it in
 # YouTube Studio and flips it public himself. Do not change this back to
 # "public" without an explicit instruction from Zia.
-UPLOAD_PRIVACY_STATUS = "public"
+# FIX (2026-08-29): this was hardcoded to "public" despite the comment above
+# saying "private" - every upload since 2026-08-16 has actually been going
+# out public and unreviewed. Corrected to match the intended behavior.
+UPLOAD_PRIVACY_STATUS = "private"
+
+# --- Required metadata that was previously missing on every Nova upload ---
+# FIX (2026-08-29): uploads had a title only - no fallback description, no
+# "made for kids" declaration, no AI-generated-content disclosure. YouTube
+# requires the made-for-kids answer on every upload (silently defaults if
+# omitted) and strongly expects synthetic/altered media to be disclosed.
+# These are now always set explicitly, never left for manual fixing later.
+SELF_DECLARED_MADE_FOR_KIDS = False  # Alternate Earth is not child-directed content
+CONTAINS_SYNTHETIC_MEDIA = True      # AI-generated visuals/voiceover - always disclosed
+
+FALLBACK_DESCRIPTION = (
+    "This video explores a speculative \"what if\" scenario as part of the "
+    "Alternate Earth series.\n\n"
+    "This video was made using AI-generated visuals and AI narration.\n\n"
+    "Subscribe for more speculative history and alternate-timeline documentaries."
+)
+AI_DISCLOSURE_LINE = "This video was made using AI-generated visuals and AI narration."
 
 # --- Chapter markers (added 2026-08-02) ---
 # YouTube requires: first chapter at 0:00, at least 3 chapters, each chapter
@@ -142,6 +162,22 @@ def _build_chapters_block(shot_durations, script_content):
     return "\n".join(lines)
 
 
+def _build_final_description(raw_description, chapters_block):
+    """Guarantees every upload has a real, non-empty description containing
+    the AI-content disclosure line, regardless of whether the backend video
+    record has a description or chapters could be generated."""
+    description = (raw_description or "").strip()
+    if not description:
+        description = FALLBACK_DESCRIPTION
+    elif AI_DISCLOSURE_LINE not in description:
+        description = description + "\n\n" + AI_DISCLOSURE_LINE
+
+    if chapters_block:
+        description = chapters_block + "\n\n" + description
+
+    return description
+
+
 def wake_up_backend(max_attempts=4):
     """
     Wakes a sleeping Render free-tier instance before hitting the real endpoint.
@@ -230,6 +266,8 @@ def _upload_to_youtube(video_bytes, title, description, access_token):
         },
         "status": {
             "privacyStatus": UPLOAD_PRIVACY_STATUS,
+            "selfDeclaredMadeForKids": SELF_DECLARED_MADE_FOR_KIDS,
+            "containsSyntheticMedia": CONTAINS_SYNTHETIC_MEDIA,
         },
     }
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -272,6 +310,7 @@ def main():
     print(f"Channel verified ({EXPECTED_CHANNEL_TITLE}) - proceeding.")
 
     print(f"Uploads will be marked '{UPLOAD_PRIVACY_STATUS}' (Zia reviews and publishes manually).")
+    print(f"Made for kids: {SELF_DECLARED_MADE_FOR_KIDS} | AI-content disclosure: {CONTAINS_SYNTHETIC_MEDIA}")
 
     print("Waking backend and fetching video list...")
     resp = wake_up_backend()
@@ -310,11 +349,14 @@ def main():
 
     chapters_block = _build_chapters_block(shot_durations, script_content)
     if chapters_block:
-        description = chapters_block + "\n\n" + description if description else chapters_block
         print("Chapter markers added to description:")
         print(chapters_block)
     else:
         print("Proceeding without chapter markers.")
+
+    description = _build_final_description(description, chapters_block)
+    print("Final description that will be uploaded:")
+    print(description)
 
     print(f"Downloading final video file for {video_id}...")
     file_resp = requests.get(
