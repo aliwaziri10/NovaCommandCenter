@@ -28,6 +28,39 @@ RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
+# ADDED (2026-08-31): DIRECT-TO-SUPABASE UPLOAD FIX.
+# ROOT CAUSE CONFIRMED via two matched production runs on the exact same
+# video (b43ac407-...): run #356 (pre-CRF, 400kbps/35MB budget) produced a
+# 48.1MB file and uploaded successfully. Run #357 (post-CRF-20 change,
+# same video, same shots, same narration) produced a 743.7MB file and
+# failed on upload with HTTP 502, four separate times, on every retry.
+# A second, different video (4fc244de, 56 shots) independently produced
+# 659.2MB and failed identically across at least two separate runs (#359,
+# #360) hours apart - including one run that started *after* the
+# keep-alive and PUT-timeout fixes were already live, which rules out
+# cold-start as the cause. The one variable that changed between "always
+# worked" and "always fails" is file size, not timing.
+# Render's free-tier backend runs on very limited RAM. A 650-750MB upload
+# arriving as a single multipart POST is a highly plausible way to OOM-
+# crash that process on every attempt, warm or not - which surfaces to
+# the client as an opaque 502, indistinguishable from a cold start unless
+# you're looking at Render's own crash logs.
+# Fix: this script now uploads the finished video file directly from the
+# GitHub Actions runner to Supabase Storage (same bucket the backend
+# already uses), completely bypassing Render for the large-file transfer.
+# The backend is then updated with a single small JSON PATCH
+# (~100 bytes: status + the resulting public URL) via the existing
+# generic /api/v1/videos/{id} CRUD endpoint - the same pattern
+# youtube_upload.py already uses to mark a video as uploaded. This keeps
+# CRF 20 (no quality compromise) while removing Render's free-tier RAM
+# entirely from the critical path for this step.
+# Requires SUPABASE_URL and SUPABASE_SECRET_KEY as env vars on this
+# workflow (same values already set on the Render backend service) - see
+# assemble.yml.
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
+SUPABASE_BUCKET = "nova-media"
+
 DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
@@ -60,6 +93,10 @@ END_FREEZE_SECONDS = 0.75
 # length, and the upload path no longer double-buffers the full file in
 # memory (see upload_router.py/supabase_storage.py, same date) so a
 # larger file doesn't add OOM risk on Render's free-tier instance.
+# NOTE (2026-08-31): that OOM-risk mitigation in upload_router.py helped
+# but was not sufficient on its own - see DIRECT-TO-SUPABASE UPLOAD note
+# above. This CRF choice itself is unchanged and is not being walked back;
+# only how the resulting large file gets uploaded has changed.
 VIDEO_CRF = 20  # visually near-lossless for x264; lower = higher quality/larger file
 AUDIO_BITRATE_KBPS = 128
 # RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
@@ -159,7 +196,11 @@ _FREEZE_PAD_LOG = []
 # render in the first place: a background thread pings the cheap /health
 # endpoint every 5 minutes for as long as main() is doing local work, so
 # Render's 15-minute inactivity clock never completes a full cycle and
-# the backend is already warm when the upload POST arrives.
+# the backend is already warm for the small metadata calls this script
+# still makes to it (video fetch, narration download, final status PATCH).
+# NOTE (2026-08-31): this thread is still useful - it just no longer needs
+# to keep the backend warm for a giant file upload, only for the small
+# calls that remain. Left in place unchanged.
 _KEEPALIVE_STOP = threading.Event()
 
 
@@ -209,42 +250,18 @@ def _resilient_get(url, max_attempts=5, **kwargs):
     raise last_exc
 
 
-def _resilient_post(url, max_attempts=5, **kwargs):
-    """UPLOAD COLD-START FIX (2026-08-22): confirmed live on run #309 -
-    the upload POST at the very end of main() (after ~18 minutes of
-    rendering with no backend calls in between) hit a 502 Bad Gateway
-    because Render's free-tier backend had spun back down from idling
-    during the render, and this POST had no retry, so 18 minutes of
-    completed work was thrown away on a single transient gateway error.
-    `files={"file": (...)}` opens the file handle fresh on each retry
-    attempt by re-opening from the caller, so this wrapper takes a
-    path instead of an open file handle to avoid resending an
-    already-consumed/closed stream on retry.
-
-    NOTE (2026-08-29): this wrapper only retries on 502/503/504 (Render
-    gateway/cold-start symptoms). A 500 from the backend (e.g. the
-    Supabase Storage upload inside upload_router.py failing and being
-    surfaced as an unhandled 500) is NOT retried here on purpose - it's
-    a real application-level failure, not a transient gateway issue, and
-    retrying it blindly would just repeat the same failure 5 times.
-
-    NOTE (2026-08-30): this retry-after-the-fact logic is a safety net,
-    not the primary fix, for long renders - see _start_keepalive() above.
-    A render long enough to fully exceed Render's ~15 min spin-down
-    window (confirmed at 56 minutes on video 4fc244de) can exhaust even
-    this backoff (150s total) before a full cold start completes on top
-    of transferring a large body. The keep-alive thread prevents the
-    backend from ever sleeping during the render; this remains as
-    protection against any other transient gateway blip.
+def _resilient_patch_json(url, json_body, max_attempts=5, timeout=60):
+    """ADDED (2026-08-31): small-body version of _resilient_get's retry
+    pattern, for the final status-update PATCH to the backend (see
+    DIRECT-TO-SUPABASE UPLOAD note above). This request is tiny (a JSON
+    object with a status string and a URL) so cold-start/gateway retries
+    are cheap here in a way they were never cheap for the old full-file
+    POST - there's no multi-hundred-MB body to re-send on every retry.
     """
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
-            file_path = kwargs.pop("_file_path")
-            file_field_name = kwargs.pop("_file_field_name")
-            with open(file_path, "rb") as f:
-                files = {file_field_name: ("final.mp4", f, "video/mp4")}
-                resp = requests.post(url, files=files, **kwargs)
+            resp = requests.patch(url, json=json_body, timeout=timeout)
             if resp.status_code in (502, 503, 504):
                 raise requests.RequestException(
                     f"backend not ready yet (HTTP {resp.status_code})"
@@ -252,14 +269,60 @@ def _resilient_post(url, max_attempts=5, **kwargs):
             return resp
         except requests.RequestException as e:
             last_exc = e
-            kwargs["_file_path"] = file_path
-            kwargs["_file_field_name"] = file_field_name
             if attempt == max_attempts:
                 break
             wait = min(15 * attempt, 60)
-            print(f"Upload backend not ready (attempt {attempt}/{max_attempts}): {e}. Retrying in {wait}s...")
+            print(f"Status PATCH backend not ready (attempt {attempt}/{max_attempts}): {e}. Retrying in {wait}s...")
             time.sleep(wait)
     raise last_exc
+
+
+def _upload_final_video_to_supabase(video_id, file_path):
+    """ADDED (2026-08-31): uploads the finished, fully-assembled video
+    file DIRECTLY from this GitHub Actions runner to Supabase Storage,
+    bypassing Render entirely for this transfer - see DIRECT-TO-SUPABASE
+    UPLOAD note near the top of this file for why. Streams the file from
+    disk (not loaded fully into memory first) since this runner's own
+    memory is also finite, though far less constrained than Render's
+    free tier. Mirrors the same bucket/path convention the backend's own
+    upload_to_storage() uses (backend/app/supabase_storage.py) so the
+    resulting public URL is indistinguishable from one the backend would
+    have produced itself.
+
+    Raises RuntimeError with Supabase's actual error text on failure -
+    matches the "never fail silently" principle from supabase_storage.py.
+    """
+    path_in_bucket = f"final/{video_id}.mp4"
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path_in_bucket}"
+    file_size = os.path.getsize(file_path)
+
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Content-Type": "video/mp4",
+        "Content-Length": str(file_size),
+        "x-upsert": "true",
+    }
+
+    last_exc = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with open(file_path, "rb") as f:
+                resp = requests.put(upload_url, headers=headers, data=f, timeout=900)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase Storage upload failed ({resp.status_code}): {resp.text[:500]}"
+                )
+            return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path_in_bucket}"
+        except (requests.RequestException, RuntimeError) as e:
+            last_exc = e
+            if attempt == max_attempts:
+                break
+            wait = 20 * attempt
+            print(f"Direct-to-Supabase upload attempt {attempt}/{max_attempts} failed: {e}. Retrying in {wait}s...")
+            time.sleep(wait)
+    raise RuntimeError(f"Direct-to-Supabase upload failed after {max_attempts} attempts: {last_exc}")
 
 
 def _parse_shots_count(production_plan):
@@ -736,7 +799,8 @@ def main():
     # Starts pinging /health every 5 min now, before any local rendering
     # begins, so the backend never crosses Render's ~15 min idle threshold
     # during the render (confirmed up to 56 min on video 4fc244de) and is
-    # already warm by the time the final upload POST fires below.
+    # already warm for the small metadata calls this script still makes
+    # to it (video fetch, narration download, final status PATCH).
     _start_keepalive()
 
     video_id = VIDEO_ID
@@ -924,17 +988,22 @@ def main():
     final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
     print(f"Final file size: {final_size_mb:.1f}MB (CRF {VIDEO_CRF}, no size budget applied).")
 
-    print("Uploading finished video back to Railway...")
-    upload_resp = _resilient_post(
-        f"{RAILWAY_URL}/api/v1/upload/video/{video_id}",
-        headers=HEADERS,
-        timeout=600,
-        _file_path=final_path,
-        _file_field_name="file",
-    )
-    upload_resp.raise_for_status()
+    # DIRECT-TO-SUPABASE UPLOAD (2026-08-31): see note near the top of this
+    # file. The large file (hundreds of MB at CRF 20) now goes straight
+    # from this runner to Supabase Storage - Render never sees it. Only a
+    # small JSON status update reaches Render afterward.
+    print("Uploading finished video directly to Supabase Storage (bypassing Render for the large-file transfer)...")
+    video_url = _upload_final_video_to_supabase(video_id, final_path)
+    print(f"Uploaded to Supabase Storage: {video_url}")
 
-    print("SUCCESS:", upload_resp.json())
+    print("Marking video as assembled on the backend (small JSON PATCH, no file transfer)...")
+    patch_resp = _resilient_patch_json(
+        f"{RAILWAY_URL}/api/v1/videos/{video_id}",
+        {"status": "assembled", "video_url": video_url},
+    )
+    patch_resp.raise_for_status()
+
+    print("SUCCESS:", patch_resp.json())
     if all_errors:
         print("Note: some shots had issues:", all_errors)
 
