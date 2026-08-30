@@ -49,6 +49,25 @@ FALLBACK_DESCRIPTION = (
 )
 AI_DISCLOSURE_LINE = "This video was made using AI-generated visuals and AI narration."
 
+# ADDED (2026-08-30): assemble.py now mixes a royalty-free chapter music bed
+# into every video (NOVA_REBUILD_HANDOFF.md item #6), sourced from Kevin
+# MacLeod / incompetech.com under Creative Commons BY 3.0 - the license
+# requires attribution wherever the video is published. assemble.py has no
+# way to write to the video's YouTube description itself (that's this
+# script's job, at upload time), so this line is always included here,
+# unconditionally, alongside the AI-disclosure line. It's included even on
+# a run where every chapter track happened to fail to download (see
+# assemble.py's _build_music_bed - a per-video, per-segment silent
+# degrade), since this script has no reliable signal on whether any given
+# uploaded video actually ended up with music in it - the license
+# obligation is cheap and unconditional attribution is the safe default,
+# not a real cost, whereas omitting it on a video that DID get music
+# would be a real compliance gap.
+MUSIC_ATTRIBUTION_LINE = (
+    "Music by Kevin MacLeod (incompetech.com), licensed under Creative "
+    "Commons: By Attribution 3.0 (creativecommons.org/licenses/by/3.0/)"
+)
+
 # --- Chapter markers (added 2026-08-02) ---
 # YouTube requires: first chapter at 0:00, at least 3 chapters, each chapter
 # at least 10 seconds long. We build chapters from the REAL shot_durations
@@ -164,13 +183,17 @@ def _build_chapters_block(shot_durations, script_content):
 
 def _build_final_description(raw_description, chapters_block):
     """Guarantees every upload has a real, non-empty description containing
-    the AI-content disclosure line, regardless of whether the backend video
-    record has a description or chapters could be generated."""
+    the AI-content disclosure line and the required music-attribution line,
+    regardless of whether the backend video record has a description or
+    chapters could be generated."""
     description = (raw_description or "").strip()
     if not description:
         description = FALLBACK_DESCRIPTION
     elif AI_DISCLOSURE_LINE not in description:
         description = description + "\n\n" + AI_DISCLOSURE_LINE
+
+    if MUSIC_ATTRIBUTION_LINE not in description:
+        description = description + "\n\n" + MUSIC_ATTRIBUTION_LINE
 
     if chapters_block:
         description = chapters_block + "\n\n" + description
