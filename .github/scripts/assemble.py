@@ -82,6 +82,51 @@ NATIVE_SFX_VOLUME = 0.16
 NARRATION_VOLUME_WITH_LAYERS = 0.95
 LIMITER_CEILING = 0.98
 
+# ADDED (2026-08-30, NOVA_REBUILD_HANDOFF.md item #6): music cue/mood
+# shift at every chapter boundary. Chapter boundaries are derived from the
+# same fixed timing spine already baked into script_writing_agent.py's
+# Rule 0 (Curiosity Loop six-beat structure / Hook-Problem-Solution-Payoff
+# spine) - NOT from parsing `[CHAPTER: ...]` markers out of the script
+# text. There is currently no mapping from a chapter marker's position in
+# the script to a timestamp in the assembled video (shots are planned
+# separately from the script by video_planning_agent), so deriving cue
+# points from Rule 0's already-fixed percentage/second targets is the only
+# reliable timing source assemble.py has today. If a real chapter-to-shot
+# mapping gets built later, swap the fixed fractions in
+# _chapter_time_bounds() below for that instead - everything downstream
+# (crossfade, mixing) stays the same.
+#
+# Tracks are Kevin MacLeod / incompetech.com, Creative Commons BY 3.0 -
+# free to use, only requires attribution (fits the zero-budget
+# constraint). Filenames below follow incompetech's standard download
+# naming but have not been individually re-verified live - if a track
+# fails to download, that chapter's segment is simply silent instead of
+# failing the whole assembly (see _build_music_bed), so a bad filename
+# degrades gracefully and will show up as a "[music] ... failed to
+# download" line in the run log rather than breaking anything. Swap any
+# filename that shows up failing repeatedly.
+MUSIC_ENABLED = True
+MUSIC_VOLUME = 0.10
+MUSIC_CROSSFADE = 2.0
+MUSIC_BASE_URL = "https://incompetech.com/music/royalty-free/mp3-royaltyfree/"
+MUSIC_ATTRIBUTION = (
+    "Music by Kevin MacLeod (incompetech.com), licensed under Creative "
+    "Commons: By Attribution 3.0 (creativecommons.org/licenses/by/3.0/) - "
+    "STILL NEEDS TO BE ADDED to every video description by youtube_upload.py "
+    "(not done as part of this change - separate follow-up)."
+)
+# (chapter label, mood, incompetech filename) - one per Curiosity Loop beat,
+# in order (Cold Open, Problem/Stakes, Rising Delivery, Midpoint Twist,
+# Climax, Payoff).
+_MUSIC_CHAPTERS = [
+    ("Cold Open", "tense_mysterious", "The-Cannery.mp3"),
+    ("Problem/Stakes", "moody_dread", "Ossuary-6-Air.mp3"),
+    ("Rising Delivery", "building_tension", "Long-Note-One.mp3"),
+    ("Midpoint Twist", "dramatic_shift", "Rite-of-Passage.mp3"),
+    ("Climax", "intense_epic", "Impact-Moderato.mp3"),
+    ("Payoff", "resolving_uplifting", "Thoughtful.mp3"),
+]
+
 WORK_DIR = "/tmp/nova_assembly"
 FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -563,7 +608,88 @@ def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
     return audio_clip.volumex(scale)
 
 
-def _build_mixed_audio(narration_path, native_sfx_path, out_path):
+def _chapter_time_bounds(total_duration):
+    """Returns [(start, end, label, mood, filename), ...] for the chapters
+    that fit inside total_duration, matching Rule 0's fixed timing spine
+    in script_writing_agent.py exactly: Cold Open is a fixed 0-30s (or
+    less, if narration itself is shorter than 30s), Problem/Stakes runs
+    30s-25%, Rising Delivery 25%-50%, Midpoint Twist 50%-55% (a short band
+    for the re-hook moment itself), Climax 55%-85%, Payoff 85%-100%."""
+    cold_open_end = min(30.0, total_duration)
+    fraction_bounds = [
+        (cold_open_end, 0.25 * total_duration),
+        (0.25 * total_duration, 0.50 * total_duration),
+        (0.50 * total_duration, 0.55 * total_duration),
+        (0.55 * total_duration, 0.85 * total_duration),
+        (0.85 * total_duration, total_duration),
+    ]
+    all_bounds = [(0.0, cold_open_end)] + fraction_bounds
+    result = []
+    for (start, end), (label, mood, filename) in zip(all_bounds, _MUSIC_CHAPTERS):
+        if end > start:
+            result.append((start, end, label, mood, filename))
+    return result
+
+
+def _download_music_track(filename, dest_path):
+    url = MUSIC_BASE_URL + filename
+    ok = _download_file(url, dest_path, max_attempts=2)
+    return dest_path if ok else None
+
+
+def _build_music_bed(total_duration, work_dir):
+    """Builds one continuous music AudioClip spanning total_duration, made
+    of each chapter's track trimmed/looped to fill its segment and
+    crossfaded into the next at the boundary (MUSIC_CROSSFADE seconds of
+    overlap with a fade on each side). Returns None if every track fails
+    to download or MUSIC_ENABLED is False - music is an optional layer,
+    never a hard dependency for assembly."""
+    if not MUSIC_ENABLED:
+        return None
+
+    bounds = _chapter_time_bounds(total_duration)
+    n = len(bounds)
+    segments = []
+
+    for idx, (start, end, label, mood, filename) in enumerate(bounds):
+        pre = MUSIC_CROSSFADE / 2 if idx > 0 else 0.0
+        post = MUSIC_CROSSFADE / 2 if idx < n - 1 else 0.0
+        seg_start = max(start - pre, 0.0)
+        seg_end = min(end + post, total_duration)
+        seg_duration = seg_end - seg_start
+        if seg_duration <= 0:
+            continue
+
+        track_path = os.path.join(work_dir, f"music_{filename}")
+        if not os.path.exists(track_path):
+            track_path = _download_music_track(filename, track_path)
+        if not track_path:
+            print(f"  [music] '{label}' ({mood}) track failed to download - that segment will be silent.")
+            continue
+
+        try:
+            raw_clip = AudioFileClip(track_path)
+            fitted = _fit_audio_to_duration(raw_clip, seg_duration).volumex(MUSIC_VOLUME)
+            if pre > 0:
+                fitted = fitted.audio_fadein(MUSIC_CROSSFADE)
+            if post > 0:
+                fitted = fitted.audio_fadeout(MUSIC_CROSSFADE)
+            fitted = fitted.set_start(seg_start)
+            segments.append(fitted)
+        except Exception as e:
+            print(f"  [music] '{label}' track failed to load ({type(e).__name__}: {e}) - that segment will be silent.")
+            continue
+
+    if not segments:
+        print("  [music] no chapter tracks available this run - proceeding without a music bed.")
+        return None
+
+    bed = CompositeAudioClip(segments).set_duration(total_duration)
+    print(f"  [music] built music bed from {len(segments)}/{n} chapter cues. {MUSIC_ATTRIBUTION}")
+    return bed
+
+
+def _build_mixed_audio(narration_path, native_sfx_path, music_clip, out_path):
     narration_clip = AudioFileClip(narration_path)
     duration = narration_clip.duration
 
@@ -577,6 +703,10 @@ def _build_mixed_audio(narration_path, native_sfx_path, out_path):
         extra_layers.append(sfx_clip)
     else:
         print("No native clip audio detected to mix in for this video.")
+
+    if music_clip:
+        print("Mixing in chapter music bed.")
+        extra_layers.append(music_clip)
 
     if extra_layers:
         narration_clip = narration_clip.volumex(NARRATION_VOLUME_WITH_LAYERS)
@@ -722,8 +852,18 @@ def main():
     print("Extracting native clip audio (ambient/sfx/laughter) for the mix...")
     extracted_sfx = _extract_native_audio(silent_path, native_sfx_path)
 
-    print("Building audio mix (narration + native clip audio)...")
-    total_duration = _build_mixed_audio(audio_path, extracted_sfx, mixed_audio_path)
+    print("Determining narration duration for chapter music timing...")
+    narration_duration_probe = AudioFileClip(audio_path).duration
+
+    print("Building chapter music bed...")
+    music_bed = None
+    try:
+        music_bed = _build_music_bed(narration_duration_probe, WORK_DIR)
+    except Exception as e:
+        print(f"  [music] music bed build failed entirely ({type(e).__name__}: {e}) - continuing without music.")
+
+    print("Building audio mix (narration + native clip audio + chapter music)...")
+    total_duration = _build_mixed_audio(audio_path, extracted_sfx, music_bed, mixed_audio_path)
 
     video_duration = _get_video_duration(silent_path)
     # END-FREEZE FIX (2026-08-26): the target held-through duration now
