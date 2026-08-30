@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -85,6 +86,40 @@ HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 # the cause of near-universal freeze-hold padding at scene ends.
 _FREEZE_PAD_LOG = []
 
+# KEEP-ALIVE FIX (2026-08-30): confirmed live on video 4fc244de - the
+# upload-cold-start retry logic added 2026-08-22 (_resilient_post) handles
+# a SHORT idle gap before upload, but this run did ~56 minutes of pure
+# local ffmpeg rendering with ZERO requests to the backend in between,
+# which is well past Render free tier's ~15 min inactivity spin-down
+# window. By the time the final upload POST fired, the backend had been
+# asleep for 40+ minutes, and even 4 retries with backoff (15/30/45/60s =
+# 150s total) weren't reliable margin to cover both a full cold start AND
+# transferring a 53.9MB body - confirmed failing 4/4 attempts on run
+# https://github.com/aliwaziri10/NovaCommandCenter/actions/runs/33268...
+# (video 4fc244de, 2026-08-30).
+#
+# Retrying harder after the backend has already gone to sleep is treating
+# the symptom. The actual fix is to never let it go to sleep during the
+# render in the first place: a background thread pings the cheap /health
+# endpoint every 5 minutes for as long as main() is doing local work, so
+# Render's 15-minute inactivity clock never completes a full cycle and
+# the backend is already warm when the upload POST arrives.
+_KEEPALIVE_STOP = threading.Event()
+
+
+def _keepalive_loop():
+    while not _KEEPALIVE_STOP.wait(300):  # 5 minutes
+        try:
+            requests.get(f"{RAILWAY_URL}/health", timeout=30)
+        except requests.RequestException:
+            pass  # best-effort only - _resilient_post still covers a genuine cold start
+
+
+def _start_keepalive():
+    t = threading.Thread(target=_keepalive_loop, daemon=True)
+    t.start()
+    return t
+
 
 def _resilient_get(url, max_attempts=5, **kwargs):
     """COLD-START FIX (2026-08-21): Render's free-tier backend spins down
@@ -139,6 +174,15 @@ def _resilient_post(url, max_attempts=5, **kwargs):
     TARGET_UPLOAD_MB comment above and the raised Supabase bucket
     file_size_limit for the actual fix to the 500 seen on video
     4fc244de-5e0d-4c36-91ab-825df9036085.
+
+    NOTE (2026-08-30): this retry-after-the-fact logic is a safety net,
+    not the primary fix, for long renders - see _start_keepalive() above.
+    A render long enough to fully exceed Render's ~15 min spin-down
+    window (confirmed at 56 minutes on video 4fc244de) can exhaust even
+    this backoff (150s total) before a full cold start completes on top
+    of transferring a 50MB+ body. The keep-alive thread prevents the
+    backend from ever sleeping during the render; this remains as
+    protection against any other transient gateway blip.
     """
     last_exc = None
     for attempt in range(1, max_attempts + 1):
@@ -556,6 +600,13 @@ def main():
     os.makedirs(media_dir, exist_ok=True)
     os.makedirs(blocks_dir, exist_ok=True)
 
+    # See KEEP-ALIVE FIX (2026-08-30) docstring near _KEEPALIVE_STOP above.
+    # Starts pinging /health every 5 min now, before any local rendering
+    # begins, so the backend never crosses Render's ~15 min idle threshold
+    # during the render (confirmed up to 56 min on video 4fc244de) and is
+    # already warm by the time the final upload POST fires below.
+    _start_keepalive()
+
     video_id = VIDEO_ID
     if not video_id:
         print("No VIDEO_ID provided - auto-selecting next video ready to assemble...")
@@ -743,6 +794,8 @@ def main():
     if all_errors:
         print("Note: some shots had issues:", all_errors)
 
+    _KEEPALIVE_STOP.set()
+
 
 def _print_failure_summary(exc):
     import traceback
@@ -770,3 +823,5 @@ if __name__ == "__main__":
     except Exception as e:
         _print_failure_summary(e)
         raise
+    finally:
+        _KEEPALIVE_STOP.set()
