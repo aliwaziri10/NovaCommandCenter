@@ -55,11 +55,18 @@ def upload_to_storage(path_in_bucket, content_bytes, content_type, content_lengt
     if content_length is not None:
         headers["Content-Length"] = str(content_length)
 
+    # TIMEOUT MATCHED (2026-08-30): was 300s. assemble.py's client-side
+    # POST to this backend's /upload/video/{id} was raised 300->600s the
+    # same session (larger CRF-encoded files, no artificial size budget
+    # anymore). This inner PUT to Supabase is the leg that actually
+    # transfers the bytes - leaving it at 300 while the outer timeout
+    # allows 600 meant this could time out first on a large file and
+    # surface as an opaque 502 without ever reaching the outer timeout.
     resp = requests.put(
         upload_url,
         headers=headers,
         data=content_bytes,
-        timeout=300,
+        timeout=600,
     )
     if resp.status_code >= 400:
         raise RuntimeError(f"Supabase Storage upload failed ({resp.status_code}): {resp.text}")
