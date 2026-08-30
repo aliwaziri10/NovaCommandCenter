@@ -36,7 +36,10 @@ async def upload_narration(video_id: str, file: UploadFile = File(...), db: Sess
     # restart/redeploy. Storing narration/final video only there was the
     # root cause of videos silently never reaching YouTube: the file
     # would vanish before the next scheduled pipeline step ran.
-    audio_url = upload_to_storage(f"narration/{video_id}.mp3", contents, "audio/mpeg")
+    try:
+        audio_url = upload_to_storage(f"narration/{video_id}.mp3", contents, "audio/mpeg")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase Storage upload failed: {e}")
 
     video.audio_path = audio_url
     db.commit()
@@ -69,7 +72,10 @@ async def upload_video(
 
     contents = await file.read()
 
-    video_url = upload_to_storage(f"final/{video_id}.mp4", contents, "video/mp4")
+    try:
+        video_url = upload_to_storage(f"final/{video_id}.mp4", contents, "video/mp4")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase Storage upload failed: {e}")
 
     video.video_url = video_url
     video.status = "assembled"
@@ -93,7 +99,10 @@ async def upload_video(
 @router.post("/reference/{tag}")
 async def upload_reference_frame(tag: str, file: UploadFile = File(...)):
     contents = await file.read()
-    image_url = upload_to_storage(f"reference/{tag}.png", contents, "image/png")
+    try:
+        image_url = upload_to_storage(f"reference/{tag}.png", contents, "image/png")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase Storage upload failed: {e}")
     return {
         "tag": tag,
         "url": image_url,
@@ -114,7 +123,10 @@ async def upload_reference_frame(tag: str, file: UploadFile = File(...)):
 @router.post("/clip/{tag}")
 async def upload_clip(tag: str, file: UploadFile = File(...)):
     contents = await file.read()
-    clip_url = upload_to_storage(f"clips/{tag}.mp4", contents, "video/mp4")
+    try:
+        clip_url = upload_to_storage(f"clips/{tag}.mp4", contents, "video/mp4")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=f"Supabase Storage upload failed: {e}")
     return {
         "tag": tag,
         "url": clip_url,
