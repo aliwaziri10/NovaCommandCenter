@@ -39,18 +39,29 @@ KEN_BURNS_ZOOM = 0.08
 # which reads as an abrupt stop rather than a settled ending.
 END_FREEZE_SECONDS = 0.75
 
-# LOWERED (2026-08-29): was 45. Upload to Supabase Storage was failing
-# (400, then surfaced as an unhandled 500 from the backend) because the
-# actual rendered file size regularly overshoots this "budget" - ffmpeg's
-# -b:v/-maxrate/-bufsize only bound the *average* bitrate, not the final
-# file size, and confirmed live this was landing at 53.9MB against a
-# 45MB budget. The Supabase bucket's file_size_limit has separately been
-# raised (200MB) so overshoot alone won't block uploads going forward,
-# but tightening this budget's margin keeps files smaller/faster to
-# upload and stops the bitrate calc from being so close to any limit.
-TARGET_UPLOAD_MB = 35
+# REMOVED (2026-08-30): TARGET_UPLOAD_MB / MIN_VIDEO_KBPS bitrate-budget
+# system removed entirely. Confirmed by direct calculation that it was
+# doing nothing useful: for this pipeline's typical ~870s video length,
+# BOTH the old 45MB budget and the "fixed" 35MB budget computed a video
+# kbps below MIN_VIDEO_KBPS=400, so the 400kbps floor silently overrode
+# the budget on every single run - that's why final file size barely
+# moved (53.9MB -> 53.8MB -> 53.9MB) when the budget was "lowered" from
+# 45 to 35 on 2026-08-29. 400kbps at 1920x1080 is far below YouTube's own
+# ~8000kbps guidance for 1080p30 SDR uploads - this pipeline has been
+# rendering visibly under-quality 1080p this whole time, independent of
+# the earlier upload-failure bug.
+#
+# Zia wants no compromise on 1080p quality. A file-size budget and real
+# quality are in tension for a video this long (870s), so this now uses
+# CRF (constant quality) encoding instead of a bitrate target - standard
+# practice for "give me good quality" without guessing a bitrate number.
+# The Supabase bucket limit has separately been raised to 500MB
+# (2026-08-30) to comfortably fit whatever CRF 20 produces at this
+# length, and the upload path no longer double-buffers the full file in
+# memory (see upload_router.py/supabase_storage.py, same date) so a
+# larger file doesn't add OOM risk on Render's free-tier instance.
+VIDEO_CRF = 20  # visually near-lossless for x264; lower = higher quality/larger file
 AUDIO_BITRATE_KBPS = 128
-MIN_VIDEO_KBPS = 400
 # RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
 # is already rendered/assembled at full 1920x1080 (see RESOLUTION above),
 # but the final cinematic-grade ffmpeg pass was silently downscaling it
@@ -170,17 +181,14 @@ def _resilient_post(url, max_attempts=5, **kwargs):
     Supabase Storage upload inside upload_router.py failing and being
     surfaced as an unhandled 500) is NOT retried here on purpose - it's
     a real application-level failure, not a transient gateway issue, and
-    retrying it blindly would just repeat the same failure 5 times. See
-    TARGET_UPLOAD_MB comment above and the raised Supabase bucket
-    file_size_limit for the actual fix to the 500 seen on video
-    4fc244de-5e0d-4c36-91ab-825df9036085.
+    retrying it blindly would just repeat the same failure 5 times.
 
     NOTE (2026-08-30): this retry-after-the-fact logic is a safety net,
     not the primary fix, for long renders - see _start_keepalive() above.
     A render long enough to fully exceed Render's ~15 min spin-down
     window (confirmed at 56 minutes on video 4fc244de) can exhaust even
     this backoff (150s total) before a full cold start completes on top
-    of transferring a 50MB+ body. The keep-alive thread prevents the
+    of transferring a large body. The keep-alive thread prevents the
     backend from ever sleeping during the render; this remains as
     protection against any other transient gateway blip.
     """
@@ -587,12 +595,6 @@ def _build_mixed_audio(narration_path, native_sfx_path, out_path):
     return duration
 
 
-def _compute_target_video_kbps(duration_seconds):
-    total_kbps = (TARGET_UPLOAD_MB * 8000) / max(duration_seconds, 1)
-    video_kbps = int(total_kbps - AUDIO_BITRATE_KBPS)
-    return max(MIN_VIDEO_KBPS, video_kbps)
-
-
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     media_dir = os.path.join(WORK_DIR, "media")
@@ -744,11 +746,15 @@ def main():
     else:
         cinematic_vf = CINEMATIC_VF_BASE
 
-    video_kbps = _compute_target_video_kbps(target_duration)
+    # CRF ENCODING (2026-08-30): replaces the old bitrate-budget calc - see
+    # comment on VIDEO_CRF near the top of the file for why. CRF targets
+    # constant visual quality directly; ffmpeg allocates however much
+    # bitrate that actually needs, rather than us guessing a number and
+    # accidentally starving 1080p footage of the bits it needs to look
+    # like 1080p.
     print(
         f"Applying cinematic grade and merging mixed audio "
-        f"(duration={target_duration:.1f}s, target video bitrate={video_kbps}kbps, "
-        f"budget={TARGET_UPLOAD_MB}MB)..."
+        f"(duration={target_duration:.1f}s, CRF={VIDEO_CRF}, no quality-compromising bitrate cap)..."
     )
     _run_ffmpeg([
         "-i", silent_path,
@@ -759,9 +765,7 @@ def main():
         "-af", LOUDNORM_AF,
         "-c:v", "libx264",
         "-preset", "medium",
-        "-b:v", f"{video_kbps}k",
-        "-maxrate", f"{int(video_kbps * 1.45)}k",
-        "-bufsize", f"{int(video_kbps * 2)}k",
+        "-crf", str(VIDEO_CRF),
         "-c:a", "aac",
         "-b:a", f"{AUDIO_BITRATE_KBPS}k",
         # CHANGED (2026-08-26): was "-shortest", which capped the final
@@ -778,13 +782,13 @@ def main():
 
 
     final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
-    print(f"Final file size: {final_size_mb:.1f}MB (budget was {TARGET_UPLOAD_MB}MB)")
+    print(f"Final file size: {final_size_mb:.1f}MB (CRF {VIDEO_CRF}, no size budget applied).")
 
     print("Uploading finished video back to Railway...")
     upload_resp = _resilient_post(
         f"{RAILWAY_URL}/api/v1/upload/video/{video_id}",
         headers=HEADERS,
-        timeout=300,
+        timeout=600,
         _file_path=final_path,
         _file_field_name="file",
     )
