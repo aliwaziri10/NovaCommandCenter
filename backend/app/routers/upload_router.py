@@ -18,6 +18,22 @@ def verify_assembly_secret(x_assembly_secret: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Assembly-Secret header")
 
 
+def _file_size_and_stream(upload_file: UploadFile):
+    """Returns (content_length, stream) for a FastAPI UploadFile without
+    reading it fully into a Python bytes object first. Starlette already
+    spools large uploads to disk under the hood (UploadFile.file) - going
+    through .read() instead would force the whole thing into a second,
+    full-size bytes object in RAM on top of that, which is how a large
+    CRF-encoded final render can push this service into OOM on Render's
+    free tier. Streaming the existing file object straight to Supabase
+    avoids that second copy."""
+    stream = upload_file.file
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(0)
+    return size, stream
+
+
 @router.post("/narration/{video_id}")
 async def upload_narration(video_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
@@ -31,8 +47,8 @@ async def upload_narration(video_id: str, file: UploadFile = File(...), db: Sess
 
     contents = await file.read()
 
-    # Uploaded to Supabase Storage (durable) instead of Railway's local disk.
-    # Railway's local filesystem is NOT durable - it is wiped on every
+    # Uploaded to Supabase Storage (durable) instead of Render's local disk.
+    # Render's local filesystem is NOT durable - it is wiped on every
     # restart/redeploy. Storing narration/final video only there was the
     # root cause of videos silently never reaching YouTube: the file
     # would vanish before the next scheduled pipeline step ran.
@@ -70,10 +86,14 @@ async def upload_video(
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    contents = await file.read()
+    # Streamed instead of file.read() - the final render is now larger
+    # on average since the CRF encoding change, and reading it fully into
+    # a bytes object here would duplicate it in memory on top of
+    # Starlette's own upload buffer, risking OOM on Render's free tier.
+    size, stream = _file_size_and_stream(file)
 
     try:
-        video_url = upload_to_storage(f"final/{video_id}.mp4", contents, "video/mp4")
+        video_url = upload_to_storage(f"final/{video_id}.mp4", stream, "video/mp4", content_length=size)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=f"Supabase Storage upload failed: {e}")
 
@@ -85,7 +105,7 @@ async def upload_video(
     return {
         "video_id": video_id,
         "video_path": video_url,
-        "file_size_bytes": len(contents),
+        "file_size_bytes": size,
         "status": video.status,
     }
 
@@ -122,13 +142,16 @@ async def upload_reference_frame(tag: str, file: UploadFile = File(...)):
 # returns a public URL for the caller to save into clip_urls itself.
 @router.post("/clip/{tag}")
 async def upload_clip(tag: str, file: UploadFile = File(...)):
-    contents = await file.read()
+    # Streamed for the same reason as /video/{video_id} - stitched
+    # chain-extension clips can also be large enough to risk doubling
+    # memory usage if read fully into a bytes object first.
+    size, stream = _file_size_and_stream(file)
     try:
-        clip_url = upload_to_storage(f"clips/{tag}.mp4", contents, "video/mp4")
+        clip_url = upload_to_storage(f"clips/{tag}.mp4", stream, "video/mp4", content_length=size)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=f"Supabase Storage upload failed: {e}")
     return {
         "tag": tag,
         "url": clip_url,
-        "file_size_bytes": len(contents),
+        "file_size_bytes": size,
     }
