@@ -35,9 +35,27 @@ def _latest_strategy_notes(db: Session) -> str | None:
 # _extract_script below are UNCHANGED and still apply to Gemini's raw text
 # output for the same reason they applied to Pollinations' - guards against
 # garbage/malformed output being spoken aloud by the TTS narrator.
+#
+# MODEL UPGRADE (2026-08-31, cinematic-direction pass): switched primary
+# model from gemini-3.5-flash to gemini-2.5-pro. Flash is a speed/cost-
+# tier model; this is explicitly a creative long-form writing task, where
+# research and Google's own free-tier model-selection guidance both point
+# to the Pro tier for coherent creative prose. Gemini 2.5 Pro is free-tier
+# (no card required) with a real but low daily cap (order of tens of
+# requests/day depending on current Google quotas) - at this pipeline's
+# actual volume (2 calls per script, at most a handful of scripts/day),
+# that cap is nowhere close to being hit. GEMINI_MODEL_FALLBACK exists so
+# a 429/quota-exhausted response on the Pro model doesn't kill generation
+# outright - it drops to Flash for that call only, rather than failing the
+# whole script.
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = "gemini-3.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+GEMINI_MODEL_PRIMARY = "gemini-2.5-pro"
+GEMINI_MODEL_FALLBACK = "gemini-3.5-flash"
+
+
+def _gemini_url(model: str) -> str:
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+
 
 # FIX (2026-08-03): the old fallback ("if len(text) > 100: return text") accepted
 # ANY long response as valid script text, including malformed/broken output from
@@ -95,30 +113,45 @@ RETRYABLE_NETWORK_EXCEPTIONS = (
 
 def _generate_part(prompt: str, system_prompt: str) -> str | None:
     """PROVIDER SWITCH (2026-08-10): now calls Gemini directly instead of
-    Pollinations. Same retry/backoff shape as before."""
+    Pollinations. Same retry/backoff shape as before.
+
+    MODEL UPGRADE (2026-08-31): tries GEMINI_MODEL_PRIMARY (2.5 Pro) for
+    every attempt first; only drops to GEMINI_MODEL_FALLBACK (3.5 Flash)
+    once the primary model itself returns a 429 (quota/rate limit) -
+    a genuine "this model is unavailable right now" signal, not a quality
+    problem - so the fallback preserves availability without silently
+    downgrading quality on ordinary transient errors (which still retry
+    on the primary model as before).
+    """
     body_text = f"{system_prompt}\n\n{prompt}"
     last_reason = None
+    current_model = GEMINI_MODEL_PRIMARY
 
     for attempt in range(MAX_GENERATION_ATTEMPTS):
         try:
             response = requests.post(
-                GEMINI_URL,
+                _gemini_url(current_model),
                 json={"contents": [{"parts": [{"text": body_text}]}]},
                 headers={"Content-Type": "application/json"},
-                timeout=90,
+                timeout=120,
             )
         except RETRYABLE_NETWORK_EXCEPTIONS as e:
             wait = (attempt + 1) * 15
             last_reason = f"{e.__class__.__name__}: {e}"
-            print(f"Gemini network error ({last_reason}), waiting {wait}s before retry "
+            print(f"Gemini ({current_model}) network error ({last_reason}), waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
             time.sleep(wait)
             continue
 
         if response.status_code == 429:
+            last_reason = "HTTP 429 rate/quota limited"
+            if current_model == GEMINI_MODEL_PRIMARY:
+                print(f"Gemini {GEMINI_MODEL_PRIMARY} quota/rate limited - falling back to "
+                      f"{GEMINI_MODEL_FALLBACK} for this call (attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}).")
+                current_model = GEMINI_MODEL_FALLBACK
+                continue
             wait = (attempt + 1) * 15
-            last_reason = "HTTP 429 rate limited"
-            print(f"Gemini rate limited, waiting {wait}s before retry "
+            print(f"Gemini {current_model} also rate limited, waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
             time.sleep(wait)
             continue
@@ -126,14 +159,14 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
         if response.status_code in (500, 502, 503, 504):
             wait = (attempt + 1) * 15
             last_reason = f"HTTP {response.status_code}"
-            print(f"Gemini transient error ({last_reason}), waiting {wait}s before retry "
+            print(f"Gemini ({current_model}) transient error ({last_reason}), waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}): {response.text[:200]}")
             time.sleep(wait)
             continue
 
         if response.status_code != 200:
             last_reason = f"HTTP {response.status_code} (non-retryable)"
-            print(f"Gemini returned {last_reason}, attempt {attempt + 1}/"
+            print(f"Gemini ({current_model}) returned {last_reason}, attempt {attempt + 1}/"
                   f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
             continue
 
@@ -142,7 +175,7 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
         except (requests.exceptions.JSONDecodeError, KeyError, IndexError) as e:
             wait = (attempt + 1) * 15
             last_reason = f"malformed response envelope ({e})"
-            print(f"Gemini {last_reason}, waiting {wait}s before retry "
+            print(f"Gemini ({current_model}) {last_reason}, waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
             time.sleep(wait)
             continue
@@ -153,10 +186,69 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
 
         last_reason = "200 OK but response failed narration-text validation " \
                        "(empty, code/markup-like, or malformed envelope)"
-        print(f"Gemini attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
+        print(f"Gemini ({current_model}) attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
 
     print(f"Gemini still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
     return None
+
+
+# ADDED (2026-08-31, cinematic-direction pass): a second-pass revision call.
+# Generates a full draft (part1+part2) exactly as before, then asks the
+# model to critique and rewrite its OWN draft against a compact checklist
+# before it's saved. This is a well-documented quality lever (draft-then-
+# revise) that the pipeline previously had none of - first-draft output
+# went straight to the database and then straight to narration.
+# Deliberately best-effort: if this call fails for any reason, the
+# unrevised draft is used instead (see run_script_writing) rather than
+# blocking script generation entirely on a bonus quality pass.
+REVISION_SYSTEM_PROMPT = (
+    "You are a script editor reviewing a finished narration script for a cinematic "
+    "alternate-history YouTube channel. You will be given a complete draft. Revise it "
+    "and output the FULL revised script (same [CHAPTER] and [SCENE] markers, same overall "
+    "length and structure) with these specific fixes applied wherever needed:\n\n"
+    "1. Break up any run of same-length, same-rhythm sentences - vary sentence length "
+    "aggressively, sentence to sentence.\n"
+    "2. Remove any remaining generic AI-narrator phrasing (e.g. 'you are standing in', "
+    "'picture yourself', 'in summary', 'to wrap up', 'little did they know', 'the rest, "
+    "as they say, is history') and replace it with something specific to THIS story - "
+    "never delete the beat, rewrite the line.\n"
+    "3. Confirm at least two people are referred to by an actual name (real historical "
+    "name where known, or a plausible period-appropriate invented name if the historical "
+    "record doesn't name them) rather than only abstract labels like 'the general' or "
+    "'the nation' throughout. If the draft never names anyone, add names now.\n"
+    "4. Confirm the script clearly separates documented real history from the speculative "
+    "'what if' branch with an explicit spoken seam (e.g. 'here's what we know actually "
+    "happened...' before the pivot into 'but suppose, instead...'). If that seam is missing "
+    "or blurry, add or sharpen it - never let a viewer be unsure which parts are real.\n"
+    "5. If every beat of the story feels mechanically identical in rhythm and phrasing to a "
+    "generic template (the same kind of line at the same kind of moment every time), "
+    "rewrite so at least the cold open and the midpoint re-hook feel specific to this "
+    "story's own content, not a reusable formula.\n\n"
+    "Do not shorten the script, do not remove any [CHAPTER] or [SCENE] marker, do not add "
+    "commentary about what you changed. Output ONLY the fully revised script text."
+)
+
+
+def _revise_script(full_draft: str) -> str:
+    """Best-effort revision pass - see REVISION_SYSTEM_PROMPT above. Returns
+    the revised text on success, or the original unrevised draft on any
+    failure (network, bad response, validation failure) - a failed
+    revision pass is never allowed to block or degrade script generation,
+    since the unrevised draft is already a complete, valid script on its
+    own."""
+    prompt = f"Here is the complete draft script to revise:\n\n{full_draft}"
+    try:
+        revised = _generate_part(prompt, REVISION_SYSTEM_PROMPT)
+    except Exception as e:
+        print(f"Revision pass raised an exception, using unrevised draft instead: {type(e).__name__}: {e}")
+        return full_draft
+
+    if not revised or len(revised) < len(full_draft) * 0.6:
+        print("Revision pass returned nothing usable or suspiciously short output - using unrevised draft instead.")
+        return full_draft
+
+    print("Revision pass succeeded - using revised script.")
+    return revised
 
 
 def run_script_writing(db: Session, topic_id: str):
@@ -170,63 +262,47 @@ def run_script_writing(db: Session, topic_id: str):
     as text.
     Skips generation entirely if a script for this topic already exists, to avoid duplicates.
 
+    [... history through 2026-08-19 items #1/#2/#3/#5/#9/#10/#12 unchanged - six-beat
+    Curiosity Loop structure, cold open, chapter markers, steady fact density, peak
+    moment at ~70% mark - see prior versions of this docstring for that history ...]
+
+    CINEMATIC-DIRECTION PASS (2026-08-31): this update responds to a direct critique
+    of the prompt's faults (formulaic identical macro-structure on every video,
+    mandatory cold-open regardless of whether a story suits it, fixed-position
+    engagement questions, zero worked examples, no narrator identity, no real-vs-
+    speculative signposting, phrase-banning without replacements, no named
+    characters/dialogue, no revision pass, and a speed-tier model used for a
+    creative-writing task). Concrete changes:
+    - Rule 0B (cold open) is now conditional, not mandatory - the model is told to
+      use it only when the story's real climactic moment justifies opening out of
+      order, and to open chronologically otherwise (still hooked per Rule 1).
+    - Rule 6 (engagement questions) now says "wherever the story naturally earns it"
+      instead of fixed structural positions.
+    - New Rule 10: a consistent narrator identity/voice signature, so scripts read
+      as distinctly Nova's voice rather than a generic AI-history-channel tone.
+    - New Rule 11: explicit spoken seam separating documented real history from the
+      speculative "what if" branch - a credibility/clarity requirement, not just style.
+    - New Rule 12: at least two people must be given actual names (real where known,
+      plausible invented names otherwise), with short attributed quoted dialogue
+      lines permitted (narrator-voiced, not lip-synced - see video_planning_agent.py's
+      matching "mid-speech" staging guidance for how these land visually).
+    - WORKED EXAMPLES block added after the rules: concrete good/bad sentence pairs,
+      replacing several phrase-only bans with actual demonstrated alternatives.
+    - part2_prompt now receives part1's real word count (not just its raw text) so
+      the "peak moment at ~70%" instruction can be grounded in a real number instead
+      of the model guessing at relative position.
+    - Model switched from gemini-3.5-flash to gemini-2.5-pro (free-tier, no cost -
+      see GEMINI_MODEL_PRIMARY comment above) with automatic fallback to Flash only
+      on an actual quota/rate-limit response, not on ordinary transient errors.
+    - New best-effort revision pass (_revise_script) runs on the assembled full
+      script before saving - see REVISION_SYSTEM_PROMPT above.
+
     FAILURE FIX (2026-08-08): on a failed generation, this used to still save a
     Script row with a literal placeholder string as content. This now raises
     instead — matching the pattern video_planning_agent.py already uses for
     exactly this failure mode — so a failed generation goes through the normal
     Task/_failed_attempts retry path and no broken Script row is ever created
     or allowed downstream.
-
-    UPDATED (2026-08-19): Style overhaul phase 2 of the Nova rebuild (see
-    brain/NOVA_REBUILD_HANDOFF.md items #4 and #14). Two additions to
-    system_prompt below:
-    - Rule 1 now explicitly forbids any channel greeting/branded intro
-      ("hey guys", "welcome back to the channel", etc.) before the value/
-      hook line — previously only implied by "never slow scene-setting",
-      which wasn't a strong enough guard on its own.
-    - Rule 4 now explicitly forbids the "you are standing in..." / "you
-      find yourself..." you-are-there narration pattern (a well-known AI
-      narration tell), while still keeping the other direct-address forms
-      (rhetorical questions, "imagine...", "picture this...") the prompt
-      already relies on for its engagement/emotional-arc rules — those are
-      unaffected and remain in place.
-
-    UPDATED (2026-08-19, item #12): Rule 7 now explicitly forbids
-    "in summary" / "to wrap up" / "in conclusion" style closing language.
-    Same handoff, next item in sequence. part2_prompt's ending instruction
-    (which is what actually drives the generated closing beat) gets the
-    matching instruction so the ban isn't just in the unused-at-inference
-    system_prompt description but in the part that shapes the real output.
-
-    UPDATED (2026-08-19, items #1/#2/#3/#10, done together as one
-    structural session per the handoff): added new Rule 0 (Curiosity Loop
-    six-beat master structure + Hook-Problem-Solution-Payoff timing spine),
-    Rule 0B (Cold Open at the most dramatic moment, then cut back), and
-    Rule 0C (chapter markers baked in from generation) to system_prompt,
-    all as pure additions ahead of the existing Rule 1 — none of the
-    previously-verified rules 1/1B/2/2B/3/4/5/6/7 were touched or
-    renumbered. part1_prompt and part2_prompt got matching additions
-    (also appended, not replacing existing instructions) so the cold
-    open + chapter markers actually land in generated output, not just
-    in the unused-at-inference system_prompt description.
-
-    UPDATED (2026-08-19, item #9): added new Rule 8 (specific numbers/
-    facts at a steady rate throughout the ENTIRE script, not just the
-    opening) to system_prompt, appended after Rule 7 — none of the
-    other rules were touched or renumbered. part1_prompt and
-    part2_prompt each got a matching instruction so the pacing actually
-    lands in generated output in both halves, not just the unused-at-
-    inference system_prompt description.
-
-    UPDATED (2026-08-19, item #5): added new Rule 9 (single biggest "wow"
-    moment of the story should land at roughly the 70% mark, inside the
-    CLIMAX beat, rather than being held back for the very end) to
-    system_prompt, appended after Rule 8 — none of the other rules were
-    touched or renumbered. part2_prompt (the half that contains both
-    CLIMAX and PAYOFF) got a matching instruction placing the peak moment
-    inside the CLIMAX chapter specifically, distinct from the PAYOFF
-    chapter's resolution/recontextualization job, so the two don't get
-    collapsed into one beat at generation time.
     """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -252,16 +328,16 @@ def run_script_writing(db: Session, topic_id: str):
         "script text. Do not show your reasoning, do not explain your process, do not use "
         "JSON — just write the script directly.\n\n"
         "Follow these storytelling rules on every script:\n\n"
-        "0. CURIOSITY LOOP MASTER STRUCTURE (video-wide shape — every script follows this, "
-        "in addition to the more detailed rules below): the whole script is built as a "
+        "0. CURIOSITY LOOP MASTER STRUCTURE (video-wide shape — every script follows this "
+        "SHAPE, but see Rule 0B: the SPECIFIC DEVICE used to open should vary story to "
+        "story, not repeat identically every time): the whole script is built as a "
         "fixed six-beat Curiosity Loop that resolves gradually across the full runtime, "
         "never answering the core question early:\n"
-        "- Beat 1 — COLD OPEN (roughly the first 0-30 seconds of narration): the single "
-        "most dramatic, highest-stakes moment of the ENTIRE story, shown first, out of "
-        "chronological order (see Rule 0B).\n"
-        "- Beat 2 — PROBLEM / STAKES SETUP (from the end of the cold open to roughly the "
-        "25% mark): cut back from the cold open to establish who/what/why and what's "
-        "genuinely at stake.\n"
+        "- Beat 1 — OPENING HOOK (roughly the first 0-30 seconds of narration): the "
+        "strongest possible hook for THIS specific story (see Rule 0B for how to choose "
+        "its form).\n"
+        "- Beat 2 — PROBLEM / STAKES SETUP (from the end of the opening hook to roughly "
+        "the 25% mark): establish who/what/why and what's genuinely at stake.\n"
         "- Beat 3 — RISING DELIVERY (roughly 25% to the midpoint): escalating turning "
         "points, each with its own twist (see Rules 2 and 2B).\n"
         "- Beat 4 — MIDPOINT TWIST / RE-HOOK (roughly the halfway mark): the deliberate "
@@ -271,28 +347,33 @@ def run_script_writing(db: Session, topic_id: str):
         "reaching the single biggest moment of the story at roughly the 70% mark (see "
         "Rule 9).\n"
         "- Beat 6 — PAYOFF (the final ~15%): resolution that answers the macro open loop "
-        "(Rule 1B) and explicitly recontextualizes the cold open from Beat 1 (see Rule 0B "
-        "and Rule 7).\n"
+        "(Rule 1B) and, if a cold open was used, recontextualizes it (see Rule 0B and "
+        "Rule 7).\n"
         "This six-beat loop maps directly onto a HOOK -> PROBLEM -> SOLUTION -> PAYOFF "
-        "spine: HOOK = 0-30s (Beat 1), PROBLEM/STAKES = 30s to ~25% (Beat 2), SOLUTION/"
-        "DELIVERY = ~25% to ~85% (Beats 3-5, including the midpoint twist), PAYOFF = final "
-        "~15% (Beat 6). Never let two beats blur into one flat, undifferentiated stretch — "
+        "spine. Never let two beats blur into one flat, undifferentiated stretch — "
         "each beat should feel like a distinct movement of the story.\n\n"
-        "0B. COLD OPEN (do not skip): the very first thing spoken must be the single most "
-        "dramatic, highest-stakes moment from LATER in the story, presented as if it's "
-        "happening right now, out of chronological order — this is Beat 1 of Rule 0 above, "
-        "and it doubles as the concrete opening image required by Rule 1's HOOK. "
-        "Immediately after this cold-open moment, the narration must explicitly cut back "
-        "with a real bridge line (for example 'Rewind.' or 'But to understand how we got "
-        "here...' or an equivalent) to begin the true chronological Problem/Stakes setup "
-        "(Beat 2). The cold-open moment must be a genuine turning point that recurs again, "
-        "in its proper chronological place, later in the script — never an invented "
-        "one-off moment that doesn't actually happen in the story. This works together "
-        "with, not instead of, Rule 1's HOOK and Rule 1B's macro open loop below.\n\n"
+        "0B. CHOOSE THE OPENING DEVICE PER STORY (do not default to the same device every "
+        "time): every script must open with Rule 1's hook within the first few seconds, "
+        "but HOW it opens should be chosen based on what actually makes THIS story land "
+        "hardest, not a fixed formula applied identically to every topic:\n"
+        "- If this story's single most dramatic moment happens later in the chronology "
+        "and is strong enough that showing it first (out of order) would genuinely hook "
+        "harder than a chronological start, use a cold open: state that moment as if it's "
+        "happening now, then cut back with a real bridge line ('Rewind.' or equivalent) "
+        "into the true chronological Problem/Stakes setup. That moment must be a genuine "
+        "turning point that recurs in its proper place later — never invented.\n"
+        "- If this story's real chronological beginning is ALREADY the stronger, more "
+        "arresting opening (a striking first fact, an audacious decision, an immediate "
+        "vivid consequence), open chronologically instead — do not force a flash-forward "
+        "onto a story that doesn't need one.\n"
+        "Pick whichever device genuinely serves THIS topic. Across many videos these "
+        "should not all read as the identical device used the identical way — that "
+        "sameness is itself a tell that undermines the channel, regardless of how good "
+        "any single video is on its own.\n\n"
         "0C. CHAPTER MARKERS (bake in from generation, every script, no exceptions): "
         "insert a `[CHAPTER: <short curiosity-driven title>]` marker at the start of each "
         "of the six Curiosity Loop beats from Rule 0 — six chapter markers total per "
-        "script (Cold Open, Problem/Stakes, Rising Delivery, Midpoint Twist, Climax, "
+        "script (Opening Hook, Problem/Stakes, Rising Delivery, Midpoint Twist, Climax, "
         "Payoff). Write each title specific to the actual topic and phrased to create "
         "curiosity on its own, the way a real YouTube chapter title would — never a flat "
         "generic label like 'Background' or 'Part 2'; something like 'The Warning No One "
@@ -353,7 +434,14 @@ def run_script_writing(db: Session, topic_id: str):
         "tone — like someone leaning in to tell you something they find genuinely "
         "fascinating, not a narrator reading a summary.\n"
         "- Avoid dry, encyclopedic delivery, filler transitions ('moving on', 'next, "
-        "let's discuss'), and stacking multiple facts in one flat sentence.\n\n"
+        "let's discuss'), and stacking multiple facts in one flat sentence.\n"
+        "- PUNCTUATION IS PERFORMANCE (the narrator voice engine reads punctuation as "
+        "timing, not just grammar): use an em-dash for a thought that cuts itself off or "
+        "pivots — like this. Use an ellipsis for a genuine hesitation or dread beat... "
+        "before landing the next line. Use short sentence fragments on their own for "
+        "impact. Do not treat punctuation as decoration — it is the only pacing control "
+        "available, so use it deliberately on every beat that needs a breath, a pause, or "
+        "a jolt.\n\n"
         "5. EMOTIONAL ARC (critical, this is a THRILLER, not a list of facts): the video "
         "must swing between tension/dread and hope/relief — never sit in one emotional "
         "register for long. Every escalation of danger, loss, or consequence needs a "
@@ -366,43 +454,101 @@ def run_script_writing(db: Session, topic_id: str):
         "- Treat the midpoint re-hook (rule 3) as the arc's low point or biggest reversal — "
         "the moment stakes feel highest — with the back half working toward eventual hope, "
         "resolution, or a hard-won answer to the macro open loop from rule 1B.\n\n"
-        "6. VIEWER ENGAGEMENT PROMPTS (exactly two, lightweight, in-narration): weave in "
-        "one short direct-address line early (within the first quarter of the video) that "
-        "gives the viewer something cheap and fast to react to in the comments — a genuine "
-        "either/or question tied to the topic, not a generic 'like and subscribe'. Weave in "
-        "a second one around the midpoint re-hook (rule 3) that invites a real opinion or "
-        "prediction about what happens next. Both must feel like a natural aside from the "
-        "narrator, never like an ad break.\n\n"
+        "6. VIEWER ENGAGEMENT PROMPTS (exactly two, lightweight, in-narration, placed "
+        "WHEREVER the story naturally earns them — not at a fixed position just because a "
+        "rule says so): weave in one short direct-address line at a point where the story "
+        "itself raises a genuine either/or question tied to the topic, not a generic 'like "
+        "and subscribe'. Weave in a second one around wherever the story's own tension "
+        "peaks that invites a real opinion or prediction about what happens next. Both must "
+        "feel like a natural aside from the narrator, prompted by what just happened in the "
+        "STORY, never like an ad break bolted on at a scheduled timestamp.\n\n"
         "7. CALLBACK TWIST + ENDING: close the macro open loop from rule 1B with a surprise, "
-        "a broader implication, or a new question that lingers — never a flat summary. "
-        "Reconnect explicitly to the concrete image or claim from the opening hook (rule 1) "
-        "and reveal that it meant something different than it first appeared, now that the "
-        "full story is known. End with a one-line tease of a related next-episode angle so "
-        "the video sets up series continuity, without over-promising a specific title. NEVER "
-        "use 'in summary', 'to sum up', 'to wrap up', 'in conclusion', or any similar "
-        "explicit summary-language framing anywhere in the script, especially the ending — "
-        "the callback twist itself must do the work of closing the story; it must never be "
-        "announced as a summary.\n\n"
+        "a broader implication, or a new question that lingers — never a flat summary. If "
+        "a cold open was used (Rule 0B), reconnect explicitly to that opening moment and "
+        "reveal it meant something different than it first appeared, now that the full "
+        "story is known; if the video opened chronologically instead, close by paying off "
+        "the specific claim or image from the opening hook (Rule 1) in the same way. End "
+        "with a one-line tease of a related next-episode angle so the video sets up series "
+        "continuity, without over-promising a specific title. NEVER use 'in summary', 'to "
+        "sum up', 'to wrap up', 'in conclusion', 'little did they know', or 'the rest, as "
+        "they say, is history' anywhere in the script, especially the ending — the callback "
+        "twist itself must do the work of closing the story; it must never be announced as "
+        "a summary.\n\n"
         "8. SPECIFIC NUMBERS AND FACTS AT A STEADY RATE (do not front-load then go "
         "abstract): throughout the ENTIRE script — not just the opening — include a "
         "concrete, specific number, date, quantity, distance, percentage, or verifiable "
         "fact roughly every 100-150 words. These must be real and verifiable, never "
-        "invented for dramatic effect. Never let a long stretch run on vague language "
+        "invented for dramatic effect. If you are not genuinely confident a specific "
+        "figure is accurate, use a clearly-hedged real range or qualifier ('by some "
+        "estimates', 'roughly', 'at least') rather than stating an invented-sounding exact "
+        "number with false confidence — a vague-but-honest figure is better than a "
+        "precise-sounding fabrication. Never let a long stretch run on vague language "
         "('a huge amount', 'many years', 'a massive army') when a specific figure is "
-        "available and would land harder. Specificity is what makes the story feel real "
-        "and researched, not vague scene-setting — spread it evenly across the whole "
-        "runtime, including the back half, not just the hook.\n\n"
+        "available and would land harder.\n\n"
         "9. PEAK MOMENT AT ~70% MARK (do not save the biggest moment for the very end): "
         "the single most exciting, impactful, or surprising moment of the ENTIRE story — "
         "the biggest 'wow' beat — should land at roughly the 70% mark of the full runtime, "
         "inside the CLIMAX beat (Beat 5 of Rule 0), not held back for the PAYOFF (Beat 6) "
-        "at the very end. The PAYOFF should still resolve the macro open loop and "
-        "recontextualize the cold open (Rule 7) — but it should feel like a satisfying, "
-        "meaningful landing after the peak, not the biggest spike of excitement in the "
-        "video itself. Saving the true peak for the last few seconds asks viewers to sit "
-        "through a full stretch of falling energy waiting for a payoff that never actually "
-        "out-excites what came before it; placing it at ~70% keeps energy and retention "
-        "high through the back stretch instead."
+        "at the very end. Placing it at ~70% keeps energy and retention high through the "
+        "back stretch instead of asking viewers to sit through falling energy waiting for "
+        "a payoff that never out-excites what already happened.\n\n"
+        "10. NARRATOR IDENTITY (consistent across every script, never named or referenced "
+        "on-screen or in narration itself — this shapes HOW the narrator writes and "
+        "delivers, it is not a character the narrator plays or announces): the narrator is "
+        "someone who has personally traced this story's paper trail — sharp, a little wry, "
+        "genuinely obsessive about the specific overlooked detail that changes how the "
+        "whole story reads. They don't perform generic wonder at the topic in the abstract; "
+        "they get excited about ONE specific overlooked fact or document or decision and "
+        "make the viewer feel like they're being let in on it. This tone should feel "
+        "recognizably consistent script to script — never revert to a generic, "
+        "interchangeable 'documentary narrator' voice that could belong to any channel.\n\n"
+        "11. REAL VS. SPECULATIVE — EXPLICIT SEAM (critical, credibility requirement, not "
+        "just style): this channel discloses to viewers that content is AI-generated, and "
+        "the 'what if' premise means every script mixes real documented history with an "
+        "invented hypothetical branch. The seam between the two must be explicit and "
+        "spoken aloud, never blurred — a clear line like 'here's what we know actually "
+        "happened...' immediately before pivoting into 'but suppose, instead...' or "
+        "equivalent. A viewer must always be able to tell, in the moment, whether what "
+        "they're hearing is documented fact or the speculative premise. Never let the "
+        "narration state the speculative branch in the same flat declarative voice used "
+        "for real historical facts — the invented material should always carry a marker "
+        "of hypothetical framing (suppose, imagine if, in this scenario, had this "
+        "happened instead) even while fully committing to telling it as a real story.\n\n"
+        "12. NAMED PEOPLE + QUOTED DIALOGUE (do not leave every figure abstract): give at "
+        "least two people in the story an actual name — use the real historical name where "
+        "the record provides one; where the record doesn't name a specific individual, "
+        "invent a plausible period- and culture-appropriate name rather than defaulting to "
+        "'the general' or 'the villager' throughout. Include 2-4 short lines of direct "
+        "quoted dialogue across the script, attributed to a named person (e.g. "
+        "[Name] is said to have told [other person], \"...\" or a documented/plausible "
+        "quote framed the same way) — kept SHORT (under ~20 words each) and natural to "
+        "say aloud, since these will be voiced by the narrator as a quoted line, not "
+        "lip-synced by a separate character. Use quoted dialogue at genuine turning "
+        "points (a decision, a warning, a confrontation) where hearing the actual words "
+        "lands harder than a paraphrase — not scattered randomly.\n\n"
+        "WORKED EXAMPLES (study these, then write in this register — these are "
+        "demonstrations of the rules above, not a formula to copy line for line):\n\n"
+        "GOOD — varied rhythm, sensory detail, earned tension:\n"
+        "\"The order took four minutes to reach the front line. Four minutes — that's all "
+        "it was. But in those four minutes, three thousand men were already walking toward "
+        "a river nobody had bothered to map.\"\n\n"
+        "BAD (AI-generic, avoid this register entirely):\n"
+        "\"This decision would have significant consequences for the outcome of the "
+        "battle, as the soldiers were unaware of the danger that awaited them.\"\n"
+        "Why the good version works: short punchy sentence, then a fragment for emphasis, "
+        "then a longer sentence that lands the concrete image (a river, unmapped, three "
+        "thousand men) instead of an abstract claim about 'significant consequences'.\n\n"
+        "GOOD — named person + quoted dialogue at a turning point:\n"
+        "\"General Okonkwo reportedly turned to his second before the retreat and said "
+        "just five words: 'We don't have four minutes.'\"\n\n"
+        "BAD (abstract, no name, no voice):\n"
+        "\"The commander realized they were running out of time and had to make a "
+        "difficult decision.\"\n\n"
+        "GOOD — explicit real-vs-speculative seam:\n"
+        "\"Here's what actually happened: the bridge held. Now suppose, instead, that one "
+        "cable had snapped thirty seconds earlier.\"\n\n"
+        "BAD (blurs fact and speculation with no seam):\n"
+        "\"The bridge might have collapsed, changing everything that came after.\""
     )
 
     strategy_notes = _latest_strategy_notes(db)
@@ -420,37 +566,46 @@ def run_script_writing(db: Session, topic_id: str):
         f'Start directly with [SCENE 1]. The very first lines must open with mystery, '
         f'conflict, or a striking consequence — hook the viewer before any explanation, '
         f'and clearly state or imply the ONE central "what if" question this whole video '
-        f'hangs on (the macro open loop — do not resolve it yet). That opening image or '
-        f'claim should be concrete enough to be worth returning to at the very end. Anchor '
-        f'stakes in specific people, a nation, or a civilization the viewer can root for. '
-        f'Structure this half as sequential turning points, each with its own small twist '
-        f'(something that looks like a win quietly planting the next problem, or the '
-        f'reverse) — never a flat recap of facts. Weave in a curiosity beat (a new '
-        f'question or small reveal) roughly every 100-120 words, and let the emotional '
-        f'tone swing between tension/dread and hope/ingenuity — never flat, never constant '
-        f'dread. Within the first quarter of this half, include one short, natural direct-'
-        f'address line asking the viewer a genuine either/or question tied to the topic — '
-        f'not a generic "like and subscribe" ask. Write it to be spoken aloud by a human-'
-        f'sounding narrator: vary sentence rhythm, use direct address and rhetorical '
-        f'questions, favor concrete sensory detail over dry fact-listing. End this half at '
-        f"a natural cliffhanger, at or near what should feel like the story's lowest point "
+        f'hangs on (the macro open loop — do not resolve it yet). Decide for THIS specific '
+        f'topic whether a cold open (flash-forward to a later dramatic moment) or a strong '
+        f'chronological opening genuinely hooks harder — per Rule 0B, do not default to '
+        f'the same device every time; pick whichever actually serves this story. That '
+        f'opening image or claim should be concrete enough to be worth returning to at the '
+        f'very end. Give at least two people in this story real names (real historical '
+        f'names where known, plausible period-appropriate invented names otherwise) and '
+        f'include at least one short (under ~20 words) attributed quoted line of dialogue '
+        f'somewhere in this half, at a genuine turning point. Anchor stakes in specific '
+        f'people, a nation, or a civilization the viewer can root for. Structure this half '
+        f'as sequential turning points, each with its own small twist (something that looks '
+        f'like a win quietly planting the next problem, or the reverse) — never a flat '
+        f'recap of facts. Weave in a curiosity beat (a new question or small reveal) '
+        f'roughly every 100-120 words, and let the emotional tone swing between '
+        f'tension/dread and hope/ingenuity — never flat, never constant dread. Somewhere in '
+        f'this half, wherever the story itself earns it, include one short, natural '
+        f'direct-address line asking the viewer a genuine either/or question tied to the '
+        f'topic — not a generic "like and subscribe" ask, and not forced in at a fixed '
+        f'position if the story hasn\'t earned it yet. Write it to be spoken aloud by a '
+        f'human-sounding narrator: vary sentence rhythm aggressively (short fragments, then '
+        f'longer flowing sentences), use em-dashes and ellipses as real pacing/performance '
+        f'marks (not just grammar), use direct address and rhetorical questions, favor '
+        f'concrete sensory detail over dry fact-listing. Whenever narration crosses from '
+        f'documented real history into the speculative "what if" branch, mark that seam '
+        f'explicitly and out loud (Rule 11) — never blur the two. End this half at a '
+        f"natural cliffhanger, at or near what should feel like the story's lowest point "
         f'or biggest reversal — do not conclude the video yet. '
         f'STRUCTURE THIS HALF AS THE FIRST THREE CURIOSITY LOOP BEATS, each opening with '
         f'its own `[CHAPTER: <curiosity-driven title>]` marker before its `[SCENE]` '
-        f'marker: (1) COLD OPEN — open with the single most dramatic, highest-stakes '
-        f'moment from LATER in the story, told as if it is happening right now, out of '
-        f'chronological order; this doubles as the opening hook image above. Immediately '
-        f'after it, cut back explicitly with a real bridge line (e.g. "Rewind." or "But '
-        f'to understand how we got here...") into (2) PROBLEM/STAKES SETUP — the true '
-        f'chronological beginning, establishing who/what/why and what is genuinely at '
-        f'stake — then into (3) RISING DELIVERY, the escalating turning points described '
-        f'above. The cold-open moment must be a real turning point that recurs again, in '
-        f'its proper chronological place, later in the full script — not an invented '
-        f'one-off. '
+        f'marker: (1) OPENING HOOK — using whichever device (cold open or chronological) '
+        f'you chose above; (2) PROBLEM/STAKES SETUP — establishing who/what/why and what '
+        f'is genuinely at stake, with real names attached to real people; then (3) RISING '
+        f'DELIVERY, the escalating turning points described above. If you used a cold '
+        f'open, that moment must be a real turning point that recurs again, in its proper '
+        f'chronological place, later in the full script — not an invented one-off. '
         f'Throughout this half, ground the story with a specific number, date, quantity, '
         f'distance, percentage, or verifiable fact roughly every 100-150 words — real '
-        f'and verifiable only, never invented, and never left vague when a real figure '
-        f'exists.'
+        f'and verifiable only, hedged with a qualifier like "roughly" or "by some '
+        f'estimates" rather than invented if you are not genuinely confident in an exact '
+        f'figure, and never left vague when a real figure exists.'
     )
     part1 = _generate_part(part1_prompt, system_prompt)
 
@@ -463,33 +618,43 @@ def run_script_writing(db: Session, topic_id: str):
             f"would end up spoken aloud in the final video."
         )
 
+    part1_word_count = len(part1.split())
+
     part2_prompt = (
         f'Continue this script directly from where it left off (write the '
         f'SECOND HALF, roughly scenes 4-6) for the topic "{topic.title}". '
-        f'Here is the first half for context:\n\n{part1}\n\n'
+        f'Here is the first half for context (it is exactly {part1_word_count} words of '
+        f'narration - use this real number, not a guess, to judge relative position when '
+        f'placing the ~70% peak-moment mark below):\n\n{part1}\n\n'
         f'Continue the story, keep introducing a new question or small reveal '
         f'roughly every 100-120 words, and keep giving each turning point its own '
-        f'small twist rather than relying on only one big reversal. IMPORTANT: at the '
-        f'halfway point of this second half, insert a deliberate midpoint re-hook — a '
-        f'twist, reversal, or sudden escalation that shifts tone and grabs attention '
-        f'again, exactly when viewers typically start to drift. Immediately after that '
-        f'shift, add a short direct-address line explicitly teasing the single biggest '
-        f'turning point still to come, and a second short direct-address line inviting '
-        f"the viewer's prediction or opinion on what happens next — both natural asides, "
-        f'not ad breaks. Include one "false resolution" moment somewhere in this half '
-        f'where something appears settled, then undercut it in the very next beat. Keep '
-        f'the scale escalating — personal, then national, then civilizational stakes — '
-        f'and keep swinging the emotional tone between tension/dread and hope/relief; '
-        f'give the viewer real moments to root for before the next escalation. Keep '
-        f'writing for the ear: varied sentence rhythm, direct address, sensory and '
-        f'emotional detail, never flat or encyclopedic. Develop the consequences, bring '
+        f'small twist rather than relying on only one big reversal. Stay consistent with '
+        f'every named person, quoted line, and specific fact already established in the '
+        f'first half above — do not introduce a conflicting name, number, or detail for '
+        f'something already established. IMPORTANT: at the halfway point of this second '
+        f'half, insert a deliberate midpoint re-hook — a twist, reversal, or sudden '
+        f'escalation that shifts tone and grabs attention again, exactly when viewers '
+        f'typically start to drift. Immediately after that shift, add a short '
+        f'direct-address line explicitly teasing the single biggest turning point still '
+        f'to come, and a second short direct-address line inviting the viewer\'s '
+        f'prediction or opinion on what happens next — both natural asides, prompted by '
+        f'the story itself, not ad breaks. Include one "false resolution" moment '
+        f'somewhere in this half where something appears settled, then undercut it in the '
+        f'very next beat. Keep the scale escalating — personal, then national, then '
+        f'civilizational stakes — and keep swinging the emotional tone between '
+        f'tension/dread and hope/relief; give the viewer real moments to root for before '
+        f'the next escalation. Include at least one more short (under ~20 words) '
+        f'attributed quoted line of dialogue somewhere in this half, at a genuine turning '
+        f'point — from a named person, real or plausible. Keep writing for the ear: '
+        f'varied sentence rhythm with em-dashes and ellipses used as real pacing marks, '
+        f'direct address, sensory and emotional detail, never flat or encyclopedic. Keep '
+        f'marking the seam explicitly (Rule 11) anywhere narration moves between '
+        f'documented fact and the speculative branch. Develop the consequences, bring '
         f'it to the present day, and close the central "what if" question from the '
-        f'opening hook by explicitly returning to that opening image or claim and '
-        f'revealing it means something different now that the full story is known — '
-        f'end with a surprise or lingering implication, then one closing line teasing a '
-        f'related next-episode angle. Do NOT use "in summary", "to sum up", "to wrap '
-        f'up", "in conclusion", or any similar summary-announcing language anywhere in '
-        f'this half, especially the ending — the callback twist itself must close the '
+        f'opening hook. Do NOT use "in summary", "to sum up", "to wrap '
+        f'up", "in conclusion", "little did they know", "the rest, as they say, is '
+        f'history", or any similar summary-announcing / cliché-closing language anywhere '
+        f'in this half, especially the ending — the callback twist itself must close the '
         f'story, never a stated summary. '
         f'STRUCTURE THIS HALF AS THE FINAL THREE CURIOSITY LOOP BEATS, each opening with '
         f'its own `[CHAPTER: <curiosity-driven title>]` marker before its `[SCENE]` '
@@ -497,21 +662,25 @@ def run_script_writing(db: Session, topic_id: str):
         f'above; (5) CLIMAX — the delivery keeps escalating toward its highest point, '
         f'roughly up to the 85% mark of the full script, and the single most exciting or '
         f'impactful moment of the ENTIRE story must land inside THIS chapter, at roughly '
-        f'the 70% mark of the full script — not held back for the PAYOFF chapter; (6) '
+        f'the 70% mark of the full script (use the real {part1_word_count}-word count of '
+        f'part one above plus this half\'s own length so far to judge that position '
+        f'accurately) — not held back for the PAYOFF chapter; (6) '
         f'PAYOFF — the final stretch, roughly the last 15%, where the central "what if" '
-        f'question is answered. In the PAYOFF chapter specifically, make sure the ending '
-        f'explicitly recontextualizes the cold-open moment from the very start of part '
-        f'one — the viewer should now understand that opening moment meant something '
-        f'different than it first appeared, now that the full story, including how that '
-        f'moment actually resolved chronologically, is known. PAYOFF should feel like a '
-        f'satisfying, meaningful landing that resolves things — it is not where the '
-        f"story's biggest excitement spike happens; that already happened in CLIMAX. Do "
-        f'not repeat the first half — only write the new continuation, starting with '
-        f'[CHAPTER: ...] then [SCENE 4]. '
+        f'question is answered. In the PAYOFF chapter specifically: if part one used a '
+        f'cold open, make sure the ending explicitly recontextualizes that opening '
+        f'moment — the viewer should now understand it meant something different than it '
+        f'first appeared, now that the full story, including how that moment actually '
+        f'resolved chronologically, is known. If part one opened chronologically instead, '
+        f'close by paying off the specific opening claim or image in the same spirit. '
+        f'PAYOFF should feel like a satisfying, meaningful landing that resolves things — '
+        f"it is not where the story's biggest excitement spike happens; that already "
+        f'happened in CLIMAX. Do not repeat the first half — only write the new '
+        f'continuation, starting with [CHAPTER: ...] then [SCENE 4]. '
         f'Keep grounding the story with a specific number, date, quantity, distance, '
         f'percentage, or verifiable fact roughly every 100-150 words throughout this '
-        f'half too — spread evenly across the back half, not just clustered near the '
-        f'start, and only ever real, verifiable figures.'
+        f'half too — spread evenly across the back half, hedge with a qualifier rather '
+        f'than inventing an exact figure you are not confident in, and never clustered '
+        f'only near the start.'
     )
     part2 = _generate_part(part2_prompt, system_prompt)
 
@@ -525,7 +694,8 @@ def run_script_writing(db: Session, topic_id: str):
             f"spoken aloud in the final video."
         )
 
-    content = part1 + "\n\n" + part2
+    draft = part1 + "\n\n" + part2
+    content = _revise_script(draft)
 
     script = Script(
         title=topic.title,
