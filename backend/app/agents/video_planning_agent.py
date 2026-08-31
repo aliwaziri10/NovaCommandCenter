@@ -72,6 +72,65 @@ def _estimate_target_shots(script_text: str) -> int:
     return max(3, min(shots, MAX_SHOTS_PER_HALF))
 
 
+# SFX CUE FIELD (2026-08-31, refinement pass): the existing "Ambient sound
+# rule" below already requires every shot's prose description to name an
+# audible sound source (e.g. "the blacksmith's hammer rings against the
+# anvil") - that requirement has been live since 2026-08-26, but nothing
+# downstream has ever actually extracted and used it for real SFX. Rather
+# than add a second, parallel field that could drift out of sync with the
+# prose description, this adds a short, separate, MACHINE-PARSEABLE
+# "SFX: <2-4 word sound keyword>" line to every shot, distilling whatever
+# sound source the shot's own prose already names into a clean search term
+# assemble.py can hand straight to the Freesound API (see assemble.py's
+# _fetch_shot_sfx() for the consuming side). This keeps the prose
+# description free-form/natural for Agnes's video prompt while giving
+# assemble.py something reliable to parse, instead of trying to extract a
+# search term from arbitrary sentence prose with regex/NLP guesswork.
+SFX_LINE_RULE = (
+    "\n\nSFX cue line (critical, machine-parsed, in addition to the ambient "
+    "sound rule above):\n"
+    "- Every shot MUST end with a second line, after the Duration line, in the "
+    "exact form 'SFX: <keyword>' where <keyword> is a short 2-4 word search "
+    "term for the SPECIFIC sound this shot's own description already names "
+    "(e.g. if the shot describes 'the blacksmith's hammer rings against the "
+    "anvil', the SFX line should read 'SFX: blacksmith hammer anvil'). This "
+    "keyword will be used to search a real sound-effects library, so it must "
+    "describe a concrete, literal, searchable sound - never an emotion, mood, "
+    "or abstract word. If a shot's description doesn't clearly name one "
+    "specific sound, use the single most obvious ambient sound implied by the "
+    "setting (e.g. 'wind', 'crowd murmur', 'footsteps stone floor')."
+)
+
+
+def _parse_shots(production_plan: str):
+    """ADDED (2026-08-31): lightweight shot splitter used only to validate
+    that every shot in a freshly generated plan actually carries an SFX
+    line before this plan is accepted - keeps a malformed/missing-SFX plan
+    from silently reaching assemble.py with gaps. Mirrors the SHOT_START
+    matching convention assemble.py itself already uses, so the two stay
+    in agreement about what counts as a shot boundary."""
+    shot_start = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
+    blocks = []
+    current = []
+    for line in production_plan.splitlines():
+        if shot_start.match(line.strip()):
+            if current:
+                blocks.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _count_missing_sfx(production_plan: str) -> int:
+    shots = _parse_shots(production_plan)
+    sfx_line = re.compile(r"^\s*SFX\s*:\s*\S", re.IGNORECASE | re.MULTILINE)
+    missing = sum(1 for shot in shots if not sfx_line.search(shot))
+    return missing
+
+
 SYSTEM_PROMPT = (
     "You are a professional video producer for a cinematic alternate-history "
     "YouTube channel. Break the given script into a clear shot-by-shot production "
@@ -135,7 +194,7 @@ SYSTEM_PROMPT = (
     "currently coming out silent - give every shot a real audible source: "
     "footsteps, wind, fire, tools, crowd murmur, hooves, waves, machinery, "
     "etc., whatever actually fits the scene."
-)
+) + SFX_LINE_RULE
 
 
 def _call_gemini(prompt: str) -> str | None:
@@ -215,7 +274,8 @@ def _continue_if_truncated(plan: str) -> str:
             f"repeat any earlier text, do not restart, just continue the plan "
             f"to completion including all remaining shots. Remember: every shot "
             f"line must start with the literal word 'Shot' followed by a number, "
-            f"never 'Scene':\n\n{plan[-1500:]}"
+            f"never 'Scene', and every shot must end with both a 'Duration: Xs' "
+            f"line and an 'SFX: <keyword>' line:\n\n{plan[-1500:]}"
         )
         cont_raw = _call_gemini(continuation_prompt)
         if not cont_raw:
@@ -226,6 +286,38 @@ def _continue_if_truncated(plan: str) -> str:
             plan = plan + "\n" + cont_raw
         else:
             break
+    return plan
+
+
+def _retry_missing_sfx(plan: str, script_text: str, target_shots: int, half_label: str) -> str:
+    """ADDED (2026-08-31): one bounded retry if the model produced shots
+    without an SFX line - rather than silently shipping a plan with gaps
+    (which would just mean those specific shots get no SFX layer later in
+    assemble.py, a soft/invisible degradation), ask once for a corrected
+    version. If the retry doesn't fully fix it either, the plan is still
+    accepted as-is - a partially-covered SFX layer is a real but minor
+    quality gap, not worth blocking video generation over, matching the
+    fail-open philosophy already used for music/native-audio elsewhere in
+    this pipeline."""
+    missing = _count_missing_sfx(plan)
+    if missing == 0:
+        return plan
+    print(f"{half_label}: {missing} shot(s) missing an 'SFX:' line - requesting one corrected pass.")
+    fix_prompt = (
+        f"Here is a shot-by-shot production plan for this script:\n\n{script_text}\n\n"
+        f"Re-output the FULL plan below, unchanged except that every single shot "
+        f"must end with an 'SFX: <keyword>' line as well as its 'Duration: Xs' "
+        f"line - some shots in the draft below are missing the SFX line. Keep "
+        f"everything else (shot numbering, descriptions, durations) exactly as "
+        f"written, just add the missing SFX lines:\n\n{plan}"
+    )
+    fixed = _call_gemini(fix_prompt)
+    if fixed and len(fixed) > len(plan) * 0.6:
+        still_missing = _count_missing_sfx(fixed)
+        print(f"{half_label}: after retry, {still_missing} shot(s) still missing SFX (was {missing}).")
+        return fixed
+    print(f"{half_label}: SFX-line retry didn't produce usable output - keeping original plan "
+          f"(some shots will simply have no SFX layer at assembly time).")
     return plan
 
 
@@ -278,6 +370,25 @@ def run_video_planning(db: Session, script_id: str):
     audible happening in-frame - Agnes has nothing to render as sound unless
     the shot text itself describes a sound source, so this is upstream of
     assemble.py's native-audio extraction, not a replacement for it.
+
+    SFX REFINEMENT PASS (2026-08-31): the 2026-08-26 ambient-sound rule made
+    every shot's PROSE name a sound source, but nothing downstream ever
+    actually turned that into a real, mixed-in sound effect - assemble.py's
+    only audio layers were narration, whatever incidental native audio
+    happened to be in the Agnes clip itself, and the chapter music bed.
+    Rather than have assemble.py try to extract a search term from freeform
+    prose (fragile, would need real NLP), this adds SFX_LINE_RULE: every
+    shot must now also end with a short, clean, machine-parseable
+    'SFX: <keyword>' line distilling that same sound source into a real
+    search term. _retry_missing_sfx() does one bounded corrective pass if
+    the model drops the line on any shots (fails open - a plan with a few
+    shots missing SFX still ships rather than blocking generation).
+    assemble.py's _fetch_shot_sfx() (see that file) is the consuming side -
+    it searches the free Freesound.org API with this exact keyword per shot
+    and mixes the result in as a new low-volume layer alongside the existing
+    native-audio and music layers, degrading silently (no SFX for that shot)
+    on any lookup/download failure, matching the fail-open pattern already
+    used for music tracks.
     """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
@@ -308,7 +419,8 @@ def run_video_planning(db: Session, script_id: str):
         f'longer holds) rather than using the same duration for every shot. Keep '
         f'every shot brightly and clearly lit unless the script explicitly calls '
         f'for night or bad weather. Avoid close-ups of readable text or '
-        f'documents. Start directly with Shot 1. This is only the first half of '
+        f'documents. Every shot needs both a Duration line and an SFX line. '
+        f'Start directly with Shot 1. This is only the first half of '
         f'the script — end at a natural shot boundary, do not add a conclusion '
         f'yet.'
     )
@@ -323,6 +435,7 @@ def run_video_planning(db: Session, script_id: str):
         )
 
     part1 = _continue_if_truncated(part1)
+    part1 = _retry_missing_sfx(part1, part1_script, part1_target_shots, "Part 1")
 
     part2_prompt = (
         f'Continue the shot-by-shot production plan directly from where it left '
@@ -336,10 +449,11 @@ def run_video_planning(db: Session, script_id: str):
         f'only continue numbering from the next shot number):\n\n{part1[-1500:]}\n\n'
         f'Keep the same format: every shot starts with the literal word "Shot" '
         f'followed by a number (never "Scene"), and every shot ends with a '
-        f'"Duration: Xs" line. Vary durations naturally. Keep every shot brightly '
-        f'and clearly lit unless the script explicitly calls for night or bad '
-        f'weather. Avoid close-ups of readable text or documents. Cover this '
-        f'second half through to the end of the script.'
+        f'"Duration: Xs" line followed by an "SFX: <keyword>" line. Vary '
+        f'durations naturally. Keep every shot brightly and clearly lit unless '
+        f'the script explicitly calls for night or bad weather. Avoid close-ups '
+        f'of readable text or documents. Cover this second half through to the '
+        f'end of the script.'
     )
     part2 = _call_gemini(part2_prompt)
 
@@ -353,6 +467,7 @@ def run_video_planning(db: Session, script_id: str):
         )
 
     part2 = _continue_if_truncated(part2)
+    part2 = _retry_missing_sfx(part2, part2_script, part2_target_shots, "Part 2")
     plan = part1 + "\n" + part2
 
     video = Video(
