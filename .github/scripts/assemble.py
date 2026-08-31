@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 import re
 import subprocess
@@ -61,6 +62,35 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 SUPABASE_BUCKET = "nova-media"
 
+# ADDED (2026-08-31, SFX refinement pass): Freesound.org API for real,
+# per-shot sound effects. Freesound was chosen after checking 10 options
+# for a free, automatable SFX source (video-conditioned generative APIs
+# like Sonilo/ElevenLabs SFX are commercial-only or have quota far too
+# small for daily volume; YouTube Audio Library and the BBC SFX archive
+# have no public API; self-hosted generative audio models need GPU compute
+# this pipeline's free-tier infra doesn't have). Freesound's own published
+# API docs (freesound.org/docs/api/overview.html) confirm a real free
+# tier: 60 requests/minute, 2000 requests/day, simple token-based auth (no
+# OAuth2 needed for searching or downloading preview-quality mp3/ogg files
+# - OAuth2 is only required for original-quality downloads, which this
+# pipeline doesn't need). At ~1-2 videos/day with a few dozen SFX cues
+# each, this pipeline is nowhere near either limit.
+# Requires FREESOUND_API_KEY as an env var (apply for a free token at
+# https://freesound.org/apiv2/apply/) - see assemble.yml. SFX is treated
+# as fully optional, same as music: any lookup/download failure for a
+# given shot just means that shot has no SFX layer, never a hard failure.
+FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "").strip()
+FREESOUND_ENABLED = bool(FREESOUND_API_KEY)
+FREESOUND_SEARCH_URL = "https://freesound.org/apiv2/search/text/"
+SFX_VOLUME = 0.22
+# Cap on unique Freesound searches per assembly run - a 100-shot video
+# would otherwise fire up to 100 searches; most shots share similar SFX
+# keywords (e.g. many "footsteps stone floor" shots in one script), so a
+# small in-run cache (see _fetch_shot_sfx) already collapses most repeats.
+# This is a hard ceiling as a second safety net against an unusually
+# keyword-diverse script eating into the 2000/day budget in one run.
+SFX_MAX_SEARCHES_PER_RUN = 60
+
 DEFAULT_SHOT_DURATION = 3.0
 CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
@@ -116,7 +146,12 @@ CINEMATIC_VF_BASE = (
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
 NATIVE_SFX_VOLUME = 0.16
-NARRATION_VOLUME_WITH_LAYERS = 0.95
+# LOWERED (2026-08-31): was 0.95. Now that a real per-shot SFX layer
+# (SFX_VOLUME) exists in addition to native clip audio and music, three
+# simultaneous layers under narration need slightly more headroom each to
+# avoid a muddier mix than the old two-layer (native + music) version -
+# the safety limiter below still catches any residual peak overage.
+NARRATION_VOLUME_WITH_LAYERS = 0.92
 LIMITER_CEILING = 0.98
 
 # ADDED (2026-08-30, NOVA_REBUILD_HANDOFF.md item #6): music cue/mood
@@ -170,6 +205,12 @@ FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
 DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 FFMPEG_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
+# ADDED (2026-08-31, SFX refinement pass): matches the "SFX: <keyword>"
+# line video_planning_agent.py now requires per shot (see that file's
+# SFX_LINE_RULE). Mirrors DURATION_PATTERN's tolerance for markdown-bold
+# wrapping (Gemini sometimes wraps field labels in ** even when told not
+# to), since that's already proven necessary for the Duration line.
+SFX_PATTERN = re.compile(r"SFX\*{0,2}\s*:\s*\*{0,2}\s*([^\n]+)", re.IGNORECASE)
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
@@ -346,6 +387,165 @@ def _parse_durations(production_plan):
         else:
             durations.append(DEFAULT_SHOT_DURATION)
     return durations
+
+
+def _parse_sfx_keywords(production_plan, total_shots):
+    """ADDED (2026-08-31, SFX refinement pass): extracts each shot's
+    'SFX: <keyword>' line (see video_planning_agent.py's SFX_LINE_RULE) in
+    shot order, mirroring _parse_durations's line-scanning approach exactly
+    so shot indices stay aligned between durations and SFX keywords. A shot
+    with no SFX line (e.g. an older plan generated before this feature, or
+    one the bounded retry in video_planning_agent.py didn't fully fix)
+    simply gets None here, which _fetch_shot_sfx treats as "no SFX for this
+    shot" rather than an error - old plans and partially-covered plans both
+    still assemble normally, just without SFX on the affected shots."""
+    keywords = []
+    current_keyword = None
+    for line in production_plan.splitlines():
+        stripped = line.strip()
+        if SHOT_START.match(stripped):
+            if current_keyword is not None or keywords:
+                keywords.append(current_keyword)
+            current_keyword = None
+            continue
+        match = SFX_PATTERN.search(stripped)
+        if match and current_keyword is None:
+            current_keyword = match.group(1).strip().strip("*").strip()
+    keywords.append(current_keyword)
+    # First entry is a None placeholder from before the first shot started -
+    # drop it, then pad/truncate to total_shots so this always lines up
+    # 1:1 with _parse_durations's output length.
+    keywords = keywords[1:] if keywords and keywords[0] is None and len(keywords) > total_shots else keywords
+    while len(keywords) < total_shots:
+        keywords.append(None)
+    return keywords[:total_shots]
+
+
+_sfx_cache = {}
+_sfx_search_count = 0
+
+
+def _fetch_shot_sfx(keyword, work_dir):
+    """ADDED (2026-08-31, SFX refinement pass): looks up a short CC-licensed
+    sound effect from the free Freesound.org API for one shot's keyword
+    (see video_planning_agent.py's SFX_LINE_RULE for where the keyword
+    comes from) and downloads its preview-quality mp3. Returns the local
+    file path, or None if SFX is disabled, the keyword is missing, the
+    search/download fails, or the per-run search cap is hit - every one of
+    these is a silent, graceful degradation (that shot just has no SFX
+    layer), matching the fail-open pattern _build_music_bed already uses
+    for music tracks. Never raises - a real SFX layer is a quality
+    enhancement, not something assembly should ever be blocked on.
+
+    Uses an in-run cache keyed by the lowercased keyword, since many shots
+    in the same script commonly share very similar SFX keywords (e.g.
+    several "footsteps stone floor" shots) - this both saves API calls
+    against the 2000/day budget and saves redundant downloads."""
+    global _sfx_search_count
+
+    if not FREESOUND_ENABLED or not keyword:
+        return None
+
+    cache_key = keyword.lower().strip()
+    if cache_key in _sfx_cache:
+        return _sfx_cache[cache_key]
+
+    if _sfx_search_count >= SFX_MAX_SEARCHES_PER_RUN:
+        print(f"  [sfx] per-run search cap ({SFX_MAX_SEARCHES_PER_RUN}) reached - "
+              f"'{keyword}' will have no SFX layer this run.")
+        _sfx_cache[cache_key] = None
+        return None
+
+    try:
+        _sfx_search_count += 1
+        resp = requests.get(
+            FREESOUND_SEARCH_URL,
+            params={
+                "query": keyword,
+                "token": FREESOUND_API_KEY,
+                "fields": "id,name,previews,duration",
+                "filter": "duration:[0.3 TO 15]",
+                "sort": "score",
+                "page_size": 1,
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"  [sfx] search failed for '{keyword}' (HTTP {resp.status_code}) - no SFX for this shot.")
+            _sfx_cache[cache_key] = None
+            return None
+
+        results = resp.json().get("results") or []
+        if not results:
+            print(f"  [sfx] no Freesound results for '{keyword}' - no SFX for this shot.")
+            _sfx_cache[cache_key] = None
+            return None
+
+        preview_url = (results[0].get("previews") or {}).get("preview-hq-mp3")
+        if not preview_url:
+            print(f"  [sfx] result for '{keyword}' had no usable preview - no SFX for this shot.")
+            _sfx_cache[cache_key] = None
+            return None
+
+        safe_name = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+        dest_path = os.path.join(work_dir, f"sfx_{safe_name}.mp3")
+        dl_resp = requests.get(preview_url, timeout=30)
+        if dl_resp.status_code != 200 or len(dl_resp.content) == 0:
+            print(f"  [sfx] preview download failed for '{keyword}' - no SFX for this shot.")
+            _sfx_cache[cache_key] = None
+            return None
+
+        with open(dest_path, "wb") as f:
+            f.write(dl_resp.content)
+        _sfx_cache[cache_key] = dest_path
+        return dest_path
+    except Exception as e:
+        print(f"  [sfx] lookup failed for '{keyword}' ({type(e).__name__}: {e}) - no SFX for this shot.")
+        _sfx_cache[cache_key] = None
+        return None
+
+
+def _build_sfx_bed(sfx_keywords, durations, work_dir):
+    """ADDED (2026-08-31, SFX refinement pass): builds one AudioClip layer
+    placing each shot's fetched SFX sound at that shot's start time within
+    the timeline, matching shot boundaries computed from `durations` in
+    the same order assemble.py already uses everywhere else (crossfade
+    overlap between shots is a small, acceptable amount of timing slop for
+    an ambient SFX hit - it doesn't need frame-accurate sync the way
+    narration does). Returns None if no shot produced a usable SFX file
+    (SFX disabled, all lookups failed, or no plan had SFX lines at all) -
+    same optional-layer pattern as music."""
+    if not FREESOUND_ENABLED:
+        return None
+
+    segments = []
+    t = 0.0
+    for keyword, dur in zip(sfx_keywords, durations):
+        sfx_path = _fetch_shot_sfx(keyword, work_dir) if keyword else None
+        if sfx_path:
+            try:
+                clip = AudioFileClip(sfx_path).volumex(SFX_VOLUME)
+                # Trim an SFX hit that's longer than its shot so it doesn't
+                # bleed audibly into the next shot's own sound.
+                if clip.duration > dur:
+                    clip = clip.subclip(0, dur)
+                clip = clip.set_start(t)
+                segments.append(clip)
+            except Exception as e:
+                print(f"  [sfx] failed to load fetched clip for shot at t={t:.1f}s "
+                      f"({type(e).__name__}: {e}) - skipping this shot's SFX.")
+        t += dur
+
+    if not segments:
+        print("  [sfx] no usable SFX this run (disabled, no keywords, or every lookup failed) - "
+              "proceeding without an SFX layer.")
+        return None
+
+    total_duration = t
+    bed = CompositeAudioClip(segments).set_duration(total_duration)
+    print(f"  [sfx] built SFX bed from {len(segments)}/{len(sfx_keywords)} shots "
+          f"({_sfx_search_count} Freesound searches this run).")
+    return bed
 
 
 def _resolve_durations(video, production_plan, total_shots):
@@ -752,7 +952,7 @@ def _build_music_bed(total_duration, work_dir):
     return bed
 
 
-def _build_mixed_audio(narration_path, native_sfx_path, music_clip, out_path):
+def _build_mixed_audio(narration_path, native_sfx_path, music_clip, shot_sfx_clip, out_path):
     narration_clip = AudioFileClip(narration_path)
     duration = narration_clip.duration
 
@@ -766,6 +966,20 @@ def _build_mixed_audio(narration_path, native_sfx_path, music_clip, out_path):
         extra_layers.append(sfx_clip)
     else:
         print("No native clip audio detected to mix in for this video.")
+
+    # ADDED (2026-08-31, SFX refinement pass): per-shot scripted SFX from
+    # Freesound, distinct from native_sfx_path above - native_sfx_path is
+    # WHATEVER incidental sound happened to be baked into the Agnes clip
+    # itself (often faint/generic), while this is a real, specific sound
+    # matched to what the shot's own production plan explicitly calls for
+    # (see video_planning_agent.py's SFX_LINE_RULE). Both layers are kept
+    # - they're complementary, not redundant.
+    if shot_sfx_clip:
+        print("Mixing in per-shot scripted SFX (Freesound).")
+        shot_sfx_clip = _fit_audio_to_duration(shot_sfx_clip, duration)
+        extra_layers.append(shot_sfx_clip)
+    else:
+        print("No per-shot scripted SFX available to mix in for this video.")
 
     if music_clip:
         print("Mixing in chapter music bed.")
@@ -794,6 +1008,11 @@ def main():
     blocks_dir = os.path.join(WORK_DIR, "blocks")
     os.makedirs(media_dir, exist_ok=True)
     os.makedirs(blocks_dir, exist_ok=True)
+
+    if not FREESOUND_ENABLED:
+        print("FREESOUND_API_KEY not set - per-shot SFX layer will be skipped this run "
+              "(music and native-clip audio are unaffected). Get a free token at "
+              "https://freesound.org/apiv2/apply/ and add it as a repo secret to enable.")
 
     # See KEEP-ALIVE FIX (2026-08-30) docstring near _KEEPALIVE_STOP above.
     # Starts pinging /health every 5 min now, before any local rendering
@@ -865,6 +1084,7 @@ def main():
         sys.exit(1)
     urls = urls[:n]
     durations = durations[:n]
+    sfx_keywords = _parse_sfx_keywords(production_plan, total_shots)[:n]
 
     silent_path = os.path.join(WORK_DIR, "silent_final.mp4")
     native_sfx_path = os.path.join(WORK_DIR, "native_sfx.wav")
@@ -926,8 +1146,15 @@ def main():
     except Exception as e:
         print(f"  [music] music bed build failed entirely ({type(e).__name__}: {e}) - continuing without music.")
 
-    print("Building audio mix (narration + native clip audio + chapter music)...")
-    total_duration = _build_mixed_audio(audio_path, extracted_sfx, music_bed, mixed_audio_path)
+    print("Building per-shot scripted SFX bed (Freesound)...")
+    shot_sfx_bed = None
+    try:
+        shot_sfx_bed = _build_sfx_bed(sfx_keywords, durations, media_dir)
+    except Exception as e:
+        print(f"  [sfx] SFX bed build failed entirely ({type(e).__name__}: {e}) - continuing without per-shot SFX.")
+
+    print("Building audio mix (narration + native clip audio + per-shot SFX + chapter music)...")
+    total_duration = _build_mixed_audio(audio_path, extracted_sfx, music_bed, shot_sfx_bed, mixed_audio_path)
 
     video_duration = _get_video_duration(silent_path)
     # END-FREEZE FIX (2026-08-26): the target held-through duration now
