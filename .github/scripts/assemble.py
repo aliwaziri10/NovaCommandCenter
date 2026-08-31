@@ -58,9 +58,40 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 # Requires SUPABASE_URL and SUPABASE_SECRET_KEY as env vars on this
 # workflow (same values already set on the Render backend service) - see
 # assemble.yml.
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
 SUPABASE_BUCKET = "nova-media"
+
+# ADDED (2026-08-31, fail-fast diagnostic): the direct-to-Supabase upload
+# path introduced same day silently produces a malformed upload URL (and
+# an opaque downstream exception, not a clear error) if these two secrets
+# are referenced in assemble.yml but were never actually created in repo
+# Settings -> Secrets, or were left blank. Confirmed via the commit
+# timeline that assemble.yml wasn't wired to pass these secrets at all
+# for the first ~27 minutes after this code went live (issue #140), and
+# two further unexplained failures (#141, #142) followed even after the
+# yml was patched - consistent with the secrets being referenced in the
+# yml but not actually set with real values in GitHub. This check turns
+# that into an immediate, unambiguous failure message instead of a
+# confusing requests/URL exception several steps later.
+if not SUPABASE_URL or not SUPABASE_URL.startswith("http"):
+    print(
+        "FATAL: SUPABASE_URL is missing or not a valid URL (got: "
+        f"{SUPABASE_URL!r}). This must be set as a repo secret "
+        "(Settings -> Secrets and variables -> Actions -> SUPABASE_URL) "
+        "with the project's real Supabase URL, e.g. "
+        "https://<project-ref>.supabase.co - assembly cannot upload "
+        "without it."
+    )
+    sys.exit(1)
+if not SUPABASE_SECRET_KEY:
+    print(
+        "FATAL: SUPABASE_SECRET_KEY is missing or empty. This must be "
+        "set as a repo secret (Settings -> Secrets and variables -> "
+        "Actions -> SUPABASE_SECRET_KEY) - assembly cannot authenticate "
+        "to Supabase Storage without it."
+    )
+    sys.exit(1)
 
 # ADDED (2026-08-31, SFX refinement pass): Freesound.org API for real,
 # per-shot sound effects. Freesound was chosen after checking 10 options
