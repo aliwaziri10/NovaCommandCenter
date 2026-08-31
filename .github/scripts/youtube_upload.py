@@ -10,6 +10,28 @@ YOUTUBE_CLIENT_SECRET = os.environ["YOUTUBE_CLIENT_SECRET"]
 YOUTUBE_REFRESH_TOKEN = os.environ["YOUTUBE_REFRESH_TOKEN"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
+# ADDED (2026-08-31): AUTO-CLEANUP OF SUPABASE STORAGE AFTER SUCCESSFUL
+# YOUTUBE UPLOAD. Zia's Free-tier Supabase project has only 1GB of total
+# file storage. A single finished Nova video is 500-700MB at CRF 20, so
+# 1-2 videos sitting in the bucket permanently would exhaust the entire
+# free quota and start blocking every future assemble run's upload -
+# recreating the exact 413/storage-full failure just fixed on 2026-08-31,
+# but from a different cause (quota exhaustion instead of a too-small
+# per-file limit).
+# Fix: once a video is confirmed uploaded to YouTube AND the backend has
+# been successfully marked status=uploaded, its Supabase Storage copy has
+# done its job - YouTube is now the permanent home for the video - so
+# this script deletes it from Supabase Storage automatically, same run,
+# no separate workflow or manual step required. This runs on every
+# scheduled upload from now on, so storage never accumulates.
+# Deliberately NOT deleting on any earlier failure path - if the YouTube
+# upload itself failed, or the backend PATCH to mark it uploaded failed,
+# the Supabase copy is kept so nothing is ever lost before it's
+# confirmed safely landed on YouTube.
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
+SUPABASE_BUCKET = "nova-media"
+
 BACKEND_TIMEOUT = 120  # Render cold starts can run past 90s
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 
@@ -199,6 +221,46 @@ def _build_final_description(raw_description, chapters_block):
         description = chapters_block + "\n\n" + description
 
     return description
+
+
+def _delete_from_supabase_storage(video_id):
+    """ADDED (2026-08-31): deletes the finished video file from Supabase
+    Storage (bucket 'nova-media', path 'final/{video_id}.mp4') now that
+    it has been confirmed uploaded to YouTube and the backend record has
+    been marked status=uploaded. This is what keeps the Free-tier 1GB
+    storage quota from filling up permanently - see note near
+    SUPABASE_URL above. Only called from main() after both the YouTube
+    upload AND the backend status PATCH have succeeded.
+
+    Best-effort: prints a clear warning on failure but does NOT raise -
+    a cleanup failure should never be treated as an upload failure (the
+    video is already safely on YouTube by this point), and the next
+    run's cleanup attempt for a different video isn't blocked by one
+    stale file failing to delete. A file that fails to delete here just
+    sits in storage until manually cleared or retried - it does not
+    silently vanish or corrupt anything.
+    """
+    path_in_bucket = f"final/{video_id}.mp4"
+    delete_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path_in_bucket}"
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+    }
+    try:
+        resp = requests.delete(delete_url, headers=headers, timeout=60)
+        if resp.status_code >= 400 and resp.status_code != 404:
+            print(
+                f"WARNING: cleanup failed - could not delete {path_in_bucket} from "
+                f"Supabase Storage ({resp.status_code}): {resp.text[:300]}. "
+                f"File will remain in storage until manually cleared."
+            )
+        else:
+            print(f"Cleanup: deleted {path_in_bucket} from Supabase Storage (video is now only on YouTube).")
+    except requests.RequestException as e:
+        print(
+            f"WARNING: cleanup failed - network error deleting {path_in_bucket} from "
+            f"Supabase Storage: {e}. File will remain in storage until manually cleared."
+        )
 
 
 def wake_up_backend(max_attempts=4):
@@ -405,11 +467,15 @@ def main():
         json={"status": "uploaded", "youtube_video_id": youtube_video_id},
         timeout=60,
     )
-    
+
     if mark_resp.status_code >= 400:
         print(f"WARNING: upload succeeded but failed to mark backend as uploaded: {mark_resp.status_code} {mark_resp.text}")
     else:
         print(f"Backend updated: video {video_id} marked status=uploaded, youtube_video_id={youtube_video_id}.")
+        # AUTO-CLEANUP (2026-08-31): only delete the Supabase Storage copy
+        # once both the YouTube upload AND the backend status update are
+        # confirmed successful - see _delete_from_supabase_storage docstring.
+        _delete_from_supabase_storage(video_id)
 
     topic_id = video.get("topic_id")
     if topic_id:
@@ -424,7 +490,7 @@ def main():
             print(f"Backend updated: topic {topic_id} marked status=used.")
     else:
         print("WARNING: video has no topic_id - cannot mark topic as used.")
-        
+
 
 def _print_failure_summary(exc):
     import traceback
