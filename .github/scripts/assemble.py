@@ -29,67 +29,53 @@ RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
-# ADDED (2026-08-31): DIRECT-TO-SUPABASE UPLOAD FIX.
-# ROOT CAUSE CONFIRMED via two matched production runs on the exact same
-# video (b43ac407-...): run #356 (pre-CRF, 400kbps/35MB budget) produced a
-# 48.1MB file and uploaded successfully. Run #357 (post-CRF-20 change,
-# same video, same shots, same narration) produced a 743.7MB file and
-# failed on upload with HTTP 502, four separate times, on every retry.
-# A second, different video (4fc244de, 56 shots) independently produced
-# 659.2MB and failed identically across at least two separate runs (#359,
-# #360) hours apart - including one run that started *after* the
-# keep-alive and PUT-timeout fixes were already live, which rules out
-# cold-start as the cause. The one variable that changed between "always
-# worked" and "always fails" is file size, not timing.
-# Render's free-tier backend runs on very limited RAM. A 650-750MB upload
-# arriving as a single multipart POST is a highly plausible way to OOM-
-# crash that process on every attempt, warm or not - which surfaces to
-# the client as an opaque 502, indistinguishable from a cold start unless
-# you're looking at Render's own crash logs.
-# Fix: this script now uploads the finished video file directly from the
-# GitHub Actions runner to Supabase Storage (same bucket the backend
-# already uses), completely bypassing Render for the large-file transfer.
-# The backend is then updated with a single small JSON PATCH
-# (~100 bytes: status + the resulting public URL) via the existing
-# generic /api/v1/videos/{id} CRUD endpoint - the same pattern
-# youtube_upload.py already uses to mark a video as uploaded. This keeps
-# CRF 20 (no quality compromise) while removing Render's free-tier RAM
-# entirely from the critical path for this step.
-# Requires SUPABASE_URL and SUPABASE_SECRET_KEY as env vars on this
-# workflow (same values already set on the Render backend service) - see
-# assemble.yml.
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
-SUPABASE_BUCKET = "nova-media"
+# ADDED (2026-09-02): DIRECT-TO-GITHUB-RELEASE UPLOAD FIX (replaces
+# direct-to-Supabase, 2026-08-31).
+# ROOT CAUSE CONFIRMED (2026-09-02) via a live query against Supabase's
+# own storage.buckets table: the 'nova-media' bucket's own file_size_limit
+# is already 2GB, so the bucket config was never the block. The real
+# ceiling is Supabase's PROJECT-WIDE Storage upload cap, which sits above
+# any bucket setting, is dashboard-only (no SQL/Management-API path), and
+# is hard-capped at 50MB on the Free plan - confirmed against Supabase's
+# own published docs. A 367.7MB (or 650-750MB) render will never clear
+# that on Free, regardless of CRF/bitrate, and raising it requires the
+# $25/mo Pro plan. Separately, Supabase's total Storage quota on Free is
+# only 1GB - even if the per-file cap were solved, a handful of ~300MB+
+# videos would exhaust the entire project's storage.
+# Fix: this script now uploads the finished video file as a GitHub
+# Release asset on this same repo instead - completely free, no per-file
+# size trouble (GitHub's per-asset limit is far above anything this
+# pipeline renders), no total-storage trouble (the asset is deleted by
+# youtube_upload.py immediately after a confirmed YouTube upload, so
+# nothing accumulates), and zero quality compromise (CRF is untouched).
+# The backend's download redirect (backend/app/routers/download_router.py)
+# already just does `RedirectResponse(url=video.video_url)` - it does not
+# care what host video_url points to, so this needed NO backend changes
+# at all; only this script's upload step and youtube_upload.py's cleanup
+# step change.
+# Requires GITHUB_TOKEN as an env var on this workflow (the default
+# Actions token works fine for a same-repo release - see assemble.yml,
+# which must also grant `permissions: contents: write`). GITHUB_REPOSITORY
+# ("owner/repo") is already present automatically in every Actions run.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+RELEASE_TAG = "nova-video-storage"
 
-# ADDED (2026-08-31, fail-fast diagnostic): the direct-to-Supabase upload
-# path introduced same day silently produces a malformed upload URL (and
-# an opaque downstream exception, not a clear error) if these two secrets
-# are referenced in assemble.yml but were never actually created in repo
-# Settings -> Secrets, or were left blank. Confirmed via the commit
-# timeline that assemble.yml wasn't wired to pass these secrets at all
-# for the first ~27 minutes after this code went live (issue #140), and
-# two further unexplained failures (#141, #142) followed even after the
-# yml was patched - consistent with the secrets being referenced in the
-# yml but not actually set with real values in GitHub. This check turns
-# that into an immediate, unambiguous failure message instead of a
-# confusing requests/URL exception several steps later.
-if not SUPABASE_URL or not SUPABASE_URL.startswith("http"):
+if not GITHUB_TOKEN:
     print(
-        "FATAL: SUPABASE_URL is missing or not a valid URL (got: "
-        f"{SUPABASE_URL!r}). This must be set as a repo secret "
-        "(Settings -> Secrets and variables -> Actions -> SUPABASE_URL) "
-        "with the project's real Supabase URL, e.g. "
-        "https://<project-ref>.supabase.co - assembly cannot upload "
-        "without it."
+        "FATAL: GITHUB_TOKEN is missing or empty. This must be set as an "
+        "env var on the 'Run assembly' step in assemble.yml (use "
+        "${{ secrets.GITHUB_TOKEN }} - no new secret needs to be created, "
+        "GitHub provides this automatically on every run) - assembly "
+        "cannot create/upload a release asset without it."
     )
     sys.exit(1)
-if not SUPABASE_SECRET_KEY:
+if not GITHUB_REPOSITORY or "/" not in GITHUB_REPOSITORY:
     print(
-        "FATAL: SUPABASE_SECRET_KEY is missing or empty. This must be "
-        "set as a repo secret (Settings -> Secrets and variables -> "
-        "Actions -> SUPABASE_SECRET_KEY) - assembly cannot authenticate "
-        "to Supabase Storage without it."
+        "FATAL: GITHUB_REPOSITORY is missing or malformed (got: "
+        f"{GITHUB_REPOSITORY!r}). GitHub Actions sets this automatically - "
+        "if it's missing, this script is not running inside a normal "
+        "GitHub Actions job."
     )
     sys.exit(1)
 
@@ -360,31 +346,82 @@ def _resilient_patch_json(url, json_body, max_attempts=5, timeout=60):
     raise last_exc
 
 
-def _upload_final_video_to_supabase(video_id, file_path):
-    """ADDED (2026-08-31): uploads the finished, fully-assembled video
-    file DIRECTLY from this GitHub Actions runner to Supabase Storage,
-    bypassing Render entirely for this transfer - see DIRECT-TO-SUPABASE
-    UPLOAD note near the top of this file for why. Streams the file from
-    disk (not loaded fully into memory first) since this runner's own
-    memory is also finite, though far less constrained than Render's
-    free tier. Mirrors the same bucket/path convention the backend's own
-    upload_to_storage() uses (backend/app/supabase_storage.py) so the
-    resulting public URL is indistinguishable from one the backend would
-    have produced itself.
+def _github_api_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
-    Raises RuntimeError with Supabase's actual error text on failure -
-    matches the "never fail silently" principle from supabase_storage.py.
+
+def _get_or_create_release():
+    """Returns the release object for RELEASE_TAG on this repo, creating
+    it the first time it's needed. This one release is reused forever as
+    a container for video assets - it is NOT a versioned software release,
+    just a free, sizeable (per-asset cap far above anything this pipeline
+    renders), zero-cost storage bucket that happens to live on GitHub."""
+    get_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/tags/{RELEASE_TAG}"
+    resp = requests.get(get_url, headers=_github_api_headers(), timeout=30)
+    if resp.status_code == 200:
+        return resp.json()
+    if resp.status_code != 404:
+        raise RuntimeError(f"Failed to look up release '{RELEASE_TAG}' ({resp.status_code}): {resp.text[:500]}")
+
+    create_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases"
+    resp = requests.post(
+        create_url,
+        headers=_github_api_headers(),
+        json={
+            "tag_name": RELEASE_TAG,
+            "name": "Nova video storage (do not delete)",
+            "body": "Internal storage bucket for finished Nova videos, used by assemble.py "
+                     "and youtube_upload.py as a free Supabase-Storage replacement. Each "
+                     "asset is deleted automatically right after its video is confirmed "
+                     "uploaded to YouTube, so this should normally sit empty or near-empty.",
+            "draft": False,
+            "prerelease": False,
+        },
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Failed to create release '{RELEASE_TAG}' ({resp.status_code}): {resp.text[:500]}")
+    return resp.json()
+
+
+def _delete_existing_asset_if_present(release, asset_name):
+    """GitHub refuses to upload an asset whose name already exists on the
+    release (422 'already_exists') - this happens on a re-run for the same
+    video_id. Deletes any existing asset with this name first so the
+    upload below is idempotent."""
+    for asset in release.get("assets", []):
+        if asset.get("name") == asset_name:
+            del_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/assets/{asset['id']}"
+            requests.delete(del_url, headers=_github_api_headers(), timeout=30)
+
+
+def _upload_final_video_to_github_release(video_id, file_path):
+    """ADDED (2026-09-02): uploads the finished, fully-assembled video
+    file DIRECTLY from this GitHub Actions runner to a GitHub Release
+    asset on this same repo - see DIRECT-TO-GITHUB-RELEASE UPLOAD note
+    near the top of this file for why this replaces the Supabase upload.
+    Streams the file from disk (not loaded fully into memory first).
+
+    Raises RuntimeError with GitHub's actual error text on failure -
+    matches the "never fail silently" principle used throughout this
+    file.
     """
-    path_in_bucket = f"final/{video_id}.mp4"
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path_in_bucket}"
+    asset_name = f"{video_id}.mp4"
+    release = _get_or_create_release()
+    _delete_existing_asset_if_present(release, asset_name)
+
+    upload_base = release["upload_url"].split("{")[0]  # strip the {?name,label} URI template
+    upload_url = f"{upload_base}?name={asset_name}"
     file_size = os.path.getsize(file_path)
 
     headers = {
-        "apikey": SUPABASE_SECRET_KEY,
-        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        **_github_api_headers(),
         "Content-Type": "video/mp4",
         "Content-Length": str(file_size),
-        "x-upsert": "true",
     }
 
     last_exc = None
@@ -392,20 +429,20 @@ def _upload_final_video_to_supabase(video_id, file_path):
     for attempt in range(1, max_attempts + 1):
         try:
             with open(file_path, "rb") as f:
-                resp = requests.put(upload_url, headers=headers, data=f, timeout=900)
+                resp = requests.post(upload_url, headers=headers, data=f, timeout=900)
             if resp.status_code >= 400:
                 raise RuntimeError(
-                    f"Supabase Storage upload failed ({resp.status_code}): {resp.text[:500]}"
+                    f"GitHub Release asset upload failed ({resp.status_code}): {resp.text[:500]}"
                 )
-            return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path_in_bucket}"
+            return resp.json()["browser_download_url"]
         except (requests.RequestException, RuntimeError) as e:
             last_exc = e
             if attempt == max_attempts:
                 break
             wait = 20 * attempt
-            print(f"Direct-to-Supabase upload attempt {attempt}/{max_attempts} failed: {e}. Retrying in {wait}s...")
+            print(f"Direct-to-GitHub-Release upload attempt {attempt}/{max_attempts} failed: {e}. Retrying in {wait}s...")
             time.sleep(wait)
-    raise RuntimeError(f"Direct-to-Supabase upload failed after {max_attempts} attempts: {last_exc}")
+    raise RuntimeError(f"Direct-to-GitHub-Release upload failed after {max_attempts} attempts: {last_exc}")
 
 
 def _parse_shots_count(production_plan):
@@ -1256,13 +1293,14 @@ def main():
     final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
     print(f"Final file size: {final_size_mb:.1f}MB (CRF {VIDEO_CRF}, no size budget applied).")
 
-    # DIRECT-TO-SUPABASE UPLOAD (2026-08-31): see note near the top of this
-    # file. The large file now goes straight from this runner to Supabase
-    # Storage - Render never sees it. Only a small JSON status update
-    # reaches Render afterward.
-    print("Uploading finished video directly to Supabase Storage (bypassing Render for the large-file transfer)...")
-    video_url = _upload_final_video_to_supabase(video_id, final_path)
-    print(f"Uploaded to Supabase Storage: {video_url}")
+    # DIRECT-TO-GITHUB-RELEASE UPLOAD (2026-09-02): see note near the top of
+    # this file. The large file now goes straight from this runner to a
+    # GitHub Release asset on this repo - Render never sees it, and there's
+    # no Supabase file-size or total-storage ceiling to hit. Only a small
+    # JSON status update reaches Render afterward.
+    print("Uploading finished video to a GitHub Release asset (free, no size ceiling, no quality change)...")
+    video_url = _upload_final_video_to_github_release(video_id, final_path)
+    print(f"Uploaded to GitHub Release: {video_url}")
 
     print("Marking video as assembled on the backend (small JSON PATCH, no file transfer)...")
     patch_resp = _resilient_patch_json(
