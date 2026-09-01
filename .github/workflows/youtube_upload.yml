@@ -9,6 +9,9 @@ on:
   schedule:
     - cron: "15 */6 * * *"
 
+permissions:
+  contents: write
+
 jobs:
   upload:
     runs-on: ubuntu-latest
@@ -24,6 +27,5 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VIDEO_ID: ${{ inputs.video_id }}
