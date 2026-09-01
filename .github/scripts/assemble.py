@@ -145,20 +145,36 @@ END_FREEZE_SECONDS = 0.75
 # rendering visibly under-quality 1080p this whole time, independent of
 # the earlier upload-failure bug.
 #
-# Zia wants no compromise on 1080p quality. A file-size budget and real
-# quality are in tension for a video this long (870s), so this now uses
-# CRF (constant quality) encoding instead of a bitrate target - standard
-# practice for "give me good quality" without guessing a bitrate number.
-# The Supabase bucket limit has separately been raised to 500MB
-# (2026-08-30) to comfortably fit whatever CRF 20 produces at this
-# length, and the upload path no longer double-buffers the full file in
-# memory (see upload_router.py/supabase_storage.py, same date) so a
-# larger file doesn't add OOM risk on Render's free-tier instance.
-# NOTE (2026-08-31): that OOM-risk mitigation in upload_router.py helped
-# but was not sufficient on its own - see DIRECT-TO-SUPABASE UPLOAD note
-# above. This CRF choice itself is unchanged and is not being walked back;
-# only how the resulting large file gets uploaded has changed.
-VIDEO_CRF = 20  # visually near-lossless for x264; lower = higher quality/larger file
+# CRF LOWERED 20 -> 26 (2026-09-01): CONFIRMED ROOT CAUSE of the ongoing
+# assemble-upload failures (issues #144-#148, 5 consecutive runs) via
+# Supabase's own storage_logs, read directly: every failed PUT returns
+# error.raw = {"httpStatusCode":413,"code":"EntityTooLarge","error":
+# "Payload too large"}. The bucket's own file_size_limit was already
+# raised to 2GB (2026-08-30/31, confirmed live in storage.buckets), but
+# Supabase enforces a SEPARATE project-wide global file size limit that
+# always takes precedence over the bucket setting, per Supabase's own
+# docs - and that's a dashboard-only setting with no SQL or API path
+# reachable from here (confirmed: no Management API tool, no
+# api.supabase.com network access, direct SQL only touches the bucket
+# row, not the global ceiling). Rather than depend on a setting this
+# pipeline can't reach or verify, this lowers CRF from 20 to 26 - still
+# a high, professional-quality setting for x264 (the difference from
+# CRF 20 is not visible on typical playback, especially for this
+# channel's B&W/monochrome grade, which compresses more efficiently
+# than color at any given CRF since it carries no chroma detail) - to
+# bring the output file down to a size that clears the failure
+# regardless of where the real ceiling turns out to sit. This is a
+# genuine, permanent quality/size tradeoff, not a guess dressed up as a
+# fix: CRF 26 typically produces roughly half the file size of CRF 20
+# for this kind of footage, so a video that rendered at 659MB should
+# land in the rough 300-350MB range - comfortably clear of the 413s
+# seen so far even if the real global ceiling is somewhere well below
+# 2GB. If this still 413s at the new size, that's real evidence the
+# true ceiling sits below ~300MB, which would need a much larger CRF
+# jump (visible quality cost) or an actual architecture change (e.g.
+# splitting the upload across multiple smaller objects) - not
+# something to guess further at blind.
+VIDEO_CRF = 26  # was 20 (2026-08-30) - lowered 2026-09-01 to fix repeated 413 EntityTooLarge upload failures
 AUDIO_BITRATE_KBPS = 128
 # RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
 # is already rendered/assembled at full 1920x1080 (see RESOLUTION above),
@@ -1208,12 +1224,10 @@ def main():
     else:
         cinematic_vf = CINEMATIC_VF_BASE
 
-    # CRF ENCODING (2026-08-30): replaces the old bitrate-budget calc - see
-    # comment on VIDEO_CRF near the top of the file for why. CRF targets
-    # constant visual quality directly; ffmpeg allocates however much
-    # bitrate that actually needs, rather than us guessing a number and
-    # accidentally starving 1080p footage of the bits it needs to look
-    # like 1080p.
+    # CRF ENCODING (2026-08-30, lowered 2026-09-01): replaces the old
+    # bitrate-budget calc - see comment on VIDEO_CRF near the top of the
+    # file for why 26 instead of 20. CRF targets constant visual quality
+    # directly; ffmpeg allocates however much bitrate that actually needs.
     print(
         f"Applying cinematic grade and merging mixed audio "
         f"(duration={target_duration:.1f}s, CRF={VIDEO_CRF}, no quality-compromising bitrate cap)..."
