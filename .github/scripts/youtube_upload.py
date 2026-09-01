@@ -10,27 +10,18 @@ YOUTUBE_CLIENT_SECRET = os.environ["YOUTUBE_CLIENT_SECRET"]
 YOUTUBE_REFRESH_TOKEN = os.environ["YOUTUBE_REFRESH_TOKEN"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
-# ADDED (2026-08-31): AUTO-CLEANUP OF SUPABASE STORAGE AFTER SUCCESSFUL
-# YOUTUBE UPLOAD. Zia's Free-tier Supabase project has only 1GB of total
-# file storage. A single finished Nova video is 500-700MB at CRF 20, so
-# 1-2 videos sitting in the bucket permanently would exhaust the entire
-# free quota and start blocking every future assemble run's upload -
-# recreating the exact 413/storage-full failure just fixed on 2026-08-31,
-# but from a different cause (quota exhaustion instead of a too-small
-# per-file limit).
-# Fix: once a video is confirmed uploaded to YouTube AND the backend has
-# been successfully marked status=uploaded, its Supabase Storage copy has
-# done its job - YouTube is now the permanent home for the video - so
-# this script deletes it from Supabase Storage automatically, same run,
-# no separate workflow or manual step required. This runs on every
-# scheduled upload from now on, so storage never accumulates.
-# Deliberately NOT deleting on any earlier failure path - if the YouTube
-# upload itself failed, or the backend PATCH to mark it uploaded failed,
-# the Supabase copy is kept so nothing is ever lost before it's
-# confirmed safely landed on YouTube.
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
-SUPABASE_BUCKET = "nova-media"
+# UPDATED (2026-09-02): cleanup target switched from Supabase Storage to a
+# GitHub Release asset, matching assemble.py's commit 6291ca5 (2026-09-02)
+# switch of the upload destination itself. This deletes the finished video
+# from the 'nova-video-storage' release on this repo now that it has been
+# confirmed uploaded to YouTube and the backend record marked
+# status=uploaded - same idempotent, best-effort, never-raise cleanup
+# contract as the previous Supabase version. Without this change, assets
+# would silently never be deleted (the old Supabase-delete call 404s and
+# is treated as success, so the bug would be invisible in logs).
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+RELEASE_TAG = "nova-video-storage"
 
 BACKEND_TIMEOUT = 120  # Render cold starts can run past 90s
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
@@ -145,8 +136,6 @@ def _group_shots_into_chapters(shot_durations, num_chapters):
             starts.append(running)
             chapter_elapsed = 0.0
 
-    # Drop any chapter that would end up shorter than MIN_CHAPTER_SECONDS
-    # (can happen with the last chapter if shots don't divide evenly).
     cleaned = [starts[0]]
     for s in starts[1:]:
         if s - cleaned[-1] >= MIN_CHAPTER_SECONDS:
@@ -223,44 +212,63 @@ def _build_final_description(raw_description, chapters_block):
     return description
 
 
-def _delete_from_supabase_storage(video_id):
-    """ADDED (2026-08-31): deletes the finished video file from Supabase
-    Storage (bucket 'nova-media', path 'final/{video_id}.mp4') now that
-    it has been confirmed uploaded to YouTube and the backend record has
-    been marked status=uploaded. This is what keeps the Free-tier 1GB
-    storage quota from filling up permanently - see note near
-    SUPABASE_URL above. Only called from main() after both the YouTube
-    upload AND the backend status PATCH have succeeded.
-
-    Best-effort: prints a clear warning on failure but does NOT raise -
-    a cleanup failure should never be treated as an upload failure (the
-    video is already safely on YouTube by this point), and the next
-    run's cleanup attempt for a different video isn't blocked by one
-    stale file failing to delete. A file that fails to delete here just
-    sits in storage until manually cleared or retried - it does not
-    silently vanish or corrupt anything.
-    """
-    path_in_bucket = f"final/{video_id}.mp4"
-    delete_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path_in_bucket}"
-    headers = {
-        "apikey": SUPABASE_SECRET_KEY,
-        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+def _github_api_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def _delete_from_github_release(video_id):
+    """UPDATED (2026-09-02): deletes the finished video's GitHub Release
+    asset (release tag 'nova-video-storage', asset name '{video_id}.mp4')
+    now that it has been confirmed uploaded to YouTube and the backend
+    record has been marked status=uploaded - see assemble.py's
+    _upload_final_video_to_github_release for how the asset got there.
+    Only called from main() after both the YouTube upload AND the backend
+    status PATCH have succeeded.
+
+    Best-effort: prints a clear warning on failure but does NOT raise - a
+    cleanup failure should never be treated as an upload failure (the
+    video is already safely on YouTube by this point), and the next run's
+    cleanup attempt for a different video isn't blocked by one stale asset
+    failing to delete. An asset that fails to delete here just sits on the
+    release until manually cleared or retried - it does not silently
+    vanish or corrupt anything.
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        print("WARNING: cleanup skipped - GITHUB_TOKEN or GITHUB_REPOSITORY not set.")
+        return
+
+    asset_name = f"{video_id}.mp4"
     try:
-        resp = requests.delete(delete_url, headers=headers, timeout=60)
-        if resp.status_code >= 400 and resp.status_code != 404:
+        get_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/tags/{RELEASE_TAG}"
+        resp = requests.get(get_url, headers=_github_api_headers(), timeout=30)
+        if resp.status_code == 404:
+            print(f"Cleanup: release '{RELEASE_TAG}' not found - nothing to delete for {asset_name}.")
+            return
+        if resp.status_code >= 400:
+            print(f"WARNING: cleanup failed - could not look up release '{RELEASE_TAG}' ({resp.status_code}): {resp.text[:300]}.")
+            return
+
+        asset = next((a for a in resp.json().get("assets", []) if a.get("name") == asset_name), None)
+        if not asset:
+            print(f"Cleanup: no asset named {asset_name} on release '{RELEASE_TAG}' - nothing to delete.")
+            return
+
+        del_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/assets/{asset['id']}"
+        del_resp = requests.delete(del_url, headers=_github_api_headers(), timeout=30)
+        if del_resp.status_code >= 400 and del_resp.status_code != 404:
             print(
-                f"WARNING: cleanup failed - could not delete {path_in_bucket} from "
-                f"Supabase Storage ({resp.status_code}): {resp.text[:300]}. "
-                f"File will remain in storage until manually cleared."
+                f"WARNING: cleanup failed - could not delete {asset_name} from release "
+                f"'{RELEASE_TAG}' ({del_resp.status_code}): {del_resp.text[:300]}. "
+                f"Asset will remain until manually cleared."
             )
         else:
-            print(f"Cleanup: deleted {path_in_bucket} from Supabase Storage (video is now only on YouTube).")
+            print(f"Cleanup: deleted {asset_name} from GitHub Release '{RELEASE_TAG}' (video is now only on YouTube).")
     except requests.RequestException as e:
-        print(
-            f"WARNING: cleanup failed - network error deleting {path_in_bucket} from "
-            f"Supabase Storage: {e}. File will remain in storage until manually cleared."
-        )
+        print(f"WARNING: cleanup failed - network error deleting {asset_name} from release '{RELEASE_TAG}': {e}. Asset will remain until manually cleared.")
 
 
 def wake_up_backend(max_attempts=4):
@@ -458,10 +466,6 @@ def main():
     print(f"SUCCESS: uploaded (privacyStatus={UPLOAD_PRIVACY_STATUS}) as https://youtube.com/watch?v={youtube_video_id}")
 
     print("Marking video as uploaded in backend...")
-    # NOTE: there is no dedicated /mark-uploaded endpoint on this backend -
-    # that route was never built (confirmed by reading main.py's registered
-    # routers). The generic CRUD router DOES support PATCH on /videos/{id},
-    # so we use that instead.
     mark_resp = requests.patch(
         f"{RAILWAY_URL}/api/v1/videos/{video_id}",
         json={"status": "uploaded", "youtube_video_id": youtube_video_id},
@@ -472,10 +476,7 @@ def main():
         print(f"WARNING: upload succeeded but failed to mark backend as uploaded: {mark_resp.status_code} {mark_resp.text}")
     else:
         print(f"Backend updated: video {video_id} marked status=uploaded, youtube_video_id={youtube_video_id}.")
-        # AUTO-CLEANUP (2026-08-31): only delete the Supabase Storage copy
-        # once both the YouTube upload AND the backend status update are
-        # confirmed successful - see _delete_from_supabase_storage docstring.
-        _delete_from_supabase_storage(video_id)
+        _delete_from_github_release(video_id)
 
     topic_id = video.get("topic_id")
     if topic_id:
