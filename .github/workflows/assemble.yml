@@ -11,7 +11,7 @@ on:
     - cron: "45 */6 * * *"
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -39,6 +39,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VIDEO_ID: ${{ inputs.video_id }}
         run: python .github/scripts/assemble.py
 
