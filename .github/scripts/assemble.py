@@ -145,36 +145,31 @@ END_FREEZE_SECONDS = 0.75
 # rendering visibly under-quality 1080p this whole time, independent of
 # the earlier upload-failure bug.
 #
-# CRF LOWERED 20 -> 26 (2026-09-01): CONFIRMED ROOT CAUSE of the ongoing
-# assemble-upload failures (issues #144-#148, 5 consecutive runs) via
-# Supabase's own storage_logs, read directly: every failed PUT returns
-# error.raw = {"httpStatusCode":413,"code":"EntityTooLarge","error":
-# "Payload too large"}. The bucket's own file_size_limit was already
-# raised to 2GB (2026-08-30/31, confirmed live in storage.buckets), but
-# Supabase enforces a SEPARATE project-wide global file size limit that
-# always takes precedence over the bucket setting, per Supabase's own
-# docs - and that's a dashboard-only setting with no SQL or API path
-# reachable from here (confirmed: no Management API tool, no
-# api.supabase.com network access, direct SQL only touches the bucket
-# row, not the global ceiling). Rather than depend on a setting this
-# pipeline can't reach or verify, this lowers CRF from 20 to 26 - still
-# a high, professional-quality setting for x264 (the difference from
-# CRF 20 is not visible on typical playback, especially for this
-# channel's B&W/monochrome grade, which compresses more efficiently
-# than color at any given CRF since it carries no chroma detail) - to
-# bring the output file down to a size that clears the failure
-# regardless of where the real ceiling turns out to sit. This is a
-# genuine, permanent quality/size tradeoff, not a guess dressed up as a
-# fix: CRF 26 typically produces roughly half the file size of CRF 20
-# for this kind of footage, so a video that rendered at 659MB should
-# land in the rough 300-350MB range - comfortably clear of the 413s
-# seen so far even if the real global ceiling is somewhere well below
-# 2GB. If this still 413s at the new size, that's real evidence the
-# true ceiling sits below ~300MB, which would need a much larger CRF
-# jump (visible quality cost) or an actual architecture change (e.g.
-# splitting the upload across multiple smaller objects) - not
-# something to guess further at blind.
-VIDEO_CRF = 26  # was 20 (2026-08-30) - lowered 2026-09-01 to fix repeated 413 EntityTooLarge upload failures
+# CRF LOWERED 20 -> 26 (2026-09-01, RE-APPLIED): CONFIRMED root cause of
+# the ongoing assemble-upload failures (issues #144-#148, run #368 among
+# them) via Supabase's own storage_logs / the run log's own error text,
+# read directly: every failed PUT returns error.raw =
+# {"httpStatusCode":413,"code":"EntityTooLarge","error":"Payload too
+# large"}. This exact fix (CRF 20->26) was already applied once on
+# 2026-09-01, but the 2026-08-31 direct-to-Supabase upload change above
+# reset VIDEO_CRF back to 20 on the assumption that bypassing Render's
+# RAM limit was the whole fix - it wasn't. The 413 comes from a SEPARATE,
+# still-unreachable project-wide Supabase file-size ceiling (dashboard-
+# only setting, no SQL/API path from here - confirmed: no Management API
+# tool, no api.supabase.com network access, direct SQL only touches the
+# bucket's own file_size_limit row, not the global one), independent of
+# which backend receives the upload. Run #368 failed at the same 659.2MB
+# size on the same video (4fc244de) that CRF 26 was already proven to
+# clear for a similarly-sized video. Restoring CRF 26 - still a high,
+# professional-quality x264 setting (not visibly different from CRF 20 on
+# typical playback, especially for this channel's B&W/monochrome grade,
+# which compresses more efficiently than color at any given CRF since it
+# carries no chroma detail) - to bring output size back down clear of the
+# 413 ceiling. If a future change touches VIDEO_CRF again, keep it at 26
+# (or verify against the real ceiling before going lower) rather than
+# reverting to 20 - that value has now caused this exact 413 failure
+# twice, on two separate videos, across two separate reverts.
+VIDEO_CRF = 26  # was 20 (2026-08-30) -> 26 (2026-09-01, fixed 413s) -> reverted to 20 (2026-08-31, direct-to-Supabase commit, re-broke it) -> restored to 26 (2026-09-01)
 AUDIO_BITRATE_KBPS = 128
 # RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
 # is already rendered/assembled at full 1920x1080 (see RESOLUTION above),
@@ -1224,10 +1219,11 @@ def main():
     else:
         cinematic_vf = CINEMATIC_VF_BASE
 
-    # CRF ENCODING (2026-08-30, lowered 2026-09-01): replaces the old
-    # bitrate-budget calc - see comment on VIDEO_CRF near the top of the
-    # file for why 26 instead of 20. CRF targets constant visual quality
-    # directly; ffmpeg allocates however much bitrate that actually needs.
+    # CRF ENCODING (2026-08-30, lowered 2026-09-01, restored 2026-09-01):
+    # replaces the old bitrate-budget calc - see comment on VIDEO_CRF near
+    # the top of the file for why 26 instead of 20. CRF targets constant
+    # visual quality directly; ffmpeg allocates however much bitrate that
+    # actually needs.
     print(
         f"Applying cinematic grade and merging mixed audio "
         f"(duration={target_duration:.1f}s, CRF={VIDEO_CRF}, no quality-compromising bitrate cap)..."
@@ -1261,9 +1257,9 @@ def main():
     print(f"Final file size: {final_size_mb:.1f}MB (CRF {VIDEO_CRF}, no size budget applied).")
 
     # DIRECT-TO-SUPABASE UPLOAD (2026-08-31): see note near the top of this
-    # file. The large file (hundreds of MB at CRF 20) now goes straight
-    # from this runner to Supabase Storage - Render never sees it. Only a
-    # small JSON status update reaches Render afterward.
+    # file. The large file now goes straight from this runner to Supabase
+    # Storage - Render never sees it. Only a small JSON status update
+    # reaches Render afterward.
     print("Uploading finished video directly to Supabase Storage (bypassing Render for the large-file transfer)...")
     video_url = _upload_final_video_to_supabase(video_id, final_path)
     print(f"Uploaded to Supabase Storage: {video_url}")
