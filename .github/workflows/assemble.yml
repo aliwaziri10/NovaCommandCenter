@@ -38,6 +38,7 @@ jobs:
           ACE_MUSIC_API_KEY: ${{ secrets.ACE_MUSIC_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
           VIDEO_ID: ${{ inputs.video_id }}
         run: python .github/scripts/assemble.py
 
