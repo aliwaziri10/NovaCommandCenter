@@ -7,6 +7,7 @@ from app.models import Topic, Script, Video, Task
 from app.agents.topic_research_agent import run_topic_research
 from app.agents.script_writing_agent import run_script_writing
 from app.agents.video_planning_agent import run_video_planning
+from app.agents.cinematographer_agent import run_cinematographer
 from app.agents.asset_generation_agent import _parse_shots
 from app.agents.github_actions_client import trigger_workflow, open_issue
 from app.agents.strategy_research_agent import run_strategy_research
@@ -17,6 +18,7 @@ STALE_TASK_MINUTES = 30
 CLIP_COOLDOWN_MINUTES = 25
 ASSEMBLY_COOLDOWN_MINUTES = 35
 NARRATION_COOLDOWN_MINUTES = 20
+CINEMATOGRAPHY_COOLDOWN_MINUTES = 15
 STRATEGY_RESEARCH_COOLDOWN_MINUTES = 7 * 24 * 60
 VIDEO_PLANNING_STARVATION_MINUTES = 90
 LOG_PATH = "/app/data/supervisor_log.json"
@@ -82,6 +84,7 @@ AGENT_ID_KEY = {
     "assembly": "video_id",
     "video_clips": "video_id",
     "narration": "video_id",
+    "cinematography": "video_id",
     "video_planning": "script_id",
     "script_writing": "topic_id",
     "topic_research": "category",
@@ -152,8 +155,37 @@ def _find_next_task(db):
             continue
         return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
 
+    # ADDED (2026-09-02): cinematographer pass. Runs as soon as a video has
+    # a production_plan but hasn't been through the DP-brief enrichment
+    # pass yet. Checked BEFORE video_clips (and video_clips below now also
+    # gates on cinematography_done as a second safety net) so Agnes never
+    # generates a shot's clip from a plan that hasn't been enriched with
+    # camera/lighting direction yet.
+    for video in videos:
+        if not video.production_plan:
+            continue
+        if video.cinematography_done:
+            continue
+        vid = str(video.id)
+        if _has_recent_task(db, "cinematography", "video_id", vid, CINEMATOGRAPHY_COOLDOWN_MINUTES):
+            continue
+        if _failed_attempts(db, "cinematography", "video_id", vid) >= MAX_RETRIES:
+            continue
+        return {
+            "agent_name": "cinematography",
+            "payload": {"video_id": vid},
+            "title": "Add cinematography brief for video " + vid[:8],
+        }
+
     for video in videos:
         if not video.production_plan or not video.audio_path:
+            continue
+        # GATE (2026-09-02): a video's clips must never generate from a
+        # plan that hasn't been through the cinematographer pass yet - see
+        # the cinematography loop above, which normally catches this
+        # earlier. Kept here too as a second safety net in case ordering
+        # ever changes.
+        if not video.cinematography_done:
             continue
         total_shots = len(_parse_shots(video.production_plan))
         if not total_shots:
@@ -234,6 +266,8 @@ def _execute(db, agent_name, payload):
         return run_script_writing(db, topic_id=payload["topic_id"])
     if agent_name == "video_planning":
         return run_video_planning(db, script_id=payload["script_id"])
+    if agent_name == "cinematography":
+        return run_cinematographer(db, video_id=payload["video_id"])
     if agent_name == "narration":
         triggered = trigger_workflow("narrate.yml", {"video_id": payload["video_id"]})
         if not triggered:
