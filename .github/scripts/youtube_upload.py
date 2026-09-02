@@ -54,6 +54,16 @@ UPLOAD_PRIVACY_STATUS = "private"
 SELF_DECLARED_MADE_FOR_KIDS = False  # Alternate Earth is not child-directed content
 CONTAINS_SYNTHETIC_MEDIA = True      # AI-generated visuals/voiceover - always disclosed
 
+# FIX (2026-09-03): this was the ONLY description text ever used - the
+# backend's video.description field is never populated anywhere in Nova's
+# pipeline (confirmed: no agent writes it), so every single upload silently
+# used this exact generic template with zero per-video content, unlike
+# Marius (scripts/youtube_upload.py's build_description()) which builds a
+# real per-video description from the actual narration/script text. Zia
+# flagged this directly by comparing Nova's and Marius's YouTube Studio
+# description fields side by side. This string is now ONLY the last-resort
+# fallback when script_content genuinely can't be fetched (see
+# _build_story_description below) - not the default outcome.
 FALLBACK_DESCRIPTION = (
     "This video explores a speculative \"what if\" scenario as part of the "
     "Alternate Earth series.\n\n"
@@ -80,6 +90,12 @@ MUSIC_ATTRIBUTION_LINE = (
     "Music by Kevin MacLeod (incompetech.com), licensed under Creative "
     "Commons: By Attribution 3.0 (creativecommons.org/licenses/by/3.0/)"
 )
+
+# ADDED (2026-09-03): real per-video description, ported from Marius's
+# scripts/youtube_upload.py build_description() - truncates the actual
+# script/narration text to a sentence boundary instead of a hard character
+# cut, so the description reads as real prose, not text chopped mid-word.
+DESCRIPTION_SNIPPET_LIMIT = 1500
 
 # --- Chapter markers (added 2026-08-02) ---
 # YouTube requires: first chapter at 0:00, at least 3 chapters, each chapter
@@ -192,15 +208,59 @@ def _build_chapters_block(shot_durations, script_content):
     return "\n".join(lines)
 
 
-def _build_final_description(raw_description, chapters_block):
+def _build_story_description(script_content):
+    """ADDED (2026-09-03): builds a real per-video description from the
+    actual script/narration text, ported from Marius's build_description().
+    Truncates at a sentence boundary (not a hard character cut) so the
+    result reads as real prose. Returns None if script_content is missing/
+    empty - caller falls back to FALLBACK_DESCRIPTION in that case, same
+    safety net as before this fix.
+    """
+    text = (script_content or "").strip()
+    if not text:
+        return None
+
+    if len(text) > DESCRIPTION_SNIPPET_LIMIT:
+        snippet = text[:DESCRIPTION_SNIPPET_LIMIT]
+        last_boundary = max(
+            snippet.rfind(". "),
+            snippet.rfind(".\n"),
+            snippet.rfind("! "),
+            snippet.rfind("? "),
+        )
+        if last_boundary > 0:
+            snippet = snippet[: last_boundary + 1]
+        else:
+            last_space = snippet.rfind(" ")
+            snippet = (snippet[:last_space] if last_space > 0 else snippet) + "..."
+    else:
+        snippet = text
+
+    return (
+        f"{snippet}\n\n"
+        f"Subscribe for more speculative history and alternate-timeline "
+        f"documentaries - Alternate Earth explores what could have been."
+    )
+
+
+def _build_final_description(raw_description, chapters_block, script_content):
     """Guarantees every upload has a real, non-empty description containing
-    the AI-content disclosure line and the required music-attribution line,
-    regardless of whether the backend video record has a description or
-    chapters could be generated."""
+    the AI-content disclosure line and the required music-attribution line.
+
+    FIX (2026-09-03): previously only ever used raw_description (the
+    backend's video.description field, which nothing in Nova's pipeline
+    ever populates) and fell straight to the generic FALLBACK_DESCRIPTION
+    on every single upload - confirmed by Zia comparing Nova's and Marius's
+    YouTube Studio description fields directly. Now tries, in order: (1)
+    raw_description if the backend ever does have one, (2) a real per-video
+    description built from script_content (see _build_story_description),
+    (3) the generic fallback only as a genuine last resort.
+    """
     description = (raw_description or "").strip()
     if not description:
-        description = FALLBACK_DESCRIPTION
-    elif AI_DISCLOSURE_LINE not in description:
+        description = _build_story_description(script_content) or FALLBACK_DESCRIPTION
+
+    if AI_DISCLOSURE_LINE not in description:
         description = description + "\n\n" + AI_DISCLOSURE_LINE
 
     if MUSIC_ATTRIBUTION_LINE not in description:
@@ -428,7 +488,7 @@ def main():
     title = video.get("title") or "Untitled"
     description = video.get("description") or ""
 
-    print("Attempting to build chapter markers...")
+    print("Fetching script content (for real description + chapter markers)...")
     shot_durations = video.get("shot_durations")
     script_content = None
     script_id = video.get("script_id")
@@ -438,7 +498,7 @@ def main():
             script_resp.raise_for_status()
             script_content = script_resp.json().get("content")
         except Exception as e:
-            print(f"Could not fetch script for chapter titles: {e}")
+            print(f"Could not fetch script for description/chapter titles: {e}")
 
     chapters_block = _build_chapters_block(shot_durations, script_content)
     if chapters_block:
@@ -447,7 +507,7 @@ def main():
     else:
         print("Proceeding without chapter markers.")
 
-    description = _build_final_description(description, chapters_block)
+    description = _build_final_description(description, chapters_block, script_content)
     print("Final description that will be uploaded:")
     print(description)
 
