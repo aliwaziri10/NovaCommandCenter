@@ -1,4 +1,4 @@
-ated# Nova Command Center
+# Nova Command Center
 
 Production React + FastAPI dashboard for content operations, revenue tracking, and agent orchestration — with a fully automated, cron-driven video pipeline (script → narration → images → video clips → assembly → YouTube upload).
 
