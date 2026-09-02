@@ -69,6 +69,29 @@ dramatic throughout, with zero slow motion:
 Narration impact (separate from camera movement) and any Voicebox
 integration are NOT part of this change - narration lives in
 narrate.py, a separate file, not reviewed here.
+
+UPDATED (2026-09-03): CINEMATOGRAPHY-LINE LEAK FIX.
+2026-09-02's new cinematographer_agent.py pipeline stage inserts a
+"Cinematography: <brief>" line into every shot's text in production_plan,
+placed between the shot's description and its "Duration:" line. This
+script's _clean_shot_text() only ever stripped "Duration:" and "Camera:"
+- it had no knowledge of the new "Cinematography:" label, so that whole
+DP brief was being left inside the parsed shot description and shipped
+to Agnes as undifferentiated raw text, layered on top of (and frequently
+contradicting) this script's own independently-chosen camera_move/
+lens_style for the same shot (e.g. cinematographer says "low-angle static
+wide, hard backlight silhouette" while this script separately picks
+"gentle aerial push-in" for the same prompt).
+Fix: _clean_shot_text() now also splits off anything from a
+"Cinematography:" label onward, matching the existing Duration/Camera
+pattern, so the shot description sent to Agnes is clean again. This is
+a containment fix, not the ideal fix - the ideal version would have
+generate_videos.py actually parse and use the cinematographer's brief
+(replacing its own camera_move/lens_style choice for that shot) instead
+of discarding it outright. That requires deciding how the two systems'
+authority should be reconciled and is deliberately left as a follow-up,
+not bundled into this fix, so the immediate leak/collision gets
+contained without a same-day redesign of prompt-building authority.
 """
 
 import os
@@ -221,6 +244,14 @@ def round_to_valid_frames(num_frames):
 def _clean_shot_text(text):
     text = re.split(r"\*{0,2}Duration\*{0,2}\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
     text = re.split(r"\bCamera\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    # FIX (2026-09-03, see module docstring "CINEMATOGRAPHY-LINE LEAK FIX"):
+    # cinematographer_agent.py (2026-09-02) inserts a "Cinematography: <brief>"
+    # line into each shot's text. Without stripping it here, that DP brief
+    # rode along inside the parsed shot description and got sent to Agnes
+    # as raw text, on top of this script's own independently-chosen
+    # camera_move/lens_style for the same shot - a collision, not an
+    # integration. Stripped here the same way Duration/Camera already are.
+    text = re.split(r"\bCinematography\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
     text = text.replace("**", "").replace("*", "").strip().rstrip(".").strip()
     return text
 
