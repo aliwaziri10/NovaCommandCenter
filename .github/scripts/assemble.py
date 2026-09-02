@@ -29,34 +29,6 @@ RAILWAY_URL = os.environ["RAILWAY_URL"]
 ASSEMBLY_SECRET = os.environ["ASSEMBLY_SECRET"]
 VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 
-# ADDED (2026-09-02): DIRECT-TO-GITHUB-RELEASE UPLOAD FIX (replaces
-# direct-to-Supabase, 2026-08-31).
-# ROOT CAUSE CONFIRMED (2026-09-02) via a live query against Supabase's
-# own storage.buckets table: the 'nova-media' bucket's own file_size_limit
-# is already 2GB, so the bucket config was never the block. The real
-# ceiling is Supabase's PROJECT-WIDE Storage upload cap, which sits above
-# any bucket setting, is dashboard-only (no SQL/Management-API path), and
-# is hard-capped at 50MB on the Free plan - confirmed against Supabase's
-# own published docs. A 367.7MB (or 650-750MB) render will never clear
-# that on Free, regardless of CRF/bitrate, and raising it requires the
-# $25/mo Pro plan. Separately, Supabase's total Storage quota on Free is
-# only 1GB - even if the per-file cap were solved, a handful of ~300MB+
-# videos would exhaust the entire project's storage.
-# Fix: this script now uploads the finished video file as a GitHub
-# Release asset on this same repo instead - completely free, no per-file
-# size trouble (GitHub's per-asset limit is far above anything this
-# pipeline renders), no total-storage trouble (the asset is deleted by
-# youtube_upload.py immediately after a confirmed YouTube upload, so
-# nothing accumulates), and zero quality compromise (CRF is untouched).
-# The backend's download redirect (backend/app/routers/download_router.py)
-# already just does `RedirectResponse(url=video.video_url)` - it does not
-# care what host video_url points to, so this needed NO backend changes
-# at all; only this script's upload step and youtube_upload.py's cleanup
-# step change.
-# Requires GITHUB_TOKEN as an env var on this workflow (the default
-# Actions token works fine for a same-repo release - see assemble.yml,
-# which must also grant `permissions: contents: write`). GITHUB_REPOSITORY
-# ("owner/repo") is already present automatically in every Actions run.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 RELEASE_TAG = "nova-video-storage"
@@ -79,33 +51,10 @@ if not GITHUB_REPOSITORY or "/" not in GITHUB_REPOSITORY:
     )
     sys.exit(1)
 
-# ADDED (2026-08-31, SFX refinement pass): Freesound.org API for real,
-# per-shot sound effects. Freesound was chosen after checking 10 options
-# for a free, automatable SFX source (video-conditioned generative APIs
-# like Sonilo/ElevenLabs SFX are commercial-only or have quota far too
-# small for daily volume; YouTube Audio Library and the BBC SFX archive
-# have no public API; self-hosted generative audio models need GPU compute
-# this pipeline's free-tier infra doesn't have). Freesound's own published
-# API docs (freesound.org/docs/api/overview.html) confirm a real free
-# tier: 60 requests/minute, 2000 requests/day, simple token-based auth (no
-# OAuth2 needed for searching or downloading preview-quality mp3/ogg files
-# - OAuth2 is only required for original-quality downloads, which this
-# pipeline doesn't need). At ~1-2 videos/day with a few dozen SFX cues
-# each, this pipeline is nowhere near either limit.
-# Requires FREESOUND_API_KEY as an env var (apply for a free token at
-# https://freesound.org/apiv2/apply/) - see assemble.yml. SFX is treated
-# as fully optional, same as music: any lookup/download failure for a
-# given shot just means that shot has no SFX layer, never a hard failure.
 FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "").strip()
 FREESOUND_ENABLED = bool(FREESOUND_API_KEY)
 FREESOUND_SEARCH_URL = "https://freesound.org/apiv2/search/text/"
 SFX_VOLUME = 0.22
-# Cap on unique Freesound searches per assembly run - a 100-shot video
-# would otherwise fire up to 100 searches; most shots share similar SFX
-# keywords (e.g. many "footsteps stone floor" shots in one script), so a
-# small in-run cache (see _fetch_shot_sfx) already collapses most repeats.
-# This is a hard ceiling as a second safety net against an unusually
-# keyword-diverse script eating into the 2000/day budget in one run.
 SFX_MAX_SEARCHES_PER_RUN = 60
 
 DEFAULT_SHOT_DURATION = 3.0
@@ -113,56 +62,9 @@ CROSSFADE = 0.5
 RESOLUTION = (1920, 1080)
 BLOCK_SIZE = 10
 KEN_BURNS_ZOOM = 0.08
-# ADDED (2026-08-26): small fixed freeze-hold tacked onto the very end of
-# the finished video (after narration ends), per Zia's request - without
-# this, the video cuts the instant the last shot/narration finishes,
-# which reads as an abrupt stop rather than a settled ending.
-END_FREEZE_SECONDS = 0.75
 
-# REMOVED (2026-08-30): TARGET_UPLOAD_MB / MIN_VIDEO_KBPS bitrate-budget
-# system removed entirely. Confirmed by direct calculation that it was
-# doing nothing useful: for this pipeline's typical ~870s video length,
-# BOTH the old 45MB budget and the "fixed" 35MB budget computed a video
-# kbps below MIN_VIDEO_KBPS=400, so the 400kbps floor silently overrode
-# the budget on every single run - that's why final file size barely
-# moved (53.9MB -> 53.8MB -> 53.9MB) when the budget was "lowered" from
-# 45 to 35 on 2026-08-29. 400kbps at 1920x1080 is far below YouTube's own
-# ~8000kbps guidance for 1080p30 SDR uploads - this pipeline has been
-# rendering visibly under-quality 1080p this whole time, independent of
-# the earlier upload-failure bug.
-#
-# CRF LOWERED 20 -> 26 (2026-09-01, RE-APPLIED): CONFIRMED root cause of
-# the ongoing assemble-upload failures (issues #144-#148, run #368 among
-# them) via Supabase's own storage_logs / the run log's own error text,
-# read directly: every failed PUT returns error.raw =
-# {"httpStatusCode":413,"code":"EntityTooLarge","error":"Payload too
-# large"}. This exact fix (CRF 20->26) was already applied once on
-# 2026-09-01, but the 2026-08-31 direct-to-Supabase upload change above
-# reset VIDEO_CRF back to 20 on the assumption that bypassing Render's
-# RAM limit was the whole fix - it wasn't. The 413 comes from a SEPARATE,
-# still-unreachable project-wide Supabase file-size ceiling (dashboard-
-# only setting, no SQL/API path from here - confirmed: no Management API
-# tool, no api.supabase.com network access, direct SQL only touches the
-# bucket's own file_size_limit row, not the global one), independent of
-# which backend receives the upload. Run #368 failed at the same 659.2MB
-# size on the same video (4fc244de) that CRF 26 was already proven to
-# clear for a similarly-sized video. Restoring CRF 26 - still a high,
-# professional-quality x264 setting (not visibly different from CRF 20 on
-# typical playback, especially for this channel's B&W/monochrome grade,
-# which compresses more efficiently than color at any given CRF since it
-# carries no chroma detail) - to bring output size back down clear of the
-# 413 ceiling. If a future change touches VIDEO_CRF again, keep it at 26
-# (or verify against the real ceiling before going lower) rather than
-# reverting to 20 - that value has now caused this exact 413 failure
-# twice, on two separate videos, across two separate reverts.
-VIDEO_CRF = 26  # was 20 (2026-08-30) -> 26 (2026-09-01, fixed 413s) -> reverted to 20 (2026-08-31, direct-to-Supabase commit, re-broke it) -> restored to 26 (2026-09-01)
+VIDEO_CRF = 26
 AUDIO_BITRATE_KBPS = 128
-# RESOLUTION UPGRADE (2026-08-28): was "scale=1280:720" - this composite
-# is already rendered/assembled at full 1920x1080 (see RESOLUTION above),
-# but the final cinematic-grade ffmpeg pass was silently downscaling it
-# back down to 720p on every single export for no technical reason. Fixed
-# to match RESOLUTION so the 1080p Nova already renders internally is
-# actually what reaches the uploaded file, instead of being thrown away.
 OUTPUT_RESOLUTION_VF = "scale=1920:1080"
 
 CINEMATIC_VF_BASE = (
@@ -174,37 +76,9 @@ CINEMATIC_VF_BASE = (
 LOUDNORM_AF = "loudnorm=I=-16:LRA=11:TP=-1.5"
 
 NATIVE_SFX_VOLUME = 0.16
-# LOWERED (2026-08-31): was 0.95. Now that a real per-shot SFX layer
-# (SFX_VOLUME) exists in addition to native clip audio and music, three
-# simultaneous layers under narration need slightly more headroom each to
-# avoid a muddier mix than the old two-layer (native + music) version -
-# the safety limiter below still catches any residual peak overage.
 NARRATION_VOLUME_WITH_LAYERS = 0.92
 LIMITER_CEILING = 0.98
 
-# ADDED (2026-08-30, NOVA_REBUILD_HANDOFF.md item #6): music cue/mood
-# shift at every chapter boundary. Chapter boundaries are derived from the
-# same fixed timing spine already baked into script_writing_agent.py's
-# Rule 0 (Curiosity Loop six-beat structure / Hook-Problem-Solution-Payoff
-# spine) - NOT from parsing `[CHAPTER: ...]` markers out of the script
-# text. There is currently no mapping from a chapter marker's position in
-# the script to a timestamp in the assembled video (shots are planned
-# separately from the script by video_planning_agent), so deriving cue
-# points from Rule 0's already-fixed percentage/second targets is the only
-# reliable timing source assemble.py has today. If a real chapter-to-shot
-# mapping gets built later, swap the fixed fractions in
-# _chapter_time_bounds() below for that instead - everything downstream
-# (crossfade, mixing) stays the same.
-#
-# Tracks are Kevin MacLeod / incompetech.com, Creative Commons BY 3.0 -
-# free to use, only requires attribution (fits the zero-budget
-# constraint). Filenames below follow incompetech's standard download
-# naming but have not been individually re-verified live - if a track
-# fails to download, that chapter's segment is simply silent instead of
-# failing the whole assembly (see _build_music_bed), so a bad filename
-# degrades gracefully and will show up as a "[music] ... failed to
-# download" line in the run log rather than breaking anything. Swap any
-# filename that shows up failing repeatedly.
 MUSIC_ENABLED = True
 MUSIC_VOLUME = 0.10
 MUSIC_CROSSFADE = 2.0
@@ -215,9 +89,6 @@ MUSIC_ATTRIBUTION = (
     "STILL NEEDS TO BE ADDED to every video description by youtube_upload.py "
     "(not done as part of this change - separate follow-up)."
 )
-# (chapter label, mood, incompetech filename) - one per Curiosity Loop beat,
-# in order (Cold Open, Problem/Stakes, Rising Delivery, Midpoint Twist,
-# Climax, Payoff).
 _MUSIC_CHAPTERS = [
     ("Cold Open", "tense_mysterious", "The-Cannery.mp3"),
     ("Problem/Stakes", "moody_dread", "Ossuary-6-Air.mp3"),
@@ -233,52 +104,21 @@ FFMPEG_BINARY = imageio_ffmpeg.get_ffmpeg_exe()
 SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
 DURATION_PATTERN = re.compile(r"Duration\*{0,2}\s*:\s*\*{0,2}\s*([\d.]+)\s*s", re.IGNORECASE)
 FFMPEG_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)")
-# ADDED (2026-08-31, SFX refinement pass): matches the "SFX: <keyword>"
-# line video_planning_agent.py now requires per shot (see that file's
-# SFX_LINE_RULE). Mirrors DURATION_PATTERN's tolerance for markdown-bold
-# wrapping (Gemini sometimes wraps field labels in ** even when told not
-# to), since that's already proven necessary for the Duration line.
 SFX_PATTERN = re.compile(r"SFX\*{0,2}\s*:\s*\*{0,2}\s*([^\n]+)", re.IGNORECASE)
 
 HEADERS = {"X-Assembly-Secret": ASSEMBLY_SECRET}
 
-# DIAGNOSTIC (2026-08-16): accumulates every shot's (target, actual, pad)
-# across the whole run so we can print a summary at the end confirming or
-# ruling out "Agnes systematically returns clips shorter than requested"
-# the cause of near-universal freeze-hold padding at scene ends.
 _FREEZE_PAD_LOG = []
 
-# KEEP-ALIVE FIX (2026-08-30): confirmed live on video 4fc244de - the
-# upload-cold-start retry logic added 2026-08-22 (_resilient_post) handles
-# a SHORT idle gap before upload, but this run did ~56 minutes of pure
-# local ffmpeg rendering with ZERO requests to the backend in between,
-# which is well past Render free tier's ~15 min inactivity spin-down
-# window. By the time the final upload POST fired, the backend had been
-# asleep for 40+ minutes, and even 4 retries with backoff (15/30/45/60s =
-# 150s total) weren't reliable margin to cover both a full cold start AND
-# transferring a 53.9MB body - confirmed failing 4/4 attempts on run
-# https://github.com/aliwaziri10/NovaCommandCenter/actions/runs/33268...
-# (video 4fc244de, 2026-08-30).
-#
-# Retrying harder after the backend has already gone to sleep is treating
-# the symptom. The actual fix is to never let it go to sleep during the
-# render in the first place: a background thread pings the cheap /health
-# endpoint every 5 minutes for as long as main() is doing local work, so
-# Render's 15-minute inactivity clock never completes a full cycle and
-# the backend is already warm for the small metadata calls this script
-# still makes to it (video fetch, narration download, final status PATCH).
-# NOTE (2026-08-31): this thread is still useful - it just no longer needs
-# to keep the backend warm for a giant file upload, only for the small
-# calls that remain. Left in place unchanged.
 _KEEPALIVE_STOP = threading.Event()
 
 
 def _keepalive_loop():
-    while not _KEEPALIVE_STOP.wait(300):  # 5 minutes
+    while not _KEEPALIVE_STOP.wait(300):
         try:
             requests.get(f"{RAILWAY_URL}/health", timeout=30)
         except requests.RequestException:
-            pass  # best-effort only - _resilient_post still covers a genuine cold start
+            pass
 
 
 def _start_keepalive():
@@ -288,18 +128,6 @@ def _start_keepalive():
 
 
 def _resilient_get(url, max_attempts=5, **kwargs):
-    """COLD-START FIX (2026-08-21): Render's free-tier backend spins down
-    after ~15 min idle and cold-starts on the next request. This script
-    runs on a GitHub Actions cron, so its very first request to the
-    backend can land during that cold-start window and get a connection
-    error or a 502/503 from Render's edge before the app is ready. With
-    no retry, that killed the ENTIRE run before any real work started -
-    confirmed live: assemble workflow run #301 failed within seconds of
-    the backend container even finishing its boot
-    (2026-08-21T02:54:41Z fail vs 02:54:49-02:55:07Z container startup
-    in Render's own logs). Retrying with backoff means a cold start no
-    longer aborts the whole job.
-    """
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -320,13 +148,6 @@ def _resilient_get(url, max_attempts=5, **kwargs):
 
 
 def _resilient_patch_json(url, json_body, max_attempts=5, timeout=60):
-    """ADDED (2026-08-31): small-body version of _resilient_get's retry
-    pattern, for the final status-update PATCH to the backend (see
-    DIRECT-TO-SUPABASE UPLOAD note above). This request is tiny (a JSON
-    object with a status string and a URL) so cold-start/gateway retries
-    are cheap here in a way they were never cheap for the old full-file
-    POST - there's no multi-hundred-MB body to re-send on every retry.
-    """
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -355,11 +176,6 @@ def _github_api_headers():
 
 
 def _get_or_create_release():
-    """Returns the release object for RELEASE_TAG on this repo, creating
-    it the first time it's needed. This one release is reused forever as
-    a container for video assets - it is NOT a versioned software release,
-    just a free, sizeable (per-asset cap far above anything this pipeline
-    renders), zero-cost storage bucket that happens to live on GitHub."""
     get_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/tags/{RELEASE_TAG}"
     resp = requests.get(get_url, headers=_github_api_headers(), timeout=30)
     if resp.status_code == 200:
@@ -389,10 +205,6 @@ def _get_or_create_release():
 
 
 def _delete_existing_asset_if_present(release, asset_name):
-    """GitHub refuses to upload an asset whose name already exists on the
-    release (422 'already_exists') - this happens on a re-run for the same
-    video_id. Deletes any existing asset with this name first so the
-    upload below is idempotent."""
     for asset in release.get("assets", []):
         if asset.get("name") == asset_name:
             del_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/assets/{asset['id']}"
@@ -400,21 +212,11 @@ def _delete_existing_asset_if_present(release, asset_name):
 
 
 def _upload_final_video_to_github_release(video_id, file_path):
-    """ADDED (2026-09-02): uploads the finished, fully-assembled video
-    file DIRECTLY from this GitHub Actions runner to a GitHub Release
-    asset on this same repo - see DIRECT-TO-GITHUB-RELEASE UPLOAD note
-    near the top of this file for why this replaces the Supabase upload.
-    Streams the file from disk (not loaded fully into memory first).
-
-    Raises RuntimeError with GitHub's actual error text on failure -
-    matches the "never fail silently" principle used throughout this
-    file.
-    """
     asset_name = f"{video_id}.mp4"
     release = _get_or_create_release()
     _delete_existing_asset_if_present(release, asset_name)
 
-    upload_base = release["upload_url"].split("{")[0]  # strip the {?name,label} URI template
+    upload_base = release["upload_url"].split("{")[0]
     upload_url = f"{upload_base}?name={asset_name}"
     file_size = os.path.getsize(file_path)
 
@@ -469,15 +271,6 @@ def _parse_durations(production_plan):
 
 
 def _parse_sfx_keywords(production_plan, total_shots):
-    """ADDED (2026-08-31, SFX refinement pass): extracts each shot's
-    'SFX: <keyword>' line (see video_planning_agent.py's SFX_LINE_RULE) in
-    shot order, mirroring _parse_durations's line-scanning approach exactly
-    so shot indices stay aligned between durations and SFX keywords. A shot
-    with no SFX line (e.g. an older plan generated before this feature, or
-    one the bounded retry in video_planning_agent.py didn't fully fix)
-    simply gets None here, which _fetch_shot_sfx treats as "no SFX for this
-    shot" rather than an error - old plans and partially-covered plans both
-    still assemble normally, just without SFX on the affected shots."""
     keywords = []
     current_keyword = None
     for line in production_plan.splitlines():
@@ -491,9 +284,6 @@ def _parse_sfx_keywords(production_plan, total_shots):
         if match and current_keyword is None:
             current_keyword = match.group(1).strip().strip("*").strip()
     keywords.append(current_keyword)
-    # First entry is a None placeholder from before the first shot started -
-    # drop it, then pad/truncate to total_shots so this always lines up
-    # 1:1 with _parse_durations's output length.
     keywords = keywords[1:] if keywords and keywords[0] is None and len(keywords) > total_shots else keywords
     while len(keywords) < total_shots:
         keywords.append(None)
@@ -505,21 +295,6 @@ _sfx_search_count = 0
 
 
 def _fetch_shot_sfx(keyword, work_dir):
-    """ADDED (2026-08-31, SFX refinement pass): looks up a short CC-licensed
-    sound effect from the free Freesound.org API for one shot's keyword
-    (see video_planning_agent.py's SFX_LINE_RULE for where the keyword
-    comes from) and downloads its preview-quality mp3. Returns the local
-    file path, or None if SFX is disabled, the keyword is missing, the
-    search/download fails, or the per-run search cap is hit - every one of
-    these is a silent, graceful degradation (that shot just has no SFX
-    layer), matching the fail-open pattern _build_music_bed already uses
-    for music tracks. Never raises - a real SFX layer is a quality
-    enhancement, not something assembly should ever be blocked on.
-
-    Uses an in-run cache keyed by the lowercased keyword, since many shots
-    in the same script commonly share very similar SFX keywords (e.g.
-    several "footsteps stone floor" shots) - this both saves API calls
-    against the 2000/day budget and saves redundant downloads."""
     global _sfx_search_count
 
     if not FREESOUND_ENABLED or not keyword:
@@ -585,15 +360,6 @@ def _fetch_shot_sfx(keyword, work_dir):
 
 
 def _build_sfx_bed(sfx_keywords, durations, work_dir):
-    """ADDED (2026-08-31, SFX refinement pass): builds one AudioClip layer
-    placing each shot's fetched SFX sound at that shot's start time within
-    the timeline, matching shot boundaries computed from `durations` in
-    the same order assemble.py already uses everywhere else (crossfade
-    overlap between shots is a small, acceptable amount of timing slop for
-    an ambient SFX hit - it doesn't need frame-accurate sync the way
-    narration does). Returns None if no shot produced a usable SFX file
-    (SFX disabled, all lookups failed, or no plan had SFX lines at all) -
-    same optional-layer pattern as music."""
     if not FREESOUND_ENABLED:
         return None
 
@@ -604,8 +370,6 @@ def _build_sfx_bed(sfx_keywords, durations, work_dir):
         if sfx_path:
             try:
                 clip = AudioFileClip(sfx_path).volumex(SFX_VOLUME)
-                # Trim an SFX hit that's longer than its shot so it doesn't
-                # bleed audibly into the next shot's own sound.
                 if clip.duration > dur:
                     clip = clip.subclip(0, dur)
                 clip = clip.set_start(t)
@@ -668,26 +432,6 @@ def _find_next_video_to_assemble():
 
 
 def _download_file(url, dest_path, max_attempts=4):
-    """FIX (2026-08-26): this was the only network call in the whole file
-    with zero retry logic - every backend call already got retries on
-    Aug 21-22 (see _resilient_get/_resilient_post), but this one didn't.
-    One transient network hiccup pulling a clip from Supabase storage and
-    the shot got silently dropped into `all_skipped` with no explanation
-    printed anywhere. Confirmed live on "The Autumn of Fire": a handful of
-    clip downloads failed silently this way, the assembled video track ran
-    out after ~3-5 minutes of real footage, and the narration-vs-video
-    freeze-hold mechanism at the end of main() (built for small
-    end-of-video gaps) stretched to cover the rest of a 30-40 minute
-    narration track - which is why it played as picture-frozen narration
-    for the remainder. Supabase itself was NOT missing any data (all shots
-    were filled) - this was purely a transient download failure during
-    that one assembly run.
-
-    Fix: retry with backoff (same pattern as _resilient_get/_resilient_post
-    above), plus print a line on every failed attempt and a final failure
-    line, so a real failure is visible in the run log instead of vanishing
-    into all_skipped with zero explanation.
-    """
     last_reason = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -727,30 +471,9 @@ def _still_image_clip(image_path, duration):
 
 
 def _fit_clip_to_duration(clip, target_duration, fps=24, shot_index=None):
-    """FIX (2026-08-03): the old version of this file did
-    `clip.set_duration(clip.duration)` when a downloaded clip was SHORTER
-    than the shot's target duration - a no-op that silently left the shot
-    under-filled instead of fixing anything.
-
-    CHANGED (2026-08-29): previously, when a clip came back shorter than
-    its target duration, this held the clip's final frame frozen for the
-    remainder (a still-image "freeze-frame") to fill the gap. Zia flagged
-    this freeze-frame as visible/unwanted at the end of shots. Since Agnes
-    clips coming back short is common (see DIAGNOSTIC below), freezing was
-    happening on most shots. Now: no freeze-frame is added - the shot
-    simply plays for its actual real duration instead of being padded.
-    This makes that shot slightly shorter on screen than planned, but
-    removes the freeze entirely. (The separate CROSSFADE-loss fix in
-    _render_block already compensates block-to-block timing independently
-    of this function, so shortening a shot here does not reintroduce the
-    old "video ends 30-50s early" bug - it only affects this one shot's
-    own on-screen length.)
-
-    DIAGNOSTIC (2026-08-16): Zia flagged a 0.5-0.8s freeze-hold on nearly
-    EVERY scene, not occasionally - which points at Agnes systematically
-    returning clips a bit shorter than the requested frame count, rather
-    than a rare edge case. Logging every shot's (target, actual, pad) here
-    so it's visible in the run log how often/how much this happens.
+    """Short clips (Agnes returning fewer frames than requested) play at
+    their real, shorter length instead of freeze-padding to fill the gap -
+    see FREEZE-FRAME ELIMINATION note near main() for the full history.
     """
     pad = max(target_duration - clip.duration, 0.0)
     _FREEZE_PAD_LOG.append((shot_index, target_duration, clip.duration, pad))
@@ -780,10 +503,6 @@ def _video_clip(video_path, duration, shot_index=None):
     clip = clip.set_position(("center", "center"))
     clip = clip.crop(x_center=resized_w / 2, y_center=resized_h / 2, width=target_w, height=target_h)
 
-    # FIX (2026-08-03): was `clip.set_duration(clip.duration)` here (a no-op)
-    # when the clip came back shorter than needed - see _fit_clip_to_duration
-    # docstring above. As of 2026-08-29, short clips play at their real
-    # length instead of freeze-padding - see that function's docstring.
     clip = _fit_clip_to_duration(clip, duration, shot_index=shot_index)
 
     clip = clip.crossfadein(min(CROSSFADE, clip.duration / 2))
@@ -803,34 +522,6 @@ def _run_ffmpeg(args, allow_fail=False):
 
 
 def _render_block(shot_indices, urls, durations, media_dir, block_output_path, use_clips):
-    """
-    CROSSFADE-LOSS FIX (2026-08-19): concatenate_videoclips() below uses
-    padding=-CROSSFADE to create the crossfade transition between
-    consecutive clips in this block - which OVERLAPS (and therefore trims)
-    CROSSFADE seconds off the tail of every clip except the last one in
-    the block. That overlap was never compensated for, so a block's
-    assembled duration came out (num_shots_in_block - 1) * CROSSFADE
-    seconds SHORTER than the sum of its shots' real target durations -
-    invisible per-shot (each clip still reports its own correct duration
-    going in) but compounding across every shot boundary in the video.
-    This is the confirmed root cause of the 30-50s freeze at the end of
-    assembled videos Zia flagged 2026-08-16: for an 80-shot video that's
-    79 transitions * 0.5s = ~39.5s of duration lost to crossfade overlap
-    - invisible until main()'s narration-vs-video length check at the
-    very end pads the whole accumulated shortfall onto one giant frozen
-    last frame (matches Red Moon Rising's ~40s freeze and Golden Horde's
-    Tide's ~50s freeze almost exactly: 79 * 0.5 = 39.5s and 94 * 0.5 =
-    47s respectively).
-
-    Fix: every clip except the last one in its block now targets
-    dur + CROSSFADE instead of dur, so after concatenate_videoclips()
-    trims CROSSFADE off its tail via the negative-padding overlap, the
-    VISIBLE on-screen duration lands back on the shot's real target - no
-    accumulated loss, no oversized end-of-video freeze. This is separate
-    from the per-shot short-clip handling (see _fit_clip_to_duration) and
-    does not affect it - the freeze-pad diagnostic log below still
-    reflects genuine Agnes-clip-came-back-short cases.
-    """
     clips = []
     skipped = []
     errors = []
@@ -839,9 +530,6 @@ def _render_block(shot_indices, urls, durations, media_dir, block_output_path, u
     for i in shot_indices:
         url = urls[i]
         dur = durations[i]
-        # See CROSSFADE-LOSS FIX docstring above: compensate every
-        # non-last-in-block clip for the overlap trim it's about to take
-        # during concatenate_videoclips() below.
         effective_dur = dur if i == last_index_in_block else dur + CROSSFADE
         ext = "mp4" if use_clips else "jpg"
         media_path = os.path.join(media_dir, "shot_%03d.%s" % (i, ext))
@@ -899,20 +587,6 @@ def _extract_native_audio(video_path, out_path):
 
 
 def _get_video_duration(video_path):
-    """FIX (2026-08-09): moviepy's VideoFileClip (via ffmpeg_reader) parses
-    ffmpeg's probe output for a 'video_fps' field and raises KeyError when
-    that field is missing - which happens on files produced by our own
-    `ffmpeg -f concat -c copy` step earlier in this script, because stream
-    copying can leave the container's fps metadata in a form moviepy's
-    regex doesn't recognize. This crashed 70+ consecutive assemble runs
-    at this exact line even though every real step (rendering, concat,
-    audio mix) had already succeeded.
-
-    Fix: read duration straight from ffmpeg's own text output instead of
-    going through moviepy at all - ffmpeg always prints a 'Duration:
-    HH:MM:SS.ms' line regardless of whether it can also parse fps, so this
-    never depends on the missing field.
-    """
     result = subprocess.run(
         [FFMPEG_BINARY, "-i", video_path],
         stdout=subprocess.PIPE,
@@ -951,12 +625,6 @@ def _apply_safety_limiter(audio_clip, ceiling=LIMITER_CEILING):
 
 
 def _chapter_time_bounds(total_duration):
-    """Returns [(start, end, label, mood, filename), ...] for the chapters
-    that fit inside total_duration, matching Rule 0's fixed timing spine
-    in script_writing_agent.py exactly: Cold Open is a fixed 0-30s (or
-    less, if narration itself is shorter than 30s), Problem/Stakes runs
-    30s-25%, Rising Delivery 25%-50%, Midpoint Twist 50%-55% (a short band
-    for the re-hook moment itself), Climax 55%-85%, Payoff 85%-100%."""
     cold_open_end = min(30.0, total_duration)
     fraction_bounds = [
         (cold_open_end, 0.25 * total_duration),
@@ -980,12 +648,6 @@ def _download_music_track(filename, dest_path):
 
 
 def _build_music_bed(total_duration, work_dir):
-    """Builds one continuous music AudioClip spanning total_duration, made
-    of each chapter's track trimmed/looped to fill its segment and
-    crossfaded into the next at the boundary (MUSIC_CROSSFADE seconds of
-    overlap with a fade on each side). Returns None if every track fails
-    to download or MUSIC_ENABLED is False - music is an optional layer,
-    never a hard dependency for assembly."""
     if not MUSIC_ENABLED:
         return None
 
@@ -1046,13 +708,6 @@ def _build_mixed_audio(narration_path, native_sfx_path, music_clip, shot_sfx_cli
     else:
         print("No native clip audio detected to mix in for this video.")
 
-    # ADDED (2026-08-31, SFX refinement pass): per-shot scripted SFX from
-    # Freesound, distinct from native_sfx_path above - native_sfx_path is
-    # WHATEVER incidental sound happened to be baked into the Agnes clip
-    # itself (often faint/generic), while this is a real, specific sound
-    # matched to what the shot's own production plan explicitly calls for
-    # (see video_planning_agent.py's SFX_LINE_RULE). Both layers are kept
-    # - they're complementary, not redundant.
     if shot_sfx_clip:
         print("Mixing in per-shot scripted SFX (Freesound).")
         shot_sfx_clip = _fit_audio_to_duration(shot_sfx_clip, duration)
@@ -1093,12 +748,6 @@ def main():
               "(music and native-clip audio are unaffected). Get a free token at "
               "https://freesound.org/apiv2/apply/ and add it as a repo secret to enable.")
 
-    # See KEEP-ALIVE FIX (2026-08-30) docstring near _KEEPALIVE_STOP above.
-    # Starts pinging /health every 5 min now, before any local rendering
-    # begins, so the backend never crosses Render's ~15 min idle threshold
-    # during the render (confirmed up to 56 min on video 4fc244de) and is
-    # already warm for the small metadata calls this script still makes
-    # to it (video fetch, narration download, final status PATCH).
     _start_keepalive()
 
     video_id = VIDEO_ID
@@ -1192,8 +841,6 @@ def main():
         print("ERROR: all shots failed: " + str(all_errors))
         sys.exit(1)
 
-    # DIAGNOSTIC (2026-08-16): summarize freeze-pad across the whole run so
-    # this is visible without scrolling through per-shot logs.
     if _FREEZE_PAD_LOG:
         padded = [x for x in _FREEZE_PAD_LOG if x[3] > 0]
         total = len(_FREEZE_PAD_LOG)
@@ -1236,34 +883,32 @@ def main():
     total_duration = _build_mixed_audio(audio_path, extracted_sfx, music_bed, shot_sfx_bed, mixed_audio_path)
 
     video_duration = _get_video_duration(silent_path)
-    # END-FREEZE FIX (2026-08-26): the target held-through duration now
-    # includes END_FREEZE_SECONDS, so the finished video always settles
-    # on the last frame for a beat after narration ends instead of
-    # cutting the instant the last word/shot finishes. This is separate
-    # from the CROSSFADE=0.5s scene-to-scene transitions above - it only
-    # affects the single tail-end of the fully assembled video, not any
-    # point between shots.
-    target_duration = total_duration + END_FREEZE_SECONDS
-    pad_seconds = target_duration - video_duration
-    if pad_seconds > 0.5:
-        print(
-            f"Video track ({video_duration:.1f}s) is shorter than narration + "
-            f"end-freeze ({target_duration:.1f}s) - freezing the last frame for "
-            f"an extra {pad_seconds:.1f}s (includes {END_FREEZE_SECONDS}s end-hold) "
-            f"so no narration gets cut off and the video settles before ending."
-        )
-        cinematic_vf = f"tpad=stop_mode=clone:stop_duration={pad_seconds:.2f}," + CINEMATIC_VF_BASE
-    else:
-        cinematic_vf = CINEMATIC_VF_BASE
 
-    # CRF ENCODING (2026-08-30, lowered 2026-09-01, restored 2026-09-01):
-    # replaces the old bitrate-budget calc - see comment on VIDEO_CRF near
-    # the top of the file for why 26 instead of 20. CRF targets constant
-    # visual quality directly; ffmpeg allocates however much bitrate that
-    # actually needs.
+    # FREEZE-FRAME ELIMINATED ENTIRELY (2026-09-03, hard requirement -
+    # zero tolerance for any frozen-frame padding anywhere in the final
+    # video, per Zia's explicit instruction). This removes BOTH remaining
+    # freeze-frame codepaths that existed before this change:
+    #   1. The deliberate END_FREEZE_SECONDS=0.75s hold tacked onto the
+    #      very end of the video (added 2026-08-26).
+    #   2. The tpad=stop_mode=clone safety-net that froze the last frame
+    #      whenever the assembled video track came up shorter than
+    #      narration+end-hold (whatever residual gap remained after the
+    #      2026-08-19 crossfade-loss fix and the 2026-08-29 per-shot
+    #      short-clip fix).
+    # Replacement: ffmpeg's "-shortest" flag, which simply ends the output
+    # at whichever of video/audio is shorter. This makes a frozen frame
+    # STRUCTURALLY IMPOSSIBLE - there is no codepath left that clones or
+    # holds a frame under any condition. The only behavior change is that
+    # if the video track and narration differ by a fraction of a second
+    # (which _resolve_durations's real per-shot shot_durations from
+    # narrate.py should already keep near-zero), the output simply ends at
+    # the shorter of the two instead of freezing to cover the gap.
+    cinematic_vf = CINEMATIC_VF_BASE
+
     print(
         f"Applying cinematic grade and merging mixed audio "
-        f"(duration={target_duration:.1f}s, CRF={VIDEO_CRF}, no quality-compromising bitrate cap)..."
+        f"(video={video_duration:.1f}s, narration={total_duration:.1f}s, ending at "
+        f"whichever is shorter - no freeze-frame padding, CRF={VIDEO_CRF})..."
     )
     _run_ffmpeg([
         "-i", silent_path,
@@ -1277,15 +922,7 @@ def main():
         "-crf", str(VIDEO_CRF),
         "-c:a", "aac",
         "-b:a", f"{AUDIO_BITRATE_KBPS}k",
-        # CHANGED (2026-08-26): was "-shortest", which capped the final
-        # output at narration length and silently discarded the new
-        # end-freeze extension (video track ran longer than audio, so
-        # "-shortest" cut it right back down to audio length - the freeze
-        # would have been added and then immediately thrown away). "-t"
-        # with the explicit target duration keeps the added hold; audio
-        # simply ends in silence for the last END_FREEZE_SECONDS, which is
-        # correct for a freeze-frame with no dialogue happening over it.
-        "-t", f"{target_duration:.2f}",
+        "-shortest",
         final_path,
     ])
 
@@ -1293,11 +930,6 @@ def main():
     final_size_mb = os.path.getsize(final_path) / (1024 * 1024)
     print(f"Final file size: {final_size_mb:.1f}MB (CRF {VIDEO_CRF}, no size budget applied).")
 
-    # DIRECT-TO-GITHUB-RELEASE UPLOAD (2026-09-02): see note near the top of
-    # this file. The large file now goes straight from this runner to a
-    # GitHub Release asset on this repo - Render never sees it, and there's
-    # no Supabase file-size or total-storage ceiling to hit. Only a small
-    # JSON status update reaches Render afterward.
     print("Uploading finished video to a GitHub Release asset (free, no size ceiling, no quality change)...")
     video_url = _upload_final_video_to_github_release(video_id, final_path)
     print(f"Uploaded to GitHub Release: {video_url}")
