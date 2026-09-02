@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, Uuid, func
+from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, Uuid, func, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -27,6 +27,12 @@ class Video(Base):
     # Nova character/scene consistency across cuts, which it previously had
     # zero mechanism for (pure blind text-to-video on every shot).
     character_reference_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    # ADDED (2026-09-02): True once cinematographer_agent.py has enriched
+    # this video's production_plan with a full DP-style shot-composition
+    # brief per shot (framing, lighting, blocking, lens feel). Gates
+    # video_clips so Agnes never generates from a plan that hasn't been
+    # through this pass yet - see supervisor_agent.py's _find_next_task.
+    cinematography_done: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     topic_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("topics.id", ondelete="SET NULL"), nullable=True
     )
