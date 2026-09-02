@@ -4,7 +4,6 @@ on:
   schedule:
     - cron: '*/10 * * * *'  # every 10 minutes, 24/7
   workflow_dispatch:  # allows manual trigger from the Actions tab
-    # trigger
 
 permissions:
   issues: write
