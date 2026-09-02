@@ -18,6 +18,7 @@ CLIP_COOLDOWN_MINUTES = 25
 ASSEMBLY_COOLDOWN_MINUTES = 35
 NARRATION_COOLDOWN_MINUTES = 20
 STRATEGY_RESEARCH_COOLDOWN_MINUTES = 7 * 24 * 60
+VIDEO_PLANNING_STARVATION_MINUTES = 90
 LOG_PATH = "/app/data/supervisor_log.json"
 
 
@@ -88,7 +89,50 @@ AGENT_ID_KEY = {
 }
 
 
+def _find_starved_video_planning_task(db):
+    """ADDED (2026-09-02): fix for verified priority-starvation bug.
+
+    _find_next_task() below checks assembly, then video_clips, then
+    narration - all looping over in-flight videos - before it ever
+    looks at video_planning. As long as even one video is mid-pipeline,
+    video_planning never gets a turn, no matter how long a script has
+    been sitting there with no video. This starves any script waiting
+    on video_planning indefinitely whenever the pipeline has ongoing
+    video work, which is most of the time.
+
+    This function is checked FIRST, before the video loops, but only
+    returns a task if a script has been waiting at least
+    VIDEO_PLANNING_STARVATION_MINUTES with no video, no active task,
+    and hasn't exhausted retries - so it doesn't change behavior for
+    scripts that are simply next-in-line under normal conditions, only
+    for ones that have been genuinely starved.
+    """
+    scripts = db.query(Script).all()
+    cutoff = datetime.utcnow() - timedelta(minutes=VIDEO_PLANNING_STARVATION_MINUTES)
+    for script in scripts:
+        has_video = db.query(Video).filter(Video.script_id == script.id).first()
+        if has_video:
+            continue
+        if script.created_at is None or script.created_at >= cutoff:
+            continue
+        sid = str(script.id)
+        if _has_active_task(db, "video_planning", "script_id", sid):
+            continue
+        if _failed_attempts(db, "video_planning", "script_id", sid) >= MAX_RETRIES:
+            continue
+        return {
+            "agent_name": "video_planning",
+            "payload": {"script_id": sid},
+            "title": "Plan video for script " + sid[:8] + " (starvation override)",
+        }
+    return None
+
+
 def _find_next_task(db):
+    starved = _find_starved_video_planning_task(db)
+    if starved:
+        return starved
+
     videos = db.query(Video).filter(Video.status.notin_(["assembled", "uploaded"])).all()
 
     for video in videos:
