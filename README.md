@@ -1,4 +1,4 @@
-# Nova Command Center
+ated# Nova Command Center
 
 Production React + FastAPI dashboard for content operations, revenue tracking, and agent orchestration — with a fully automated, cron-driven video pipeline (script → narration → images → video clips → assembly → YouTube upload).
 
@@ -7,7 +7,25 @@ Production React + FastAPI dashboard for content operations, revenue tracking, a
 - **Frontend:** React 18, TypeScript, Vite, Tailwind CSS, Recharts
 - **Backend:** FastAPI, SQLAlchemy 2.0, Alembic — hosted on **Render** (`novacommandcenter.onrender.com`)
 - **Database:** **Supabase Postgres** (production). `DATABASE_URL` is set on Render to Supabase's Supavisor pooler connection string. `database.py` auto-detects Postgres vs SQLite from this URL, so no code changes are needed either way.
+- **Media storage:** **Backblaze B2** (bucket `nova-media-zia`) — see "Media Storage" section below. **Supabase Storage is NOT used for anything as of Sep 2, 2026 — do not re-enable it, do not raise its bucket limits, do not suggest it as a fix for anything.**
 - **Render free tier sleeps when idle** — `keep-alive.yml` pings `/api/v1/videos` every 10 minutes to prevent cold starts from breaking scheduled runs.
+
+## Media Storage — Backblaze B2 (NOT Supabase Storage)
+
+**Do not use, reference, or re-enable Supabase Storage for any file uploads (video, audio, images, thumbnails).** It was fully migrated away from on Sep 2, 2026, for two independent, permanent reasons:
+
+1. Supabase's Free plan enforces a hard **50MB Global file size limit** that cannot be raised past 50MB by any bucket-level setting, regardless of what any individual bucket's `file_size_limit` is configured to. Nova's CRF20-encoded 1080p renders (600-750MB) can never fit through it.
+2. Supabase Storage/REST is separately subject to its own Egress/bandwidth caps per billing cycle, unrelated to (1).
+
+All media now goes to **Backblaze B2** instead:
+- Bucket: `nova-media-zia` (globally unique name — plain `nova-media` was already taken)
+- Endpoint: `s3.us-east-005.backblazeb2.com`
+- Visibility: **Private** (not Public — Backblaze charges a one-time $1 card-verification fee to flip a bucket to Public when the account has no billing history on file, which is not payable here)
+- Access: S3-compatible API via `boto3`, credentials in `B2_ENDPOINT_URL` / `B2_KEY_ID` / `B2_APPLICATION_KEY` env vars on Render
+- Because the bucket is Private, uploads return a **presigned URL** (temporary signed download link, 6-day expiry) instead of a plain public URL — this is what lets `assemble.py`'s plain unauthenticated HTTP GET still work. If a video is ever read back more than 6 days after upload, its stored URL will have expired and the file will need re-uploading.
+- Implemented in `backend/app/supabase_storage.py` — filename and function name (`upload_to_storage`) were deliberately left unchanged from the old Supabase version so no other file's import had to change; only this file's internals are B2-backed now.
+
+`SUPABASE_URL` / `SUPABASE_SECRET_KEY` env vars may still exist on Render as leftover/unused — they are not read by any storage code anymore. Supabase itself is still used, but **only** for `DATABASE_URL` (the Postgres database) — never for storage.
 
 ## Automated Video Pipeline
 
