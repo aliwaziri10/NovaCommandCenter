@@ -1,6 +1,6 @@
 """
 Uploads bytes or a file-like stream to Backblaze B2 (via its S3-compatible
-API) and returns a public URL.
+API) and returns a temporary secure download URL.
 
 MIGRATED 2026-09-02: previously uploaded to Supabase Storage, but
 Supabase's Free plan enforces a hard 50MB Global file size limit that
@@ -15,13 +15,29 @@ expiry), no per-file size cap, free egress up to 3x stored data/month
 (fixes the separate Egress Exceeded problem too), no credit card
 required to sign up.
 
+The bucket (nova-media-zia) is kept PRIVATE, not Public - Backblaze
+charges a one-time $1 card-verification fee to flip a bucket to Public
+when the account has no billing history, which isn't payable with no
+card at all. Instead, this module returns a presigned URL (a
+temporary, signed link good for 6 days) for every uploaded file.
+assemble.py and narrate.py's plain HTTP GET/HEAD calls work against a
+presigned URL exactly the same as a public one - no other file needed
+to change.
+
+6 days was chosen to stay safely under the 7-day (604800s) maximum
+presigned-URL lifetime that S3-compatible SigV4 signing allows, while
+giving the pipeline (supervisor every ~20min, GH Actions cron every
+6h) comfortable room to consume the file well before it expires. If a
+video's audio_path/video_url is ever read back after 6 days (e.g. a
+long-stuck video resumed later), the URL will have expired and need
+re-uploading/regenerating - not expected in normal operation, but
+worth knowing if a "link expired"-style download error ever appears
+far downstream.
+
 This module's filename and function name are kept the same
 (supabase_storage.py / upload_to_storage) so no other file in the
 codebase needed to change its import - only this file's internals
-changed. The bucket is Public (not Private) because assemble.py
-(running on a separate GitHub Actions machine) does a plain
-unauthenticated HTTP GET to download narration/video files by URL -
-same behavior as the old public Supabase bucket.
+changed.
 
 This exists because Render's local disk is NOT durable storage - files
 written there are wiped on container restart/redeploy. Narration audio
@@ -32,6 +48,8 @@ storage, not local disk.
 import boto3
 from botocore.config import Config as BotoConfig
 from app.config import settings
+
+PRESIGNED_URL_EXPIRY_SECONDS = 6 * 24 * 60 * 60  # 6 days
 
 
 def _b2_client():
@@ -52,7 +70,8 @@ def _b2_client():
 def upload_to_storage(path_in_bucket, content_bytes, content_type, content_length=None):
     """Uploads content_bytes (or a file-like/stream object) to the B2
     bucket at path_in_bucket (overwriting if it already exists) and
-    returns the public URL.
+    returns a presigned download URL valid for
+    PRESIGNED_URL_EXPIRY_SECONDS.
 
     content_bytes may be raw bytes, OR a file-like object opened for
     reading (e.g. FastAPI's UploadFile.file) - boto3's put_object
@@ -78,7 +97,12 @@ def upload_to_storage(path_in_bucket, content_bytes, content_type, content_lengt
             Body=content_bytes,
             ContentType=content_type,
         )
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": path_in_bucket},
+            ExpiresIn=PRESIGNED_URL_EXPIRY_SECONDS,
+        )
     except Exception as e:
         raise RuntimeError(f"Backblaze B2 upload failed: {e}")
 
-    return f"https://{settings.b2_endpoint_url}/{bucket}/{path_in_bucket}"
+    return url
