@@ -39,8 +39,24 @@ jobs:
               if re.search(pattern, added_text, re.IGNORECASE):
                   violations.append(pattern)
 
+          touched_files = set(re.findall(r'^\+\+\+ b/(.+)$', diff, re.MULTILINE))
+          protected_files = set(rules.get("protected_files", []))
+          required_terms = rules.get("required_if_protected_file_touched", [])
+          touched_protected = touched_files & protected_files
+
+          for path in sorted(touched_protected):
+              if not os.path.exists(path):
+                  continue  # file was deleted in this push; nothing to check
+              with open(path, encoding="utf-8", errors="ignore") as f:
+                  content = f.read().lower()
+              if required_terms and not any(term.lower() in content for term in required_terms):
+                  violations.append(
+                      f"protected file '{path}' was touched but its current content "
+                      f"contains none of the required terms {required_terms}"
+                  )
+
           if violations:
-              msg = "Constraint Gate FAILED. Banned pattern(s) added:\n" + "\n".join(f"- {v}" for v in violations)
+              msg = "Constraint Gate FAILED. Violation(s):\n" + "\n".join(f"- {v}" for v in violations)
               print(msg)
               subprocess.run([
                   "gh", "issue", "create",
@@ -49,5 +65,5 @@ jobs:
               ], env=os.environ)
               sys.exit(1)
           else:
-              print("Constraint Gate passed — no banned patterns added.")
+              print("Constraint Gate passed — no banned patterns added, no protected-file violations.")
           EOF
