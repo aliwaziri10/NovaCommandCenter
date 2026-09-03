@@ -92,6 +92,27 @@ of discarding it outright. That requires deciding how the two systems'
 authority should be reconciled and is deliberately left as a follow-up,
 not bundled into this fix, so the immediate leak/collision gets
 contained without a same-day redesign of prompt-building authority.
+
+UPDATED (2026-09-04): NAMED-HISTORICAL-FIGURE LIKENESS GUARDRAIL (rebuild
+item #20). script_writing_agent.py's Rule 12 deliberately requires naming
+real historical figures in NARRATION (e.g. "General Okonkwo said...") -
+that's correct and stays, since a spoken name carries no likeness risk.
+The risk is downstream: a shot description built from that script can
+carry a real person's name straight into an Agnes video-generation
+prompt, and an AI video model asked to render a specific named real
+person will attempt a photorealistic likeness of them - a genuine
+liability/accuracy risk this pipeline had no guard against at all,
+unlike the anachronism/quality/motion guards already applied to every
+prompt. Added NAMED_FIGURE_GUARD, included in every _build_prompt() call
+(both the full-camera and generic-fallback branches) alongside the
+existing guards: instructs the model to never attempt a specific,
+identifiable likeness of a real named historical individual even when
+one is named in the shot description, and to render any named person as
+a generic, unidentifiable period-appropriate individual instead (through
+framing/angle/distance/lighting, not by refusing the shot or omitting
+the person). This does not touch script_writing_agent.py or narration in
+any way - narration keeps real names exactly as Rule 12 requires; only
+the visual-generation prompt is affected.
 """
 
 import os
@@ -175,6 +196,22 @@ ANACHRONISM_GUARD = (
     "no cars, no drones, no modern clothing, no digital devices, no anachronistic objects of any kind, "
     "no laptops, no computers, no smartphones, no tablets, no screens or monitors of any kind, "
     "no modern furniture, no electrical wiring or outlets, no plastic objects"
+)
+
+# ADDED (2026-09-04, rebuild item #20 - see module docstring
+# "NAMED-HISTORICAL-FIGURE LIKENESS GUARDRAIL"): applied to every prompt,
+# same as the other guards below. Narration is allowed (and, per
+# script_writing_agent.py Rule 12, required) to name real historical
+# figures - this guard only affects what the VIDEO model is told to
+# render when a shot description happens to include one of those names.
+NAMED_FIGURE_GUARD = (
+    "if this scene depicts a specific real named historical individual, "
+    "do not attempt a specific, identifiable likeness of that real person - "
+    "render them as a generic, unidentifiable period-appropriate person instead "
+    "(via framing, distance, angle, silhouette, obscured or turned-away face, or "
+    "similar composition choices), never a recognizable portrait of the actual "
+    "historical figure; still include the person and the action described, just "
+    "without attempting their real likeness"
 )
 
 # CHANGED (2026-08-19): style overhaul phase 1. Full-motion black & white
@@ -602,6 +639,7 @@ def _submit_clip(description, shot_index, num_frames, elapsed_seconds_before_sho
         if not include_camera:
             parts = [
                 LIGHTING_DIRECTIVE, QUALITY_GUARD, ANACHRONISM_GUARD, MOTION_CONTINUITY_GUARD,
+                NAMED_FIGURE_GUARD,
             ]
             if is_group_shot:
                 parts.append(DISTINCT_INDIVIDUALS_GUARD)
@@ -612,6 +650,7 @@ def _submit_clip(description, shot_index, num_frames, elapsed_seconds_before_sho
             return ", ".join(p for p in parts if p)
         parts = [
             LIGHTING_DIRECTIVE, QUALITY_GUARD, ANACHRONISM_GUARD, MOTION_CONTINUITY_GUARD,
+            NAMED_FIGURE_GUARD,
         ]
         if is_group_shot:
             parts.append(DISTINCT_INDIVIDUALS_GUARD)
