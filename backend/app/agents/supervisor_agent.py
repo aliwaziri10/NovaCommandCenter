@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.models import Topic, Script, Video, Task
@@ -22,6 +22,27 @@ CINEMATOGRAPHY_COOLDOWN_MINUTES = 15
 STRATEGY_RESEARCH_COOLDOWN_MINUTES = 7 * 24 * 60
 VIDEO_PLANNING_STARVATION_MINUTES = 90
 LOG_PATH = "/app/data/supervisor_log.json"
+
+
+# TIMEZONE FIX (2026-09-04): _find_starved_video_planning_task below was
+# comparing script.created_at (returned by SQLAlchemy as an
+# offset-AWARE datetime, since the DB column is TIMESTAMPTZ) directly
+# against `cutoff` (built from datetime.utcnow(), which is always
+# offset-NAIVE). Python refuses to compare an aware and a naive datetime
+# at all - raises "can't compare offset-naive and offset-aware datetimes"
+# - which crashed EVERY supervisor cycle (both the 20-minute APScheduler
+# job and the manual /supervisor/run-now endpoint) the instant any script
+# existed with no video yet, silently halting the entire pipeline
+# (topic_research, script_writing, everything downstream never got a
+# chance to run because this crashed first). This helper normalizes any
+# datetime - aware or naive - down to a plain naive-UTC datetime before
+# comparison, so it works no matter what the DB driver hands back.
+def _naive_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def _clear_stale_tasks(db):
@@ -116,7 +137,10 @@ def _find_starved_video_planning_task(db):
         has_video = db.query(Video).filter(Video.script_id == script.id).first()
         if has_video:
             continue
-        if script.created_at is None or script.created_at >= cutoff:
+        # TIMEZONE FIX (2026-09-04): normalize before comparing - see
+        # _naive_utc() docstring above for why this was crashing every cycle.
+        created_at = _naive_utc(script.created_at)
+        if created_at is None or created_at >= cutoff:
             continue
         sid = str(script.id)
         if _has_active_task(db, "video_planning", "script_id", sid):
