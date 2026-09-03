@@ -18,9 +18,14 @@ Design notes:
 - "Needs Fix" pulls real open issues the supervisor already created
   (label: supervisor-escalated) plus any open workflow-failure issues not
   yet auto-closed - it does not re-diagnose bugs, it surfaces the ones
-  already confirmed live.
+  already confirmed live. Before listing an issue, it re-checks the video's
+  current status/youtube_video_id and auto-closes the issue if the video has
+  since completed - the supervisor and workflows don't reliably close these
+  themselves once a stuck video later recovers.
 - This script never triggers workflows or force-fixes anything itself -
-  that job belongs to supervisor.py. This is read-only reporting.
+  that job belongs to supervisor.py. This is read-only reporting (aside from
+  closing confirmed-stale issues, which is a report-integrity action, not a
+  pipeline action).
 """
 
 import os
@@ -47,6 +52,10 @@ STUCK_HOURS = {
 }
 
 SHOT_START = re.compile(r"^[\-\*\s]*\**(?:shot\s*[\d.]+|\d+[\.\)])\**", re.IGNORECASE)
+
+# Matches a video's id (uuid) anywhere in an issue's title or body, so we can
+# tell which video a given "stuck"/"workflow failed" issue was about.
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 
 
 def parse_dt(value):
@@ -119,7 +128,7 @@ def fetch_open_issues(label_or_query):
     """Uses gh CLI (already authenticated in the workflow) to search issues."""
     result = subprocess.run(
         ["gh", "issue", "list", "--state", "open", "--search", label_or_query,
-         "--json", "number,title,url,createdAt", "--limit", "30"],
+         "--json", "number,title,url,createdAt,body", "--limit", "30"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -129,6 +138,45 @@ def fetch_open_issues(label_or_query):
         return json.loads(result.stdout)
     except json.JSONDecodeError:
         return []
+
+
+def close_stale_issue(issue, video):
+    yt_id = video.get("youtube_video_id", "")
+    reason = (
+        f"Video is confirmed `status=uploaded`"
+        + (f" (youtube_video_id {yt_id})" if yt_id else "")
+        + " in live DB. Auto-closing as stale - this issue was opened while the "
+        "video was stuck, but the video has since completed."
+    )
+    subprocess.run(
+        ["gh", "issue", "comment", str(issue["number"]), "--body", reason],
+        capture_output=True, text=True,
+    )
+    result = subprocess.run(
+        ["gh", "issue", "close", str(issue["number"]), "--reason", "completed"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Warning: could not auto-close issue #{issue['number']}: {result.stderr}")
+        return False
+    print(f"Auto-closed stale issue #{issue['number']} (video now uploaded).")
+    return True
+
+
+def reconcile_needs_fix_issues(issues, videos_by_id):
+    """Drops any issue from the Needs Fix list whose referenced video has
+    since reached status=uploaded, closing that issue on GitHub too so it
+    doesn't keep coming back as a false bug report."""
+    still_open = []
+    for issue in issues:
+        haystack = f"{issue.get('title', '')}\n{issue.get('body', '')}"
+        match = UUID_RE.search(haystack)
+        video = videos_by_id.get(match.group(0)) if match else None
+        if video and video.get("status") == "uploaded":
+            close_stale_issue(issue, video)
+            continue
+        still_open.append(issue)
+    return still_open
 
 
 def classify_videos(videos, now):
@@ -285,6 +333,8 @@ def main():
         write_status_issue(body)
         raise
 
+    videos_by_id = {v.get("id"): v for v in videos if v.get("id")}
+
     moving, stuck, _ = classify_videos(videos, now)
 
     needs_fix_issues = fetch_open_issues("label:supervisor-escalated")
@@ -296,7 +346,7 @@ def main():
         if issue["number"] not in seen:
             seen.add(issue["number"])
             deduped.append(issue)
-    needs_fix_issues = deduped
+    needs_fix_issues = reconcile_needs_fix_issues(deduped, videos_by_id)
 
     body = build_report_body(videos, moving, stuck, needs_fix_issues, now)
     write_status_issue(body)
