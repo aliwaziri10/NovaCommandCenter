@@ -86,8 +86,11 @@ MUSIC_BASE_URL = "https://incompetech.com/music/royalty-free/mp3-royaltyfree/"
 MUSIC_ATTRIBUTION = (
     "Music by Kevin MacLeod (incompetech.com), licensed under Creative "
     "Commons: By Attribution 3.0 (creativecommons.org/licenses/by/3.0/) - "
-    "STILL NEEDS TO BE ADDED to every video description by youtube_upload.py "
-    "(not done as part of this change - separate follow-up)."
+    "attribution is added to every video's YouTube description "
+    "unconditionally by youtube_upload.py's MUSIC_ATTRIBUTION_LINE / "
+    "_build_final_description() (confirmed live 2026-09-03) - this "
+    "script has no way to write to the YouTube description itself, so "
+    "the actual attribution placement lives in that file, not here."
 )
 _MUSIC_CHAPTERS = [
     ("Cold Open", "tense_mysterious", "The-Cannery.mp3"),
