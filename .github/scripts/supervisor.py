@@ -231,6 +231,35 @@ def auto_close_stale_failure_issues():
                 print(f"Auto-closed stale issue #{issue['number']}: {issue['title']}")
 
 
+# PIPELINE BREAKDOWN (2026-09-04): the supervisor previously only printed
+# output when it force-triggered a stuck video or escalated one - a clean
+# run (the normal case) gave no visibility at all into how many videos
+# were actually at each stage. Added so every run prints a real snapshot:
+# how many videos are sitting at each backend `status` value, and how many
+# are currently waiting on each pipeline stage per determine_stage(). This
+# is read-only/print-only - it does not change any trigger/escalation
+# behavior above.
+def _print_pipeline_breakdown(videos):
+    status_counts = {}
+    stage_counts = {}
+    for v in videos:
+        status_label = v.get("status") or "(no status)"
+        status_counts[status_label] = status_counts.get(status_label, 0) + 1
+
+        stage = determine_stage(v)
+        stage_label = stage or "done / not yet in pipeline"
+        stage_counts[stage_label] = stage_counts.get(stage_label, 0) + 1
+
+    print("\n--- PIPELINE BREAKDOWN ---")
+    print("By backend status:")
+    for label, count in sorted(status_counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {label}: {count}")
+    print("By stage currently needed:")
+    for label, count in sorted(stage_counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {label}: {count}")
+    print("--------------------------\n")
+
+
 def main():
     print("Checking for stale failure issues to auto-close...")
     auto_close_stale_failure_issues()
@@ -240,6 +269,8 @@ def main():
     resp.raise_for_status()
     videos = resp.json()
     print(f"Checking {len(videos)} video(s) for stuck stages...")
+
+    _print_pipeline_breakdown(videos)
 
     for video in videos:
         try:
