@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 import sys
 import time
@@ -29,6 +30,20 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 # the documented/intended voice.
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-GuyNeural")
 SLOWDOWN_FACTOR = "0.95"
+
+# VOICE MODULATION FIX (2026-09-04): every sentence was previously
+# synthesized with identical rate/pitch, making the narrator sound flat
+# and robotic across an entire ~9-minute video. Edge TTS's Communicate
+# class accepts per-call `rate` (percent offset) and `pitch` (Hz offset)
+# parameters - these were never being passed, so everything defaulted to
+# "+0%"/"+0Hz" every time. Each sentence now gets a small randomized
+# rate/pitch nudge within a narrow, natural-sounding band (kept modest on
+# purpose - wide swings would sound erratic/uncanny, not "expressive").
+# This is a pure narration-engine change; it does not touch
+# split_into_segments' abbreviation-aware sentence boundaries or the
+# pause-insertion logic, both of which are unaffected and unchanged.
+VOICE_RATE_VARIATION_PCT = (-4, 5)   # inclusive range, percent offset from base rate
+VOICE_PITCH_VARIATION_HZ = (-3, 4)   # inclusive range, Hz offset from base pitch
 
 # FIX (2026-08-10): was alternating 1.0s/2.0s between sentences (average
 # ~1.5s, worst-case 2.0s - perceived as ~3s with slowdown/normalize stacked
@@ -73,8 +88,20 @@ def _looks_like_code_or_markup(text):
     return False
 
 
-async def _synthesize_sentence_edge(text, tmp_path):
-    communicate = edge_tts.Communicate(text, voice=EDGE_TTS_VOICE)
+def _random_rate_str():
+    offset = random.randint(*VOICE_RATE_VARIATION_PCT)
+    sign = "+" if offset >= 0 else ""
+    return f"{sign}{offset}%"
+
+
+def _random_pitch_str():
+    offset = random.randint(*VOICE_PITCH_VARIATION_HZ)
+    sign = "+" if offset >= 0 else ""
+    return f"{sign}{offset}Hz"
+
+
+async def _synthesize_sentence_edge(text, tmp_path, rate="+0%", pitch="+0Hz"):
+    communicate = edge_tts.Communicate(text, voice=EDGE_TTS_VOICE, rate=rate, pitch=pitch)
     await communicate.save(tmp_path)
 
 
@@ -194,12 +221,18 @@ def split_into_segments(narration_text):
 
 
 def synthesize_sentence(text, tmp_path):
-    asyncio.run(_synthesize_sentence_edge(text, tmp_path))
+    rate_str = _random_rate_str()
+    pitch_str = _random_pitch_str()
+    asyncio.run(_synthesize_sentence_edge(text, tmp_path, rate=rate_str, pitch=pitch_str))
     clip = AudioSegment.from_file(tmp_path)
     # DIAGNOSTIC (2026-08-09): kept from the Chatterbox near-empty-audio
     # bug - logs each segment's real length so a future failure points at
     # the exact sentence(s) that came out wrong, not just the aggregate.
-    print(f"  segment ({len(text)} chars): {len(clip) / 1000.0:.2f}s audio -> {text[:60]!r}")
+    # Now also logs the rate/pitch used for this segment (2026-09-04 voice
+    # modulation fix), so a future "sounds off" report can be diagnosed
+    # against the exact values that produced it.
+    print(f"  segment ({len(text)} chars, rate={rate_str}, pitch={pitch_str}): "
+          f"{len(clip) / 1000.0:.2f}s audio -> {text[:60]!r}")
     return clip
 
 
@@ -313,7 +346,7 @@ def main():
         print(f"ERROR: script {script_id} looks like code/markup after cleaning - refusing to narrate it.")
         sys.exit(1)
 
-    print("Generating speech with Edge TTS (sentence-level, real pauses)")
+    print("Generating speech with Edge TTS (sentence-level, real pauses, per-sentence rate/pitch variation)")
     combined_audio, real_total_seconds = synthesize_with_pauses(narration_text)
     combined_audio = pydub_normalize(combined_audio)
     print(f"Real measured narration length: {real_total_seconds:.1f}s")
