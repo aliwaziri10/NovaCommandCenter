@@ -1,7 +1,7 @@
 # Nova Rebuild — Style Overhaul Handoff
 
 ## Why this file exists
-A prior session proposed a full rewrite of Nova's storytelling/visual format (20-item list, see "Full Item List" below). This doc is the real, GitHub-verified status — reconstructed from `list_commits` + live file contents on 2026-08-19, not from any earlier version of this file. **This file itself went stale within 15 minutes of being created on 2026-08-19** (it originally claimed only #7 was done, then 7 more commits landed without anyone updating it) — treat any status doc, including this one, as unverified until cross-checked against `list_commits`.
+A prior session proposed a full rewrite of Nova's storytelling/visual format (20-item list, see "Full Item List" below). This doc is the real, GitHub-verified status. **Earlier versions of this file went stale repeatedly** (most recently: it listed #6/#9 as "not started" after they'd already shipped) — treat any status doc, including this one, as unverified until cross-checked against the actual source files.
 
 ## Rule for this initiative
 One item at a time. After each item is committed, verify it by re-fetching from GitHub, mark it done below, then move to the next. Do not batch multiple items into one commit.
@@ -28,31 +28,32 @@ One item at a time. After each item is committed, verify it by re-fetching from 
 19. End screen bridging directly into next video's hook
 20. Guardrail against photorealistic named historical figures
 
-## Status (verified live against `script_writing_agent.py` and `generate_videos.py`, 2026-08-19)
+## Status (verified live against script_writing_agent.py, generate_videos.py, assemble.py, youtube_upload.py, 2026-09-03)
 
-### DONE — 11 of 20
+### DONE — 12 of 20
 - **#1 Curiosity Loop 6-beat structure** — `script_writing_agent.py`, Rule 0 + matching part1/part2 prompt instructions.
 - **#2 Hook-Problem-Solution-Payoff spine** — same file, mapped explicitly onto the 6 beats in Rule 0.
 - **#3 Cold open, then cut back** — Rule 0B, with an explicit bridge-line requirement.
 - **#4 No channel-greeting intro before value line** — Rule 1, explicit ban on "hey guys"/"welcome back" etc.
 - **#5 Peak "wow" moment at ~70% mark** — Rule 9, placed inside the CLIMAX beat specifically, distinct from PAYOFF.
+- **#6 New music cue at every chapter/emotional turn** — `assemble.py`, `_build_music_bed()` + `_MUSIC_CHAPTERS` (6 mood-matched Kevin MacLeod/incompetech CC-BY tracks, one per story beat, crossfaded at chapter boundaries). Required attribution is added unconditionally to every video's YouTube description by `youtube_upload.py`'s `MUSIC_ATTRIBUTION_LINE` (confirmed live 2026-09-03 - a stale comment in assemble.py claiming this was still outstanding was corrected same session).
 - **#7 Full-motion B&W video** — `generate_videos.py`, `QUALITY_GUARD` rewritten to enforce grayscale cinematography (deliberately not sepia/vintage-filter).
-- **#8 Camera-angle variation every 40s** — `generate_videos.py`, time-bucketed on elapsed runtime, not shot count.
+- **#8 Camera-angle variation every 40s** — `generate_videos.py`, time-bucketed on real elapsed runtime (`CAMERA_VARIATION_INTERVAL_SECONDS`), not shot count. Confirmed live 2026-09-03.
 - **#9 Steady numbers/facts throughout** — Rule 8, spread across both part1/part2 prompts, not just the opening.
-- **#10 Chapter markers from generation** — Rule 0C, `[CHAPTER: ...]` markers for all 6 beats, distinct from `[SCENE]` markers.
+- **#10 Chapter markers from generation** — Rule 0C, `[CHAPTER: ...]` markers for all 6 beats, distinct from `[SCENE]` markers. Also independently reconstructed at upload time in `youtube_upload.py` from real shot_durations if the script-side markers are unavailable.
 - **#12 No "in summary" language** — Rule 7 + explicit instruction in part2_prompt's ending beat.
 - **#14 Drop "you are standing in..." narration** — Rule 4, explicit ban alongside guidance on what direct-address forms remain allowed.
 
-### NOT STARTED — 9 of 20, no trace in either file as of 2026-08-19
-#6, #11, #13, #15, #16, #17, #18, #19, #20
+### NOT STARTED — 8 of 20, no trace in any pipeline file as of 2026-09-03
+#11, #13, #15, #16, #17, #18, #19, #20
 
 ## Recommended next step
-Freeze bugs (Phase 2a end-of-video freeze, Phase 2b per-scene freeze-hold) and narrator voice modulation — flagged 2026-08-16, still unfixed — are UNRELATED to this rebuild list and were not touched by any of today's commits. Check those separately; don't assume this rebuild session addressed them.
+Of the remaining 8, #15 (verified-facts research gate) and #16 (niche-gap check) are pre-production/content-quality gates - highest leverage for avoiding wasted renders on a bad topic. #11 (ending recontextualizes opening) and #20 (no photorealistic named historical figures - a real likeness/liability risk, unlike the others which are purely stylistic) are prompt/script changes similar in scope to what's already shipped. #13, #17, #18, #19 are more structural/operational (channel identity, cadence discipline, analytics feedback loop, end-screen linking) and depend on data Nova doesn't yet expose (e.g. #18 needs YouTube Analytics API integration, not just a prompt change).
 
 ## Rules carried over from PROJECT_STATE.md (still apply)
-- GitHub write access for Claude is intermittently 403 on this repo — always confirm before assuming a push succeeded; deliver as full-file copy-paste + direct /edit/main/ link when it fails.
+- GitHub write access for Claude was intermittently 403 on this repo through 2026-08-09; retested working (direct push succeeded, no 403) as of 2026-09-03 - always confirm before assuming a push will succeed either way.
 - Read all files in /brain before starting work; this repo is the single source of truth, not chat history.
 - Do not reference Railway anywhere in new writing (RAILWAY_URL env var name is legacy-only, do not rename).
 
 ## Last Updated
-2026-08-19 (corrected — reconstructed from commit history, not carried forward from the original version of this file)
+2026-09-03 (corrected — verified against live generate_videos.py, assemble.py, youtube_upload.py, not carried forward from the 2026-08-19 version which had gone stale on #6, #9, #8's true status)
