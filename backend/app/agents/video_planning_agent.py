@@ -197,7 +197,19 @@ SYSTEM_PROMPT = (
 ) + SFX_LINE_RULE
 
 
-def _call_gemini(prompt: str) -> str | None:
+def _call_gemini(prompt: str) -> tuple[str | None, str | None]:
+    """ERROR VISIBILITY FIX (2026-09-05): now returns (text, last_reason)
+    instead of just text - see run_video_planning's 2026-09-05 docstring
+    note. Every failed attempt already computed a specific last_reason
+    ("HTTP 429 rate limited", "malformed response envelope", etc.) but it
+    was discarded before reaching the caller, so both raised RuntimeErrors
+    below only ever said the generic "returned nothing usable" with no
+    detail on which of those reasons actually happened - impossible to
+    tell a quota problem apart from an invalid key or a changed response
+    format without Render log access this environment doesn't have.
+    Same fix applied the same day to script_writing_agent.py's
+    _generate_part for the identical problem.
+    """
     body_text = f"{SYSTEM_PROMPT}\n\n{prompt}"
     last_reason = None
 
@@ -234,8 +246,8 @@ def _call_gemini(prompt: str) -> str | None:
             continue
 
         if response.status_code != 200:
-            last_reason = f"HTTP {response.status_code} (non-retryable)"
-            print(f"Gemini returned {last_reason}, attempt {attempt + 1}/"
+            last_reason = f"HTTP {response.status_code} (non-retryable): {response.text[:300]}"
+            print(f"Gemini returned non-200, attempt {attempt + 1}/"
                   f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
             continue
 
@@ -251,17 +263,17 @@ def _call_gemini(prompt: str) -> str | None:
 
         raw = raw_text.strip()
         if _is_bad_response(raw):
-            last_reason = "200 OK but response looked like an error/markup envelope"
+            last_reason = f"200 OK but response looked like an error/markup envelope. Raw start: {raw[:200]!r}"
             print(f"Gemini attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
             continue
         if len(raw) > 100:
-            return _strip_ad_footer(raw)
+            return _strip_ad_footer(raw), None
 
-        last_reason = "200 OK but response was too short to be a real plan"
+        last_reason = f"200 OK but response was too short to be a real plan. Raw: {raw[:200]!r}"
         print(f"Gemini attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
 
     print(f"Gemini still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
-    return None
+    return None, last_reason
 
 
 def _continue_if_truncated(plan: str) -> str:
@@ -277,7 +289,7 @@ def _continue_if_truncated(plan: str) -> str:
             f"never 'Scene', and every shot must end with both a 'Duration: Xs' "
             f"line and an 'SFX: <keyword>' line:\n\n{plan[-1500:]}"
         )
-        cont_raw = _call_gemini(continuation_prompt)
+        cont_raw, _reason = _call_gemini(continuation_prompt)
         if not cont_raw:
             break
         if _is_refusal(cont_raw):
@@ -311,7 +323,7 @@ def _retry_missing_sfx(plan: str, script_text: str, target_shots: int, half_labe
         f"everything else (shot numbering, descriptions, durations) exactly as "
         f"written, just add the missing SFX lines:\n\n{plan}"
     )
-    fixed = _call_gemini(fix_prompt)
+    fixed, _reason = _call_gemini(fix_prompt)
     if fixed and len(fixed) > len(plan) * 0.6:
         still_missing = _count_missing_sfx(fixed)
         print(f"{half_label}: after retry, {still_missing} shot(s) still missing SFX (was {missing}).")
@@ -389,6 +401,14 @@ def run_video_planning(db: Session, script_id: str):
     native-audio and music layers, degrading silently (no SFX for that shot)
     on any lookup/download failure, matching the fail-open pattern already
     used for music tracks.
+
+    ERROR VISIBILITY FIX (2026-09-05): both raised RuntimeErrors below now
+    include the real last_reason from _call_gemini (see that function's
+    2026-09-05 docstring update) instead of just the generic "returned
+    nothing usable" message. Same fix applied the same day to
+    script_writing_agent.py for the identical problem - both agents were
+    failing ~100% of the time and neither error was diagnosable without
+    Render log access this environment doesn't have.
     """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
@@ -424,14 +444,14 @@ def run_video_planning(db: Session, script_id: str):
         f'the script — end at a natural shot boundary, do not add a conclusion '
         f'yet.'
     )
-    part1 = _call_gemini(part1_prompt)
+    part1, part1_reason = _call_gemini(part1_prompt)
 
     if not part1:
         raise RuntimeError(
             f"Video planning failed on part 1 for script {script_id} "
             f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
-            f"backoff-spaced attempts) - no Video row created, will be retried by "
-            f"the supervisor up to MAX_RETRIES."
+            f"backoff-spaced attempts - last reason: {part1_reason}) - no Video "
+            f"row created, will be retried by the supervisor up to MAX_RETRIES."
         )
 
     part1 = _continue_if_truncated(part1)
@@ -455,15 +475,15 @@ def run_video_planning(db: Session, script_id: str):
         f'of readable text or documents. Cover this second half through to the '
         f'end of the script.'
     )
-    part2 = _call_gemini(part2_prompt)
+    part2, part2_reason = _call_gemini(part2_prompt)
 
     if not part2:
         raise RuntimeError(
             f"Video planning failed on part 2 for script {script_id} "
             f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
-            f"backoff-spaced attempts, part 1 succeeded). No Video row created — "
-            f"will be retried by the supervisor up to MAX_RETRIES instead of "
-            f"shipping a truncated plan."
+            f"backoff-spaced attempts, part 1 succeeded - last reason: "
+            f"{part2_reason}). No Video row created — will be retried by the "
+            f"supervisor up to MAX_RETRIES instead of shipping a truncated plan."
         )
 
     part2 = _continue_if_truncated(part2)
