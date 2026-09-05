@@ -131,6 +131,68 @@ def _count_missing_sfx(production_plan: str) -> int:
     return missing
 
 
+# HISTORICAL ACCURACY / ANATOMY SAFETY PASS (2026-09-05): Zia reviewed a
+# batch of finished videos and flagged three related visual problems: (1)
+# soldiers/crowds rendering as unnaturally small, dwarf-like figures, (2)
+# a morphing artifact producing a figure with many extra limbs (a "24-hand"
+# frame) during action, and (3) armor/weapons/architecture that doesn't
+# match the story's actual time period (e.g. full plate-armor knights in a
+# story set centuries before or after plate armor existed). None of these
+# are assemble.py or Agnes-account issues - they trace back to this
+# prompt never constraining (a) how many people a shot can ask for at what
+# scale, or (b) what era-specific detail a shot should describe. Both
+# added below as new rules. The anatomy issue in particular is a
+# well-documented AI video generation failure mode that gets sharply worse
+# when a shot asks for many human figures at small scale or in tangled
+# overlapping motion - reducing shot complexity is the standard mitigation
+# available at the prompt level (there is no way to guarantee a text-to-
+# video model never produces an anatomy artifact, only to reduce the
+# conditions that provoke it).
+HISTORICAL_ACCURACY_RULE = (
+    "\n\nHistorical/period accuracy rule (critical):\n"
+    "- For every shot, identify the ACTUAL historical time period this specific "
+    "moment is set in, based on what the script itself establishes (dates, "
+    "context, technology mentioned) - then describe clothing, armor, weapons, "
+    "architecture, and any tools/vehicles as authentic to THAT specific period. "
+    "Do NOT default to generic 'medieval knight in full plate armor' imagery "
+    "unless the story's actual setting is genuinely late-medieval or early-"
+    "modern Europe (roughly 1400s-1600s).\n"
+    "- Concrete guidance by era: antiquity (roughly 500 BC-500 AD) calls for "
+    "tunics, cloaks, leather or bronze/iron lamellar armor, short swords or "
+    "spears - not plate armor. Early-to-high medieval (roughly 500-1300 AD) "
+    "calls for mail hauberks, simple helmets, kite shields - full plate is "
+    "anachronistic here too. 1700s-1800s calls for period military uniforms, "
+    "muskets/cannons, not swords-and-shields at all. If the story is 1900s or "
+    "later, describe modern-for-that-decade dress and equipment, never armor "
+    "or medieval weapons.\n"
+    "- Apply this same era-matching to architecture and background objects too "
+    "(building styles, ships, tools) - not just clothing and weapons."
+)
+
+CROWD_ANATOMY_SAFETY_RULE = (
+    "\n\nCrowd size and anatomy safety rule (critical):\n"
+    "- AI video generation frequently distorts human anatomy when a shot asks "
+    "for many people packed together at small on-screen scale, or for fast "
+    "tangled multi-person action - producing warped proportions, extra or "
+    "missing limbs, morphing figures, or people rendered as unnaturally small "
+    "or child-sized. Write shots to avoid provoking this:\n"
+    "- Cap any single shot at a MAXIMUM of 4-5 clearly distinguishable, "
+    "sharply-rendered human figures at natural adult proportions.\n"
+    "- For a scene that genuinely needs to feel like a crowd, army, or large "
+    "gathering, describe the crowd as an out-of-focus or receding background "
+    "mass (e.g. 'a blurred line of soldiers stretching into the distance "
+    "behind him'), and keep only 1-3 people as the sharp, detailed foreground "
+    "subject of the shot - never ask for a large number of individually "
+    "detailed figures in one frame.\n"
+    "- Do NOT describe chaotic, tangled, or overlapping multi-person combat "
+    "or group action within a single shot. Break group action into separate "
+    "shots, each showing one or two clear figures performing one clear "
+    "action (a single sword swing, one soldier falling, two people "
+    "grappling) - cut to a new shot for the next beat of action rather than "
+    "compressing a melee into one description."
+)
+
+
 SYSTEM_PROMPT = (
     "You are a professional video producer for a cinematic alternate-history "
     "YouTube channel. Break the given script into a clear shot-by-shot production "
@@ -173,7 +235,10 @@ SYSTEM_PROMPT = (
     "legible text and it will come out as garbled nonsense letters, which looks "
     "broken. If a document or paper needs to appear, either keep it out of focus "
     "in the background of a wider shot, or describe the person/object interacting "
-    "with it rather than the text itself.\n\n"
+    "with it rather than the text itself."
+    + HISTORICAL_ACCURACY_RULE
+    + CROWD_ANATOMY_SAFETY_RULE
+    + "\n\n"
     "Protagonist visibility rule (critical):\n"
     "- Do NOT put the protagonist on-screen in every shot, and do NOT default "
     "to opening and closing every shot on the protagonist. Across the full "
@@ -409,6 +474,22 @@ def run_video_planning(db: Session, script_id: str):
     script_writing_agent.py for the identical problem - both agents were
     failing ~100% of the time and neither error was diagnosable without
     Render log access this environment doesn't have.
+
+    HISTORICAL ACCURACY / ANATOMY SAFETY PASS (2026-09-05, second same-day
+    update): Zia reviewed a batch of finished videos and flagged soldiers/
+    crowds rendering as unnaturally small (dwarf-like) figures, a morphing
+    artifact producing a figure with many extra limbs during action, and
+    armor/weapons not matching the story's actual time period (plate-armor
+    knights in stories set centuries before/after plate armor existed).
+    Added HISTORICAL_ACCURACY_RULE (era-matched costume/armor/architecture,
+    with concrete guidance per era) and CROWD_ANATOMY_SAFETY_RULE (caps
+    sharp foreground figures per shot at 4-5, pushes real crowds to an
+    out-of-focus background mass, bans chaotic multi-person combat in a
+    single shot) to SYSTEM_PROMPT - see both constants above for full text.
+    These are prompt-level mitigations for a known AI video generation
+    failure mode (anatomy distortion under many-small-figures or chaotic-
+    motion conditions); they reduce the conditions that provoke it but
+    can't guarantee the underlying video model never produces an artifact.
     """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
@@ -439,7 +520,12 @@ def run_video_planning(db: Session, script_id: str):
         f'longer holds) rather than using the same duration for every shot. Keep '
         f'every shot brightly and clearly lit unless the script explicitly calls '
         f'for night or bad weather. Avoid close-ups of readable text or '
-        f'documents. Every shot needs both a Duration line and an SFX line. '
+        f'documents. Match every shot's costume, armor, weapons, and '
+        f'architecture to the story's real historical period - never default '
+        f'to generic medieval-knight imagery. Keep any shot with multiple '
+        f'people to at most 4-5 sharp foreground figures, pushing real crowds '
+        f'into an out-of-focus background instead. Every shot needs both a '
+        f'Duration line and an SFX line. '
         f'Start directly with Shot 1. This is only the first half of '
         f'the script — end at a natural shot boundary, do not add a conclusion '
         f'yet.'
@@ -472,8 +558,12 @@ def run_video_planning(db: Session, script_id: str):
         f'"Duration: Xs" line followed by an "SFX: <keyword>" line. Vary '
         f'durations naturally. Keep every shot brightly and clearly lit unless '
         f'the script explicitly calls for night or bad weather. Avoid close-ups '
-        f'of readable text or documents. Cover this second half through to the '
-        f'end of the script.'
+        f'of readable text or documents. Keep matching every shot's costume, '
+        f'armor, weapons, and architecture to the story's real historical '
+        f'period - never default to generic medieval-knight imagery. Keep any '
+        f'shot with multiple people to at most 4-5 sharp foreground figures, '
+        f'pushing real crowds into an out-of-focus background instead. Cover '
+        f'this second half through to the end of the script.'
     )
     part2, part2_reason = _call_gemini(part2_prompt)
 
