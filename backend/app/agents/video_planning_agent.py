@@ -490,6 +490,16 @@ def run_video_planning(db: Session, script_id: str):
     failure mode (anatomy distortion under many-small-figures or chaotic-
     motion conditions); they reduce the conditions that provoke it but
     can't guarantee the underlying video model never produces an artifact.
+
+    SYNTAX HOTFIX (2026-09-05, third same-day update): the previous commit
+    (Historical Accuracy / Anatomy Safety Pass above) introduced a real
+    Python syntax error - both part1_prompt and part2_prompt used unescaped
+    apostrophes ("shot's costume", "story's real historical period") inside
+    single-quote-delimited f-strings, which is invalid Python and would have
+    crashed this module on next import. Caught and fixed immediately via a
+    local py_compile check before this was ever run against a real video -
+    escaped both apostrophes with backslashes. No behavior change versus
+    what was intended in the previous commit; this only fixes the syntax.
     """
     script_uuid = uuid.UUID(str(script_id))
     script = db.query(Script).filter(Script.id == script_uuid).first()
@@ -520,8 +530,8 @@ def run_video_planning(db: Session, script_id: str):
         f'longer holds) rather than using the same duration for every shot. Keep '
         f'every shot brightly and clearly lit unless the script explicitly calls '
         f'for night or bad weather. Avoid close-ups of readable text or '
-        f'documents. Match every shot's costume, armor, weapons, and '
-        f'architecture to the story's real historical period - never default '
+        f'documents. Match every shot\'s costume, armor, weapons, and '
+        f'architecture to the story\'s real historical period - never default '
         f'to generic medieval-knight imagery. Keep any shot with multiple '
         f'people to at most 4-5 sharp foreground figures, pushing real crowds '
         f'into an out-of-focus background instead. Every shot needs both a '
@@ -558,8 +568,8 @@ def run_video_planning(db: Session, script_id: str):
         f'"Duration: Xs" line followed by an "SFX: <keyword>" line. Vary '
         f'durations naturally. Keep every shot brightly and clearly lit unless '
         f'the script explicitly calls for night or bad weather. Avoid close-ups '
-        f'of readable text or documents. Keep matching every shot's costume, '
-        f'armor, weapons, and architecture to the story's real historical '
+        f'of readable text or documents. Keep matching every shot\'s costume, '
+        f'armor, weapons, and architecture to the story\'s real historical '
         f'period - never default to generic medieval-knight imagery. Keep any '
         f'shot with multiple people to at most 4-5 sharp foreground figures, '
         f'pushing real crowds into an out-of-focus background instead. Cover '
