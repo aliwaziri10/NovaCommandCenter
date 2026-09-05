@@ -23,6 +23,26 @@ STRATEGY_RESEARCH_COOLDOWN_MINUTES = 7 * 24 * 60
 VIDEO_PLANNING_STARVATION_MINUTES = 90
 LOG_PATH = "/app/data/supervisor_log.json"
 
+# PAUSED (2026-09-05): cinematography stage disabled. topic_research,
+# script_writing, video_planning, and cinematography all call the same
+# GEMINI_API_KEY, and every one of them started failing 100% of the time
+# ("Gemini returned nothing usable after 4 attempts") right around when
+# this stage was added (2026-09-03) - matching an already-documented
+# precedent in the sibling Marius project (marius-command-center's
+# topic_research.yml was paused 2026-08-15 for the identical reason:
+# "competing with script_writing.py for the same GEMINI_API_KEY quota,
+# contributing to 429 rate-limit failures"). Not yet proven with certainty
+# (the specific per-attempt failure reason - 429 vs something else - was
+# being discarded before this session; see video_planning_agent.py and
+# script_writing_agent.py for the same-day fix making that visible on the
+# next failure), but this is the newest, least-essential consumer of the
+# same quota, so it's the first one paused while the others (which the
+# rest of the pipeline actually depends on) get a chance to recover.
+# Re-enable by uncommenting the loop below once quota pressure is
+# confirmed resolved - do not delete the code, cinematographer_agent.py
+# itself is untouched.
+CINEMATOGRAPHY_PAUSED = True
+
 
 # TIMEZONE FIX (2026-09-04): _find_starved_video_planning_task below was
 # comparing script.created_at (returned by SQLAlchemy as an
@@ -179,27 +199,26 @@ def _find_next_task(db):
             continue
         return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
 
-    # ADDED (2026-09-02): cinematographer pass. Runs as soon as a video has
-    # a production_plan but hasn't been through the DP-brief enrichment
-    # pass yet. Checked BEFORE video_clips (and video_clips below now also
-    # gates on cinematography_done as a second safety net) so Agnes never
-    # generates a shot's clip from a plan that hasn't been enriched with
-    # camera/lighting direction yet.
-    for video in videos:
-        if not video.production_plan:
-            continue
-        if video.cinematography_done:
-            continue
-        vid = str(video.id)
-        if _has_recent_task(db, "cinematography", "video_id", vid, CINEMATOGRAPHY_COOLDOWN_MINUTES):
-            continue
-        if _failed_attempts(db, "cinematography", "video_id", vid) >= MAX_RETRIES:
-            continue
-        return {
-            "agent_name": "cinematography",
-            "payload": {"video_id": vid},
-            "title": "Add cinematography brief for video " + vid[:8],
-        }
+    # PAUSED (2026-09-05): see CINEMATOGRAPHY_PAUSED comment near the top
+    # of this file for why. Skipped entirely while paused so it can never
+    # be selected; video_clips below no longer gates on cinematography_done
+    # while paused either, so pausing this does not stall video_clips.
+    if not CINEMATOGRAPHY_PAUSED:
+        for video in videos:
+            if not video.production_plan:
+                continue
+            if video.cinematography_done:
+                continue
+            vid = str(video.id)
+            if _has_recent_task(db, "cinematography", "video_id", vid, CINEMATOGRAPHY_COOLDOWN_MINUTES):
+                continue
+            if _failed_attempts(db, "cinematography", "video_id", vid) >= MAX_RETRIES:
+                continue
+            return {
+                "agent_name": "cinematography",
+                "payload": {"video_id": vid},
+                "title": "Add cinematography brief for video " + vid[:8],
+            }
 
     for video in videos:
         if not video.production_plan or not video.audio_path:
@@ -209,7 +228,12 @@ def _find_next_task(db):
         # the cinematography loop above, which normally catches this
         # earlier. Kept here too as a second safety net in case ordering
         # ever changes.
-        if not video.cinematography_done:
+        # RELAXED (2026-09-05): while CINEMATOGRAPHY_PAUSED is True, this
+        # gate is skipped entirely - otherwise every video would sit
+        # blocked forever waiting on a stage that will never run while
+        # paused. Once cinematography is re-enabled, this gate returns to
+        # its original strict behavior automatically.
+        if not CINEMATOGRAPHY_PAUSED and not video.cinematography_done:
             continue
         total_shots = len(_parse_shots(video.production_plan))
         if not total_shots:
