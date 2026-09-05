@@ -23,25 +23,17 @@ STRATEGY_RESEARCH_COOLDOWN_MINUTES = 7 * 24 * 60
 VIDEO_PLANNING_STARVATION_MINUTES = 90
 LOG_PATH = "/app/data/supervisor_log.json"
 
-# PAUSED (2026-09-05): cinematography stage disabled. topic_research,
-# script_writing, video_planning, and cinematography all call the same
-# GEMINI_API_KEY, and every one of them started failing 100% of the time
-# ("Gemini returned nothing usable after 4 attempts") right around when
-# this stage was added (2026-09-03) - matching an already-documented
-# precedent in the sibling Marius project (marius-command-center's
-# topic_research.yml was paused 2026-08-15 for the identical reason:
-# "competing with script_writing.py for the same GEMINI_API_KEY quota,
-# contributing to 429 rate-limit failures"). Not yet proven with certainty
-# (the specific per-attempt failure reason - 429 vs something else - was
-# being discarded before this session; see video_planning_agent.py and
-# script_writing_agent.py for the same-day fix making that visible on the
-# next failure), but this is the newest, least-essential consumer of the
-# same quota, so it's the first one paused while the others (which the
-# rest of the pipeline actually depends on) get a chance to recover.
-# Re-enable by uncommenting the loop below once quota pressure is
-# confirmed resolved - do not delete the code, cinematographer_agent.py
-# itself is untouched.
-CINEMATOGRAPHY_PAUSED = True
+# RE-ENABLED (2026-09-05): cinematography now runs on its own dedicated
+# Gemini key (GEMINI_API_KEY_CINEMATOGRAPHY, added to Render same day) -
+# see cinematographer_agent.py, which no longer reads the shared
+# GEMINI_API_KEY that topic_research/script_writing/video_planning use.
+# It was paused earlier the same day (see git history on this line for
+# the original PAUSED comment/reasoning) because all four stages were
+# sharing one key and failing ~100% of the time. That contention is gone
+# now that this stage has its own quota, so it is unpaused here. If
+# quota-contention symptoms return, do NOT re-share a key - investigate
+# whether the new dedicated key itself is rate-limited instead.
+CINEMATOGRAPHY_PAUSED = False
 
 
 # TIMEZONE FIX (2026-09-04): _find_starved_video_planning_task below was
@@ -199,10 +191,10 @@ def _find_next_task(db):
             continue
         return {"agent_name": "assembly", "payload": {"video_id": vid}, "title": "Assemble video " + vid[:8]}
 
-    # PAUSED (2026-09-05): see CINEMATOGRAPHY_PAUSED comment near the top
-    # of this file for why. Skipped entirely while paused so it can never
-    # be selected; video_clips below no longer gates on cinematography_done
-    # while paused either, so pausing this does not stall video_clips.
+    # RE-ENABLED (2026-09-05): see CINEMATOGRAPHY_PAUSED comment near the
+    # top of this file - cinematography now runs on its own dedicated
+    # Gemini key and no longer competes with the other three stages, so
+    # this loop is active again.
     if not CINEMATOGRAPHY_PAUSED:
         for video in videos:
             if not video.production_plan:
