@@ -266,11 +266,32 @@ def _find_next_task(db):
             continue
         return {"agent_name": "script_writing", "payload": {"topic_id": tid}, "title": "Write script for topic " + tid[:8]}
 
+    # FIX (2026-09-05): DEADLOCK FIX - see brain/KNOWN_BUGS.md.
+    # topics_without_scripts previously counted EVERY topic with no
+    # Script row, including ones that have permanently exhausted
+    # script_writing's MAX_RETRIES (the loop above skips those forever,
+    # but they were still counted here). That let dead topics masquerade
+    # as "still in the pipeline": as long as the dead-topic count sat at
+    # or above MIN_TOPICS_IN_PIPELINE, the `< MIN_TOPICS_IN_PIPELINE`
+    # check below never tripped, so fresh topic_research never fired to
+    # replace them - a silent total deadlock (confirmed live 2026-09-05:
+    # exactly 3 topics had permanently failed script_writing after Gemini
+    # returned nothing usable on each, topics_without_scripts sat at
+    # exactly 3 == MIN_TOPICS_IN_PIPELINE, and both script_writing and
+    # topic_research had been idle for ~2 weeks as a result).
+    # Fix: exclude permanently-failed topics from this count - they are
+    # not "in the pipeline" in any actionable sense, they are dead ends
+    # that will never produce a script, so they must not count toward
+    # deciding whether more research is needed.
     topics_without_scripts = []
     for t in topics:
         has_script = db.query(Script).filter(Script.topic_id == t.id).first()
-        if not has_script:
-            topics_without_scripts.append(t)
+        if has_script:
+            continue
+        tid = str(t.id)
+        if _failed_attempts(db, "script_writing", "topic_id", tid) >= MAX_RETRIES:
+            continue
+        topics_without_scripts.append(t)
 
     if len(topics_without_scripts) < MIN_TOPICS_IN_PIPELINE:
         if _has_active_task(db, "topic_research", "category", "History"):
@@ -321,7 +342,7 @@ def _write_log(entry):
         pass
 
 
-def _maybe_alert_permanent_abandonment(db, agent_name, payload, error_text):
+def _maybe_alert_permanent_abandonment(db, agent_name, payload, error_text, task=None):
     """ADDED (2026-08-28): fires exactly once, at the moment a given
     (agent_name, id) combination's failure count reaches MAX_RETRIES -
     i.e. the exact cycle where _find_next_task will start silently
@@ -343,6 +364,20 @@ def _maybe_alert_permanent_abandonment(db, agent_name, payload, error_text):
 
     Never raises - a broken alert must not break the supervisor cycle
     itself (same reasoning as open_issue()'s own internal try/except).
+
+    VISIBILITY FIX (2026-09-05): confirmed live that open_issue() has
+    been silently failing for this exact alert for weeks - 3 topics hit
+    MAX_RETRIES between 2026-08-22 and 2026-08-28 and NOT ONE resulting
+    GitHub issue exists (checked directly via the GitHub API). Given
+    open_issue()'s own docstring already flags the likely cause (GITHUB_PAT
+    missing the "Issues: write" repo permission) and this environment has
+    no access to Render's live logs to confirm the exact HTTP error (see
+    brain/KNOWN_BUGS.md), printing to stdout is not enough - nothing reads
+    Render's stdout unless someone is watching it in real time. This now
+    also writes the open_issue() outcome onto the failed Task row itself
+    (`task.payload["abandonment_alert"]`), so whether the alert fired -
+    and if not, that it silently failed - is visible from a plain Supabase
+    query instead of requiring Render log access. Still never raises.
     """
     try:
         id_key = AGENT_ID_KEY.get(agent_name)
@@ -370,7 +405,24 @@ def _maybe_alert_permanent_abandonment(db, agent_name, payload, error_text):
             f"the attempt count to 0) once the underlying cause is "
             f"addressed, or investigate why it's failing first."
         )
-        open_issue(title, body, labels=["supervisor-abandoned"])
+        issue_opened = open_issue(title, body, labels=["supervisor-abandoned"])
+
+        if task is not None:
+            merged = dict(task.payload or {})
+            merged["abandonment_alert"] = {
+                "attempted_at": str(datetime.utcnow()),
+                "issue_opened": issue_opened,
+                "note": (
+                    "GitHub issue created." if issue_opened else
+                    "open_issue() returned False - GitHub did not accept the "
+                    "issue (commonly: GITHUB_PAT missing 'Issues: write' repo "
+                    "permission). This (agent, id) is still permanently "
+                    "abandoned even though no issue exists - check here since "
+                    "GitHub has nothing to show."
+                ),
+            }
+            task.payload = merged
+            db.commit()
     except Exception as e:
         print(f"WARNING: _maybe_alert_permanent_abandonment itself failed (non-fatal): {type(e).__name__}: {e}")
 
@@ -424,7 +476,7 @@ def run_supervisor_cycle(db):
         merged["error"] = str(e)
         task.payload = merged
         db.commit()
-        _maybe_alert_permanent_abandonment(db, next_action["agent_name"], next_action["payload"], str(e))
+        _maybe_alert_permanent_abandonment(db, next_action["agent_name"], next_action["payload"], str(e), task=task)
         result = {
             "timestamp": str(started_at),
             "action": "failed",
