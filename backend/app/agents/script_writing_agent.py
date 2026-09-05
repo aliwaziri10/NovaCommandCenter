@@ -111,7 +111,7 @@ RETRYABLE_NETWORK_EXCEPTIONS = (
 )
 
 
-def _generate_part(prompt: str, system_prompt: str) -> str | None:
+def _generate_part(prompt: str, system_prompt: str) -> tuple[str | None, str | None]:
     """PROVIDER SWITCH (2026-08-10): now calls Gemini directly instead of
     Pollinations. Same retry/backoff shape as before.
 
@@ -122,6 +122,17 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
     problem - so the fallback preserves availability without silently
     downgrading quality on ordinary transient errors (which still retry
     on the primary model as before).
+
+    ERROR VISIBILITY FIX (2026-09-05): this function computed a detailed
+    `last_reason` on every failed attempt ("HTTP 429 rate/quota limited",
+    "malformed response envelope", etc.) but never returned it - callers
+    only ever saw None and had to raise a generic "Gemini returned nothing
+    usable" error with no detail on WHICH of those reasons actually
+    happened. That made it impossible to tell a rate-limit problem apart
+    from an invalid key, a deprecated model, or a changed response format
+    from outside Render's own logs (which this environment cannot read).
+    Now returns (text, last_reason) so the caller's raised error can
+    include the real reason - see run_script_writing below.
     """
     body_text = f"{system_prompt}\n\n{prompt}"
     last_reason = None
@@ -144,7 +155,7 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
             continue
 
         if response.status_code == 429:
-            last_reason = "HTTP 429 rate/quota limited"
+            last_reason = f"HTTP 429 rate/quota limited (model={current_model})"
             if current_model == GEMINI_MODEL_PRIMARY:
                 print(f"Gemini {GEMINI_MODEL_PRIMARY} quota/rate limited - falling back to "
                       f"{GEMINI_MODEL_FALLBACK} for this call (attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}).")
@@ -158,15 +169,15 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
 
         if response.status_code in (500, 502, 503, 504):
             wait = (attempt + 1) * 15
-            last_reason = f"HTTP {response.status_code}"
+            last_reason = f"HTTP {response.status_code} (model={current_model})"
             print(f"Gemini ({current_model}) transient error ({last_reason}), waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS}): {response.text[:200]}")
             time.sleep(wait)
             continue
 
         if response.status_code != 200:
-            last_reason = f"HTTP {response.status_code} (non-retryable)"
-            print(f"Gemini ({current_model}) returned {last_reason}, attempt {attempt + 1}/"
+            last_reason = f"HTTP {response.status_code} (model={current_model}, non-retryable): {response.text[:300]}"
+            print(f"Gemini ({current_model}) returned non-200, attempt {attempt + 1}/"
                   f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
             continue
 
@@ -174,7 +185,7 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
             raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
         except (requests.exceptions.JSONDecodeError, KeyError, IndexError) as e:
             wait = (attempt + 1) * 15
-            last_reason = f"malformed response envelope ({e})"
+            last_reason = f"malformed response envelope (model={current_model}): {e}"
             print(f"Gemini ({current_model}) {last_reason}, waiting {wait}s before retry "
                   f"(attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS})...")
             time.sleep(wait)
@@ -182,14 +193,14 @@ def _generate_part(prompt: str, system_prompt: str) -> str | None:
 
         extracted = _extract_script(raw_text.strip())
         if extracted:
-            return extracted
+            return extracted, None
 
-        last_reason = "200 OK but response failed narration-text validation " \
-                       "(empty, code/markup-like, or malformed envelope)"
+        last_reason = f"200 OK (model={current_model}) but response failed narration-text validation " \
+                       f"(empty, code/markup-like, or malformed envelope). Raw start: {raw_text[:200]!r}"
         print(f"Gemini ({current_model}) attempt {attempt + 1}/{MAX_GENERATION_ATTEMPTS} failed - {last_reason}")
 
     print(f"Gemini still failing after {MAX_GENERATION_ATTEMPTS} attempts. Last reason: {last_reason}")
-    return None
+    return None, last_reason
 
 
 # ADDED (2026-08-31, cinematic-direction pass): a second-pass revision call.
@@ -238,13 +249,14 @@ def _revise_script(full_draft: str) -> str:
     own."""
     prompt = f"Here is the complete draft script to revise:\n\n{full_draft}"
     try:
-        revised = _generate_part(prompt, REVISION_SYSTEM_PROMPT)
+        revised, reason = _generate_part(prompt, REVISION_SYSTEM_PROMPT)
     except Exception as e:
         print(f"Revision pass raised an exception, using unrevised draft instead: {type(e).__name__}: {e}")
         return full_draft
 
     if not revised or len(revised) < len(full_draft) * 0.6:
-        print("Revision pass returned nothing usable or suspiciously short output - using unrevised draft instead.")
+        print(f"Revision pass returned nothing usable ({reason}) or suspiciously short output - "
+              f"using unrevised draft instead.")
         return full_draft
 
     print("Revision pass succeeded - using revised script.")
@@ -303,6 +315,15 @@ def run_script_writing(db: Session, topic_id: str):
     exactly this failure mode — so a failed generation goes through the normal
     Task/_failed_attempts retry path and no broken Script row is ever created
     or allowed downstream.
+
+    ERROR VISIBILITY FIX (2026-09-05): both raised RuntimeErrors below now
+    include the real last_reason from _generate_part (see that function's
+    2026-09-05 docstring update) instead of just the generic "returned
+    nothing usable" message - this was true here as much as in
+    video_planning_agent.py, and both were fixed the same day for the same
+    reason: this channel's pipeline was failing 100% of the time on every
+    Gemini-calling stage and nobody could tell why without Render log
+    access this environment doesn't have.
     """
     topic_uuid = uuid.UUID(str(topic_id))
     topic = db.query(Topic).filter(Topic.id == topic_uuid).first()
@@ -607,15 +628,16 @@ def run_script_writing(db: Session, topic_id: str):
         f'estimates" rather than invented if you are not genuinely confident in an exact '
         f'figure, and never left vague when a real figure exists.'
     )
-    part1 = _generate_part(part1_prompt, system_prompt)
+    part1, part1_reason = _generate_part(part1_prompt, system_prompt)
 
     if not part1:
         raise RuntimeError(
             f"Script generation failed on part 1 for topic {topic_id} "
             f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
-            f"backoff-spaced attempts) - no Script row created, will be retried by "
-            f"the supervisor up to MAX_RETRIES instead of saving a placeholder that "
-            f"would end up spoken aloud in the final video."
+            f"backoff-spaced attempts - last reason: {part1_reason}) - no Script "
+            f"row created, will be retried by the supervisor up to MAX_RETRIES "
+            f"instead of saving a placeholder that would end up spoken aloud in "
+            f"the final video."
         )
 
     part1_word_count = len(part1.split())
@@ -682,16 +704,17 @@ def run_script_writing(db: Session, topic_id: str):
         f'than inventing an exact figure you are not confident in, and never clustered '
         f'only near the start.'
     )
-    part2 = _generate_part(part2_prompt, system_prompt)
+    part2, part2_reason = _generate_part(part2_prompt, system_prompt)
 
     if not part2:
         raise RuntimeError(
             f"Script generation failed on part 2 for topic {topic_id} "
             f"(Gemini returned nothing usable after {MAX_GENERATION_ATTEMPTS} "
-            f"backoff-spaced attempts, part 1 succeeded). No Script row created — "
-            f"will be retried by the supervisor up to MAX_RETRIES instead of "
-            f"shipping a truncated script with a failure marker that would end up "
-            f"spoken aloud in the final video."
+            f"backoff-spaced attempts, part 1 succeeded - last reason: "
+            f"{part2_reason}). No Script row created — will be retried by the "
+            f"supervisor up to MAX_RETRIES instead of shipping a truncated "
+            f"script with a failure marker that would end up spoken aloud in "
+            f"the final video."
         )
 
     draft = part1 + "\n\n" + part2
