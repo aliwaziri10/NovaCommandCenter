@@ -19,8 +19,14 @@ from app.models.video import Video
 #
 # Reuses the same Gemini call/retry/backoff conventions already proven in
 # video_planning_agent.py rather than inventing a new HTTP pattern.
+#
+# UPDATED (2026-09-05): topic_research, script_writing, video_planning,
+# and this agent were all sharing GEMINI_API_KEY, which caused all four
+# to start failing ~100% of the time right after this stage was added.
+# This agent now uses its own dedicated key (GEMINI_API_KEY_CINEMATOGRAPHY)
+# so it no longer competes with the three core stages for quota.
 
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_KEY = os.environ["GEMINI_API_KEY_CINEMATOGRAPHY"]
 GEMINI_MODEL = "gemini-3.5-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
 
