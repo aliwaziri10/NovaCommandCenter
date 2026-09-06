@@ -68,8 +68,14 @@ AGNES_BASE = "https://apihub.agnes-ai.com/v1"
 AGNES_VIDEO_URL = f"{AGNES_BASE}/videos"
 AGNES_IMAGE_URL = f"{AGNES_BASE}/images/generations"
 AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
-CLIP_HEIGHT = 768
-CLIP_WIDTH = 1152
+# CHANGED (2026-09-07): raised from 768x1152 (Agnes's 720p tier) to true
+# 1080p (1920x1080 landscape, per Agnes's docs normalization table) - Ali
+# flagged skin going waxy/plastic on both Nova and Marius. Agnes's own
+# docs confirm output is over-smoothed most aggressively at low
+# resolution before their upsampler runs, so this is being tried first,
+# before any negative_prompt change.
+CLIP_HEIGHT = 1080
+CLIP_WIDTH = 1920
 CLIP_FRAME_RATE = 24
 MIN_FRAMES = 49    # ~2s floor, matches Marius
 # FREEZE-PAD FIX (2026-08-19, Phase 2b - see module docstring): was 169
