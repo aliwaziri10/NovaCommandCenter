@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 
@@ -96,6 +97,24 @@ MUSIC_ATTRIBUTION_LINE = (
 # script/narration text to a sentence boundary instead of a hard character
 # cut, so the description reads as real prose, not text chopped mid-word.
 DESCRIPTION_SNIPPET_LIMIT = 1500
+
+# FIX (2026-09-07): script_content is stored with production-script markup
+# baked in ("[CHAPTER: ...]", "[SCENE N]") - Zia flagged this leaking
+# straight into live YouTube descriptions verbatim. _build_story_description
+# only ever truncated the raw text, it never stripped this markup first.
+# This regex removes any "[WORD ...]" or "[WORD N]" bracketed tag (CHAPTER,
+# SCENE, or anything in the same style) and collapses the extra blank lines
+# left behind, so only the actual narration prose remains.
+SCRIPT_MARKUP_PATTERN = re.compile(r"\[[A-Z][A-Z \-]*(?::[^\]]*|\s+\d+)?\]")
+
+
+def _strip_script_markup(text):
+    if not text:
+        return text
+    cleaned = SCRIPT_MARKUP_PATTERN.sub("", text)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n\s*\n\s*\n+", "\n\n", cleaned)
+    return cleaned.strip()
 
 # --- Chapter markers (added 2026-08-02) ---
 # YouTube requires: first chapter at 0:00, at least 3 chapters, each chapter
@@ -216,7 +235,7 @@ def _build_story_description(script_content):
     empty - caller falls back to FALLBACK_DESCRIPTION in that case, same
     safety net as before this fix.
     """
-    text = (script_content or "").strip()
+    text = _strip_script_markup((script_content or "").strip())
     if not text:
         return None
 
