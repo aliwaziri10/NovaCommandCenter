@@ -48,8 +48,19 @@ def _latest_strategy_notes(db: Session) -> str | None:
 # a 429/quota-exhausted response on the Pro model doesn't kill generation
 # outright - it drops to Flash for that call only, rather than failing the
 # whole script.
+# MODEL RETIREMENT FIX (2026-10-06): gemini-2.5-pro was retired for this key.
+# EVIDENCE: every script_writing task failure since 2026-09-05 (60+ rows in
+# Supabase `tasks`) carries the saved reason "HTTP 404 (model=gemini-2.5-pro,
+# non-retryable) ... no longer available to new users. Please update your code
+# to use models/gemini-3.1-pro-preview". The last script that succeeded was
+# 2026-08-29, just before the 2026-08-31 switch to 2.5 Pro. The old code only
+# fell back to Flash on a 429, so a 404 retried the dead model 4 times and gave
+# up. Same GEMINI_API_KEY works fine on gemini-3.5-flash (topic_research
+# completed 2026-10-01). Primary is now Google's suggested replacement
+# (UNVERIFIED that this free key can use it - hence the fallback below now also
+# triggers on 404/400/401/403, not only 429).
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL_PRIMARY = "gemini-2.5-pro"
+GEMINI_MODEL_PRIMARY = "gemini-3.1-pro-preview"
 GEMINI_MODEL_FALLBACK = "gemini-3.5-flash"
 
 
@@ -179,6 +190,14 @@ def _generate_part(prompt: str, system_prompt: str) -> tuple[str | None, str | N
             last_reason = f"HTTP {response.status_code} (model={current_model}, non-retryable): {response.text[:300]}"
             print(f"Gemini ({current_model}) returned non-200, attempt {attempt + 1}/"
                   f"{MAX_GENERATION_ATTEMPTS}: {response.text[:200]}")
+            # MODEL RETIREMENT FIX (2026-10-06): a non-retryable error from the
+            # PRIMARY model (404 model retired, 400/401/403 not allowed for this
+            # key) will never succeed on retry, so switch to the fallback model
+            # right away instead of burning all attempts on the same dead model.
+            if current_model == GEMINI_MODEL_PRIMARY and current_model != GEMINI_MODEL_FALLBACK:
+                print(f"Gemini {GEMINI_MODEL_PRIMARY} unusable (HTTP {response.status_code}) - "
+                      f"falling back to {GEMINI_MODEL_FALLBACK} for this call.")
+                current_model = GEMINI_MODEL_FALLBACK
             continue
 
         try:
