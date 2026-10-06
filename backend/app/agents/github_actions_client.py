@@ -10,11 +10,27 @@ def trigger_workflow(workflow_filename, inputs):
     """Triggers a GitHub Actions workflow_dispatch run.
     workflow_filename: e.g. "generate_videos.yml"
     inputs: dict matching the workflow's declared inputs (all values must be strings)
-    Returns True if GitHub accepted the trigger request, False otherwise.
+    Returns True if GitHub accepted the trigger request.
+
+    ERROR VISIBILITY FIX (2026-10-06): this used to return False on failure
+    and only print the real HTTP status to Render logs, so every failed
+    task row just said "Failed to trigger narrate.yml GitHub Actions
+    workflow." with no reason (narration for video 574f10af failed twice
+    that way on 2026-10-06 while the same workflow ran fine when started
+    by supervisor.yml with GitHub's built-in token). It now RAISES a
+    RuntimeError containing the real status and response body so the
+    reason lands in tasks.payload->>'error'. This is safe: every caller
+    (supervisor_agent.py narration/video_clips/assembly branches and
+    tasks_router.py generate_videos branch) already raised its own
+    RuntimeError whenever this returned False, so the failure path and
+    retry behavior are unchanged - only the message is richer.
     """
     if not GITHUB_PAT:
         print("WARNING: GITHUB_PAT not set, cannot trigger workflow.")
-        return False
+        raise RuntimeError(
+            f"Failed to trigger {workflow_filename}: GITHUB_PAT environment "
+            f"variable is not set on the backend (Render)."
+        )
 
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/{workflow_filename}/dispatches"
     headers = {
@@ -31,10 +47,16 @@ def trigger_workflow(workflow_filename, inputs):
             print(f"Triggered workflow {workflow_filename} with inputs {inputs}")
             return True
         print(f"WARNING: failed to trigger {workflow_filename}: HTTP {resp.status_code}: {resp.text[:200]}")
-        return False
+        raise RuntimeError(
+            f"Failed to trigger {workflow_filename}: GitHub answered HTTP "
+            f"{resp.status_code}: {resp.text[:300]}"
+        )
     except requests.RequestException as e:
         print(f"WARNING: error triggering {workflow_filename}: {type(e).__name__}: {str(e)[:150]}")
-        return False
+        raise RuntimeError(
+            f"Failed to trigger {workflow_filename}: network error "
+            f"{type(e).__name__}: {str(e)[:200]}"
+        )
 
 
 def open_issue(title, body, labels=None):
