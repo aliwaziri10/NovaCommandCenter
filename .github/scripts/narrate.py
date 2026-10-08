@@ -29,7 +29,7 @@ VIDEO_ID = os.environ.get("VIDEO_ID", "").strip()
 # so this default is what actually ran in production. Corrected to match
 # the documented/intended voice.
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-GuyNeural")
-SLOWDOWN_FACTOR = "0.95"
+SLOWDOWN_FACTOR = "1.0"  # NARRATION PACING FIX (2026-10-08): was 0.95 (5% slower), reported as too slow
 
 # VOICE MODULATION FIX (2026-09-04): every sentence was previously
 # synthesized with identical rate/pitch, making the narrator sound flat
@@ -42,8 +42,8 @@ SLOWDOWN_FACTOR = "0.95"
 # This is a pure narration-engine change; it does not touch
 # split_into_segments' abbreviation-aware sentence boundaries or the
 # pause-insertion logic, both of which are unaffected and unchanged.
-VOICE_RATE_VARIATION_PCT = (-4, 5)   # inclusive range, percent offset from base rate
-VOICE_PITCH_VARIATION_HZ = (-3, 4)   # inclusive range, Hz offset from base pitch
+VOICE_RATE_VARIATION_PCT = (4, 8)  # NARRATION PACING FIX (2026-10-08): was (-4, 5); consistently brisker, narrower swing   # inclusive range, percent offset from base rate
+VOICE_PITCH_VARIATION_HZ = (-2, 2)   # inclusive range, Hz offset from base pitch
 
 # FIX (2026-08-10): was alternating 1.0s/2.0s between sentences (average
 # ~1.5s, worst-case 2.0s - perceived as ~3s with slowdown/normalize stacked
@@ -51,8 +51,8 @@ VOICE_PITCH_VARIATION_HZ = (-3, 4)   # inclusive range, Hz offset from base pitc
 # the real measured narration length AFTER this runs (see
 # _scale_shot_durations below), so shortening pauses here automatically
 # shortens the shots too - no separate video-sync fix needed.
-PAUSE_SECONDS_MIN = 1.0
-PAUSE_SECONDS_MAX = 1.0
+PAUSE_SECONDS_MIN = 0.4  # NARRATION PACING FIX (2026-10-08): was 1.0s after every sentence
+PAUSE_SECONDS_MAX = 0.4
 
 WORK_DIR = "/tmp/nova_narration"
 BACKEND_TIMEOUT = 120
@@ -195,6 +195,30 @@ _ABBREVIATIONS = {
 }
 
 
+# NARRATION PACING FIX (2026-10-08): Zia reported narration on both
+# channels was too slow, paused too often and sometimes "did not make
+# sense". Causes found in the code: a 1-2s silence after EVERY sentence
+# (including 2-3 word fragments like "Not once." that belong to the
+# sentence before them), a sub-100% speaking rate, and ellipses treated as
+# sentence ends. Short fragments are now merged into the neighbouring
+# sentence so they are spoken in one natural breath with no pause, and an
+# ellipsis no longer ends a segment.
+MIN_WORDS_PER_SEGMENT = 5
+
+
+def _merge_short_segments(segments):
+    merged = []
+    for seg in segments:
+        if merged and len(seg.split()) < MIN_WORDS_PER_SEGMENT:
+            merged[-1] = f"{merged[-1]} {seg}".strip()
+        else:
+            merged.append(seg)
+    if len(merged) > 1 and len(merged[0].split()) < MIN_WORDS_PER_SEGMENT:
+        merged[1] = f"{merged[0]} {merged[1]}".strip()
+        merged = merged[1:]
+    return merged
+
+
 def split_into_segments(narration_text):
     """Splits narration into one segment per real SENTENCE, so a pause gets
     inserted only at genuine sentence boundaries - not after abbreviations,
@@ -208,6 +232,8 @@ def split_into_segments(narration_text):
     buffer = ""
     for piece in raw_pieces:
         buffer = f"{buffer} {piece}".strip() if buffer else piece
+        if buffer.endswith("...") or buffer.endswith("\u2026"):
+            continue  # an ellipsis is a trailing-off beat, not a sentence end
         match = re.search(r"([A-Za-z]+)\.$", buffer)
         if match:
             word = match.group(1).lower()
@@ -217,7 +243,8 @@ def split_into_segments(narration_text):
         buffer = ""
     if buffer.strip():
         segments.append(buffer.strip())
-    return [s for s in segments if s] or [narration_text.strip()]
+    segments = [s for s in segments if s] or [narration_text.strip()]
+    return _merge_short_segments(segments)
 
 
 def synthesize_sentence(text, tmp_path):
