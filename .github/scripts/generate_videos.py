@@ -4,6 +4,19 @@ Nova Command Center - Video Generation Agent
 [... all prior docstring history unchanged through 2026-09-04 named-figure
 likeness guardrail ...]
 
+UPDATED (2026-10-18): MODEL SWITCH TO agnes-video-2.5-flash.
+Agnes retired agnes-video-v2.0 on 2026-09-25. _submit_clip_raw and
+_poll_clip now use agnes-video-2.5-flash with the same request shape the
+working Tiny Lawn Tales pipeline uses: mode ("text" or "reference"),
+seconds ("4".."12"), size "720P", aspect_ratio "16:9", n, and images=[url]
+in reference mode; polling passes model_name=agnes-video-2.5-flash.
+The rest of this file still thinks in frames; _submit_clip_raw converts
+frames to whole seconds (rounded up, clamped to 4..12).
+QUEUE FULL: when Agnes answers 503 video_queue_full, _submit_clip_raw waits
+and retries; if the queue is still full it returns a "QUEUE FULL" error and
+main() stops the batch cleanly (progress is already saved per shot) so the
+next scheduled run tries again instead of waiting through every shot.
+
 UPDATED (2026-09-06): DARK-SCREEN / WESTERN-LIKENESS / ANACHRONISM FIX,
 PORTED FROM MARIUS'S CONFIRMED-LIVE prompt_builder.py.
 
@@ -68,12 +81,24 @@ AGNES_BASE = "https://apihub.agnes-ai.com/v1"
 AGNES_VIDEO_URL = f"{AGNES_BASE}/videos"
 AGNES_IMAGE_URL = f"{AGNES_BASE}/images/generations"
 AGNES_POLL_URL = "https://apihub.agnes-ai.com/agnesapi"
+
+# ADDED (2026-10-18): Flash model settings (see module docstring).
+AGNES_VIDEO_MODEL = "agnes-video-2.5-flash"
+VIDEO_SIZE = "720P"  # Flash supports only 720P
+ASPECT_RATIO = "16:9"
+MIN_API_SECONDS = 4
+MAX_API_SECONDS = 12
+AGNES_QUEUE_FULL_WAIT_SECONDS = 120
+AGNES_QUEUE_FULL_MAX_ATTEMPTS = 8
+
 # CHANGED (2026-09-07): raised from 768x1152 (Agnes's 720p tier) to true
 # 1080p (1920x1080 landscape, per Agnes's docs normalization table) - Ali
 # flagged skin going waxy/plastic on both Nova and Marius. Agnes's own
 # docs confirm output is over-smoothed most aggressively at low
 # resolution before their upsampler runs, so this is being tried first,
 # before any negative_prompt change.
+# NOTE (2026-10-18): CLIP_WIDTH/CLIP_HEIGHT are still used for the dormant
+# image generation call; the Flash video model itself is 720P only.
 CLIP_HEIGHT = 1080
 CLIP_WIDTH = 1920
 CLIP_FRAME_RATE = 24
@@ -88,7 +113,7 @@ MAX_FRAMES = 241   # ~10s ceiling (was 169/~7s) - see FREEZE-PAD FIX note above
 # Agnes segments instead of freeze-padding everything past the first one.
 MAX_CHAIN_SEGMENTS = 4
 DEFAULT_SHOT_SECONDS = 5.0  # only used if shot_durations is unavailable for this video
-MAX_WAIT_SECONDS = 240
+MAX_WAIT_SECONDS = 900  # CHANGED (2026-10-18): was 240; Flash clips can take longer when the queue is busy
 POLL_INTERVAL_SECONDS = 10
 MIN_SECONDS_BETWEEN_SUBMITS = 10  # FIX (2026-08-13): was 4 - too tight, let content-policy retry bursts trip real 429s
 AGNES_IMAGE_MAX_RETRIES = 3
@@ -269,6 +294,14 @@ def round_to_valid_frames(num_frames):
     n = math.ceil((num_frames - 1) / 8)
     n = max(0, n)
     return 8 * n + 1
+
+
+def _seconds_for_frames(num_frames):
+    """ADDED (2026-10-18): frames -> whole seconds string for Flash,
+    rounded UP (never shorter than the shot needs), clamped to 4..12."""
+    import math
+    secs = math.ceil((num_frames - 1) / CLIP_FRAME_RATE)
+    return str(min(max(secs, MIN_API_SECONDS), MAX_API_SECONDS))
 
 
 def _clean_shot_text(text):
@@ -587,21 +620,44 @@ def _upload_clip(tag, local_path):
 
 
 def _submit_clip_raw(prompt, num_frames, anchor_image_url=None):
+    # CHANGED (2026-10-18): agnes-video-2.5-flash request shape (see module
+    # docstring). anchor_image_url switches to reference mode.
     body = {
-        "model": "agnes-video-v2.0",
+        "model": AGNES_VIDEO_MODEL,
         "prompt": prompt,
-        "height": CLIP_HEIGHT,
-        "width": CLIP_WIDTH,
-        "num_frames": num_frames,
-        "frame_rate": CLIP_FRAME_RATE,
+        "mode": "text",
+        "seconds": _seconds_for_frames(num_frames),
+        "size": VIDEO_SIZE,
+        "aspect_ratio": ASPECT_RATIO,
+        "n": 1,
     }
     if anchor_image_url:
-        body["image"] = anchor_image_url
+        body["mode"] = "reference"
+        body["images"] = [anchor_image_url]
+        body["prompt"] = (
+            "Use the picture in <Picture 1> as the visual reference for the "
+            "subject, setting and look, keeping it consistent. " + prompt
+        )
 
-    try:
-        submit = requests.post(AGNES_VIDEO_URL, headers=HEADERS, json=body, timeout=60)
-    except requests.RequestException as e:
-        return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}", False
+    queue_full_count = 0
+    while True:
+        try:
+            submit = requests.post(AGNES_VIDEO_URL, headers=HEADERS, json=body, timeout=60)
+        except requests.RequestException as e:
+            return None, f"submit request error: {type(e).__name__}: {str(e)[:150]}", False
+
+        if submit.status_code == 503 and "video_queue_full" in submit.text:
+            queue_full_count += 1
+            if queue_full_count >= AGNES_QUEUE_FULL_MAX_ATTEMPTS:
+                return None, (
+                    f"QUEUE FULL - Agnes video queue still full after {AGNES_QUEUE_FULL_MAX_ATTEMPTS} tries, "
+                    f"will retry next run: {submit.text[:200]}"
+                ), False
+            print(f"Agnes video queue is full (try {queue_full_count}/{AGNES_QUEUE_FULL_MAX_ATTEMPTS}). "
+                  f"Waiting {AGNES_QUEUE_FULL_WAIT_SECONDS}s before trying again...")
+            time.sleep(AGNES_QUEUE_FULL_WAIT_SECONDS)
+            continue
+        break
 
     if submit.status_code == 400 and "content_policy_violation" in submit.text:
         print(f"[content-policy] Agnes rejection body: {submit.text[:500]}")
@@ -736,7 +792,7 @@ def _poll_clip(video_id):
         try:
             check = requests.get(
                 AGNES_POLL_URL,
-                params={"video_id": video_id, "model_name": "agnes-video-v2.0"},
+                params={"video_id": video_id, "model_name": AGNES_VIDEO_MODEL},
                 headers=HEADERS,
                 timeout=30,
             )
@@ -964,6 +1020,13 @@ def main():
             if error and "RATE LIMITED" in error:
                 print("Backing off 60s after a 429 before continuing this run...")
                 time.sleep(60)
+            if error and "QUEUE FULL" in error:
+                # ADDED (2026-10-18): Agnes's queue is saturated - stop the
+                # batch now instead of waiting through every remaining shot.
+                # Progress is saved below; the next scheduled run resumes.
+                print("Agnes video queue is full - stopping this batch cleanly. The next scheduled run will resume.")
+                _save_progress(video_id, clip_urls)
+                break
 
         _save_progress(video_id, clip_urls)
         good_so_far = len([u for u in clip_urls if u])
