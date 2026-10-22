@@ -1,0 +1,47 @@
+name: Assemble Video (No Narration)
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video ID to build without narration"
+        required: true
+        default: "af34e8f7-de9f-4674-abb8-e555fc2516a1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  assemble_no_narration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests==2.32.3 moviepy==1.0.3 Pillow==10.4.0 imageio-ffmpeg==0.4.9 numpy==1.24.4
+
+      - name: Run no-narration assembly
+        env:
+          RAILWAY_URL: https://novacommandcenter.onrender.com
+          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
+          VIDEO_ID: ${{ inputs.video_id }}
+          OUTPUT_DIR: /tmp/nova_no_narration_out
+        run: python .github/scripts/assemble_no_narration.py
+
+      - name: Save the finished video as a downloadable file
+        uses: actions/upload-artifact@v4
+        with:
+          name: no-narration-video
+          path: /tmp/nova_no_narration_out/*.mp4
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
